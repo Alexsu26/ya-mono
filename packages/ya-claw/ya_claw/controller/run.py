@@ -60,6 +60,7 @@ class RunController:
                 id=session_id,
                 profile_name=request.profile_name,
                 session_metadata={},
+                session_type="conversation",
             )
             db_session.add(session_record)
         else:
@@ -94,6 +95,8 @@ class RunController:
             request.reset_state,
         )
         run_metadata = dict(request.metadata)
+        if request.reset_state:
+            run_metadata["restore_state"] = False
 
         sequence_no = await self._next_sequence_no(db_session, session_id)
         run_id = uuid4().hex
