@@ -11,6 +11,7 @@ import contextvars
 import inspect
 import sys
 import time
+import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
@@ -20,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Generic, cast
 import jinja2
 from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, UsageLimits, UserError
 from pydantic_ai._agent_graph import CallToolsNode, HistoryProcessor, ModelRequestNode
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, ProcessHistory
 from pydantic_ai.messages import (
     BaseToolCallPart,
     ModelMessage,
@@ -71,6 +72,8 @@ from ya_agent_sdk.filters.system_prompt import create_system_prompt_filter
 from ya_agent_sdk.toolsets.core.base import BaseTool, GlobalHooks, Toolset
 from ya_agent_sdk.utils import AgentDepsT, EnvT, add_toolset_instructions
 
+from .capabilities import HISTORY_PROCESSORS_DEPRECATION_MESSAGE, is_process_history_for
+
 if TYPE_CHECKING:
     from pydantic_ai import ModelSettings
     from pydantic_ai.toolsets import AbstractToolset
@@ -82,6 +85,11 @@ logger = get_logger(__name__)
 # =============================================================================
 # Exceptions
 # =============================================================================
+
+
+_PRE_HISTORY_PROCESSORS_DEPRECATION_MESSAGE = (
+    "`pre_history_processors=` is deprecated; use `pre_capabilities=[ProcessHistory(...)]` instead."
+)
 
 
 class AgentInterrupted(Exception):
@@ -352,7 +360,9 @@ def create_agent(
     unified_subagents: bool = False,
     inherit_hooks: bool = True,
     # --- Capabilities ---
+    pre_capabilities: Sequence[AbstractCapability[AgentDepsT]] | None = None,
     capabilities: Sequence[AbstractCapability[AgentDepsT]] | None = None,
+    inherit_pre_capabilities: bool = True,
     inherit_capabilities: bool = True,
     # --- Agent ---
     agent_tools: Sequence[Any] | None = None,
@@ -410,9 +420,15 @@ def create_agent(
         use_cache_friendly_compact_filter: Select the cache-friendly compact filter by default.
             Set to False to use the legacy compact agent implementation.
 
-        capabilities: Pydantic AI capabilities to attach to the agent. Capabilities
-            bundle tools, lifecycle hooks, instructions, and model settings into
-            reusable composable units. See pydantic-ai capabilities documentation.
+        pre_capabilities: Pydantic AI capabilities that run before SDK history
+            capabilities. Use this for ProcessHistory capabilities that must see
+            the raw message history before compact, handoff, auto-load, and runtime
+            instruction filters.
+        capabilities: Pydantic AI capabilities to attach after SDK history capabilities.
+            Capabilities bundle tools, lifecycle hooks, instructions, and model settings
+            into reusable composable units. See pydantic-ai capabilities documentation.
+        inherit_pre_capabilities: If True (default), subagents inherit the parent's
+            pre_capabilities unless overridden by their own config.pre_capabilities.
         inherit_capabilities: If True (default), subagents inherit the parent's
             capabilities unless overridden by their own config.capabilities.
             If False, subagents get no capabilities unless explicitly set in config.
@@ -424,10 +440,10 @@ def create_agent(
             rendered as a Jinja2 template, supporting conditionals and default values.
         system_prompt_template_vars: Variables for Jinja2 template rendering. Works with
             both custom system_prompt strings and the default template file.
-        pre_history_processors: Sequence of history processors to run BEFORE built-in
-            processors. Use this to bypass or modify messages before built-in filters
-            (compact, environment instructions, etc.) process them.
-        history_processors: Sequence of history processors to run AFTER built-in processors.
+        pre_history_processors: Deprecated sequence of history processors to run BEFORE built-in
+            ProcessHistory capabilities. Use pre_capabilities=[ProcessHistory(...)] for new code.
+        history_processors: Deprecated sequence of history processors to run AFTER built-in
+            ProcessHistory capabilities. Use capabilities=[ProcessHistory(...)] for new code.
         retries: Number of retries for agent run. Defaults to 1.
         output_retries: Number of retries for output parsing. Defaults to 3.
         defer_model_check: Defer model validation. Defaults to False.
@@ -493,12 +509,14 @@ def create_agent(
     ).with_state(state)
     logger.debug("Context created: %s (run_id=%s)", type(ctx).__name__, ctx.run_id)
 
-    # --- History Processors ---
-    # Combine pre-processors, context processors, built-ins, and user-provided processors.
+    # --- Capabilities ---
+    # Combine user capabilities, compatibility history processors, context history capabilities,
+    # built-in ProcessHistory capabilities, and user-provided compatibility processors.
     # Runtime instructions run after compact so restored histories receive fresh runtime context.
-    # Manual users of AgentContext.get_history_processors() still receive runtime instructions there.
-    context_processors = [
-        processor for processor in ctx.get_history_processors() if processor is not inject_runtime_instructions
+    context_history_capabilities = [
+        capability
+        for capability in ctx.get_history_capabilities()
+        if not is_process_history_for(capability, inject_runtime_instructions)
     ]
     compact_filter = (
         create_cache_friendly_compact_filter(
@@ -514,19 +532,37 @@ def create_agent(
         )
     )
 
-    all_processors: list[HistoryProcessor[AgentDepsT]] = []
+    pre_history_capabilities: list[AbstractCapability[AgentDepsT]] = []
+    post_history_capabilities: list[AbstractCapability[AgentDepsT]] = []
     if pre_history_processors:
-        all_processors.extend(pre_history_processors)
-    all_processors.extend([
-        *context_processors,
-        compact_filter,
-        cold_start_trim,
-        create_environment_instructions_filter(actual_env),
-        process_auto_load_files,
-        inject_runtime_instructions,
-    ])
+        warnings.warn(_PRE_HISTORY_PROCESSORS_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
+        pre_history_capabilities.extend(ProcessHistory(processor) for processor in pre_history_processors)
     if history_processors:
-        all_processors.extend(history_processors)
+        warnings.warn(HISTORY_PROCESSORS_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
+        post_history_capabilities.extend(ProcessHistory(processor) for processor in history_processors)
+
+    user_pre_capabilities = list(pre_capabilities or [])
+    user_capabilities = list(capabilities or [])
+    sdk_history_capabilities: list[AbstractCapability[AgentDepsT]] = [
+        *cast(list[AbstractCapability[AgentDepsT]], context_history_capabilities),
+        ProcessHistory(compact_filter),
+        ProcessHistory(cold_start_trim),
+        ProcessHistory(create_environment_instructions_filter(actual_env)),
+        ProcessHistory(process_auto_load_files),
+        ProcessHistory(inject_runtime_instructions),
+    ]
+    internal_subagent_capabilities: list[AbstractCapability[AgentDepsT]] = [
+        *pre_history_capabilities,
+        *sdk_history_capabilities,
+        *post_history_capabilities,
+    ]
+    all_capabilities: list[AbstractCapability[AgentDepsT]] = [
+        *user_pre_capabilities,
+        *pre_history_capabilities,
+        *sdk_history_capabilities,
+        *post_history_capabilities,
+        *user_capabilities,
+    ]
 
     # --- Toolset Setup ---
     all_toolsets: list[AbstractToolset[Any]] = []
@@ -556,19 +592,25 @@ def create_agent(
 
         if all_subagent_configs:
             logger.debug("Adding %d subagent configs to toolset", len(all_subagent_configs))
-            # Resolve capabilities for subagents
-            subagent_capabilities: list[AbstractCapability[Any]] | None = None
-            if inherit_capabilities and capabilities:
-                subagent_capabilities = list(capabilities)
-            core_toolset = core_toolset.with_subagents(
+            # Resolve user capabilities for subagents. SDK history capabilities are passed
+            # separately so subagent config capabilities can override parent user capabilities
+            # while preserving the internal ProcessHistory pipeline.
+            subagent_pre_capabilities: list[AbstractCapability[Any]] | None = (
+                list(user_pre_capabilities) if inherit_pre_capabilities else None
+            )
+            subagent_capabilities: list[AbstractCapability[Any]] | None = (
+                list(user_capabilities) if inherit_capabilities else None
+            )
+            core_toolset = core_toolset._with_subagents(
                 all_subagent_configs,
                 model=model,
                 model_settings=model_settings,
-                history_processors=cast(list[HistoryProcessor[AgentContext]], all_processors),
                 model_cfg=effective_model_cfg,
                 unified=unified_subagents,
                 inherit_hooks=inherit_hooks,
+                pre_capabilities=subagent_pre_capabilities,
                 capabilities=subagent_capabilities,
+                sdk_capabilities=cast(list[AbstractCapability[Any]], internal_subagent_capabilities),
             )
 
     # Auto-detect context management tools from registered tools
@@ -610,10 +652,9 @@ def create_agent(
             output_type=output_type,
             tools=agent_tools or (),
             toolsets=all_toolsets if all_toolsets else None,
-            capabilities=list(capabilities) if capabilities else None,
-            history_processors=[
-                *(all_processors or []),
-                create_system_prompt_filter(system_prompt=effective_system_prompt),
+            capabilities=[
+                *all_capabilities,
+                ProcessHistory(create_system_prompt_filter(system_prompt=effective_system_prompt)),
             ],
             retries=retries,
             output_retries=output_retries,
@@ -628,9 +669,9 @@ def create_agent(
     attach_message_bus_guard(agent)
 
     logger.debug(
-        "Agent created: toolsets=%d, history_processors=%d",
+        "Agent created: toolsets=%d, capabilities=%d",
         len(all_toolsets) if all_toolsets else 0,
-        len(all_processors) if all_processors else 0,
+        len(all_capabilities),
     )
     return AgentRuntime[AgentDepsT, OutputT, EnvT](env=actual_env, ctx=ctx, agent=agent, core_toolset=core_toolset)
 
