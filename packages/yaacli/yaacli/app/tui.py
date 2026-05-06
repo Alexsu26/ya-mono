@@ -96,7 +96,7 @@ from yaacli.events import ContextUpdateEvent, LoopCompleteEvent, LoopCompleteRea
 from yaacli.hooks import emit_context_update
 from yaacli.logging import configure_tui_logging, get_logger
 from yaacli.perf import perf_log_report, perf_report, perf_timer
-from yaacli.runtime import create_tui_runtime
+from yaacli.runtime import apply_model_profile, create_tui_runtime, resolve_startup_model_profile
 from yaacli.session import TUIContext
 from yaacli.usage import SessionUsage
 
@@ -219,6 +219,7 @@ class TUIApp:
     _mode: TUIMode = field(default=TUIMode.ACT, init=False)
     _state: TUIState = field(default=TUIState.IDLE, init=False)
     _agent_phase: str = field(default="idle", init=False)  # "idle", "thinking", "tools"
+    _active_model_name: str = field(default="", init=False)
 
     # Resources (initialized in __aenter__)
     _exit_stack: AsyncExitStack | None = field(default=None, init=False, repr=False)
@@ -511,6 +512,7 @@ class TUIApp:
             config_dir=self.config_manager.config_dir,
         )
         await self._exit_stack.enter_async_context(self._runtime)
+        self._active_model_name, _ = resolve_startup_model_profile(self.config)
 
         # Register application-level injected context tags for compact stripping
         self._runtime.ctx.injected_context_tags = (
@@ -2442,6 +2444,9 @@ class TUIApp:
             case "/tasks":
                 self._append_user_input(command)
                 self._show_tasks()
+            case "/model":
+                self._append_user_input(command)
+                self._handle_model_command(args)
             case "/paste-image":
                 self._append_user_input(command)
                 await self._paste_clipboard_image()
@@ -2610,6 +2615,7 @@ class TUIApp:
         sys_table.add_row("/clear", "Clear output and history")
         sys_table.add_row("/cost", "Show cost summary")
         sys_table.add_row("/tasks", "Show background tasks and processes")
+        sys_table.add_row("/model [name|current]", "List, show, or switch model profiles")
         sys_table.add_row("/perf", "Show performance stats (YAACLI_PERF=1)")
         sys_table.add_row("/session [id]", "List sessions or restore by ID")
         sys_table.add_row("/paste-image", "Attach image from system clipboard")
@@ -3119,6 +3125,77 @@ class TUIApp:
         sys_text.append(text)
         self._append_output(self._renderer.render(sys_text).rstrip())
 
+    def _get_current_model_profile(self) -> tuple[str, Any] | None:
+        """Get the active model profile for display."""
+        if not self._active_model_name:
+            try:
+                self._active_model_name, _ = resolve_startup_model_profile(self.config)
+            except Exception:
+                return None
+        try:
+            return self._active_model_name, self.config.get_model_profile(self._active_model_name)
+        except Exception:
+            return None
+
+    def _format_model_profile_line(self, name: str, profile: Any, *, current: bool = False) -> str:
+        marker = "*" if current else " "
+        description = f" - {profile.description}" if getattr(profile, "description", "") else ""
+        return f"{marker} {name}: {profile.model}{description}"
+
+    def _show_model_list(self) -> None:
+        """List configured model profiles."""
+        profiles = self.config.get_model_profiles()
+        if not profiles:
+            self._append_system_output("No model profiles configured.")
+            return
+
+        lines = ["Available models:"]
+        for name, profile in profiles.items():
+            lines.append(self._format_model_profile_line(name, profile, current=name == self._active_model_name))
+        self._append_output("\n".join(lines))
+
+    def _show_current_model(self) -> None:
+        """Display the current model profile."""
+        current = self._get_current_model_profile()
+        if current is None:
+            self._append_system_output("No active model configured.")
+            return
+
+        name, profile = current
+        lines = [
+            f"Current model: {name}",
+            f"model: {profile.model}",
+            f"model_settings: {profile.model_settings if profile.model_settings is not None else '(default)'}",
+            f"model_cfg: {profile.model_cfg if profile.model_cfg is not None else '(default)'}",
+        ]
+        if profile.description:
+            lines.append(f"description: {profile.description}")
+        self._append_output("\n".join(lines))
+
+    def _switch_model(self, model_name: str) -> None:
+        """Switch the active main-agent model profile."""
+        if self._state == TUIState.RUNNING:
+            self._append_system_output("Cannot switch model while agent is running.")
+            return
+
+        profile = self.config.get_model_profile(model_name)
+        model_cfg = apply_model_profile(self.runtime, profile)
+        self._active_model_name = model_name
+        if model_cfg.context_window:
+            self._context_window_size = model_cfg.context_window
+        self._append_system_output(f"Model switched to {model_name}: {profile.model}")
+
+    def _handle_model_command(self, args: str) -> None:
+        """Handle /model commands."""
+        arg = args.strip()
+        if not arg:
+            self._show_model_list()
+            return
+        if arg == "current":
+            self._show_current_model()
+            return
+        self._switch_model(arg)
+
     # =========================================================================
     # Main Run Loop
     # =========================================================================
@@ -3128,7 +3205,12 @@ class TUIApp:
         # Welcome message
         title = Text("YAACLI CLI", style="bold magenta")
         self._append_output(self._renderer.render(title).rstrip())
-        self._append_output(f"Model: {self.config.general.model}")
+        current_model = self._get_current_model_profile()
+        if current_model is None:
+            self._append_output("Model: (not configured)")
+        else:
+            model_name, model_profile = current_model
+            self._append_output(f"Model: {model_name} ({model_profile.model})")
         self._append_output(f"Mode: {self._mode.value.upper()}")
         self._append_output(f"Config dir: {self.config_manager.config_dir}")
         self._append_output("This is the global YAACLI config directory.")

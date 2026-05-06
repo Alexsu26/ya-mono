@@ -11,6 +11,7 @@ from yaacli.config import (
     CommandDefinition,
     ConfigManager,
     GeneralConfig,
+    ModelProfileConfig,
     ToolsConfig,
     YaacliConfig,
 )
@@ -64,6 +65,50 @@ def test_general_config_with_dict_settings() -> None:
 
     assert isinstance(config.model_settings, dict)
     assert config.model_settings["max_tokens"] == 8192
+
+
+def test_model_profiles_include_legacy_default() -> None:
+    """Legacy [general] model is exposed as the default profile."""
+    config = YaacliConfig(
+        general=GeneralConfig(
+            model="openai:gpt-4o",
+            model_settings="openai_default",
+            model_cfg="openai",
+        )
+    )
+
+    profiles = config.get_model_profiles()
+
+    assert profiles["default"].model == "openai:gpt-4o"
+    assert profiles["default"].model_settings == "openai_default"
+    assert profiles["default"].model_cfg == "openai"
+    assert config.get_startup_model_profile() == ("default", profiles["default"])
+
+
+def test_model_profiles_active_model() -> None:
+    """Named profiles can be selected as the startup model."""
+    deepseek = ModelProfileConfig(
+        model="deepseek:deepseek-v4-flash",
+        model_settings="deepseek",
+        model_cfg="deepseek",
+    )
+    config = YaacliConfig(
+        general=GeneralConfig(active_model="deepseek"),
+        models={"deepseek": deepseek},
+    )
+
+    assert config.is_configured is True
+    assert config.get_model_profile("deepseek") == deepseek
+    assert config.get_startup_model_profile() == ("deepseek", deepseek)
+
+
+def test_model_profiles_first_named_profile_without_active() -> None:
+    """Named profiles work without legacy [general] fields."""
+    deepseek = ModelProfileConfig(model="deepseek:deepseek-v4-flash")
+    config = YaacliConfig(models={"deepseek": deepseek})
+
+    assert config.is_configured is True
+    assert config.get_startup_model_profile() == ("deepseek", deepseek)
 
 
 def test_tools_config() -> None:

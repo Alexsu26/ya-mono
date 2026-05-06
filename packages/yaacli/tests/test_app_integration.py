@@ -29,7 +29,7 @@ from y_agent_environment.shell import BackgroundProcess
 from yaacli.app import TUIApp, TUIMode, TUIState
 from yaacli.app.tui import PendingAttachment, _is_benign_contextvar_cleanup_error
 from yaacli.clipboard import ClipboardImage, ClipboardImageReadResult
-from yaacli.config import CommandDefinition
+from yaacli.config import CommandDefinition, ModelProfileConfig
 
 
 @dataclass
@@ -55,9 +55,22 @@ class MockConfig:
         )
     )
     commands: dict[str, CommandDefinition] = field(default_factory=dict)
+    models: dict[str, ModelProfileConfig] = field(default_factory=dict)
 
     def get_commands(self) -> dict[str, CommandDefinition]:
         return self.commands
+
+    def get_model_profiles(self) -> dict[str, ModelProfileConfig]:
+        return self.models
+
+    def get_model_profile(self, name: str) -> ModelProfileConfig:
+        return self.models[name]
+
+    def get_startup_model_profile(self) -> tuple[str, ModelProfileConfig] | None:
+        if self.models:
+            first_name = next(iter(self.models))
+            return first_name, self.models[first_name]
+        return None
 
 
 @dataclass
@@ -829,6 +842,84 @@ async def test_tui_app_submit_custom_slash_command():
     await app._agent_task
 
     assert captured_prompts == ["Create a git commit for the current changes.\n\nUser instruction: polish tests"]
+
+
+@pytest.mark.asyncio
+async def test_tui_app_model_command_lists_profiles() -> None:
+    """The bare /model command lists configured profiles."""
+    config = MockConfig(
+        models={
+            "deepseek": ModelProfileConfig(model="deepseek:deepseek-v4-flash", description="DeepSeek"),
+            "gpt": ModelProfileConfig(model="openai:gpt-4o"),
+        }
+    )
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    app._active_model_name = "deepseek"
+
+    await app._handle_command_inner("/model")
+
+    output = "\n".join(app._output_lines)
+    assert "Available models:" in output
+    assert "* deepseek: deepseek:deepseek-v4-flash - DeepSeek" in output
+    assert "  gpt: openai:gpt-4o" in output
+
+
+@pytest.mark.asyncio
+async def test_tui_app_model_current_shows_active_profile() -> None:
+    """The /model current command shows active profile details."""
+    config = MockConfig(
+        models={
+            "deepseek": ModelProfileConfig(
+                model="deepseek:deepseek-v4-flash",
+                model_settings="deepseek",
+                model_cfg="deepseek",
+            )
+        }
+    )
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    app._active_model_name = "deepseek"
+
+    await app._handle_command_inner("/model current")
+
+    output = "\n".join(app._output_lines)
+    assert "Current model: deepseek" in output
+    assert "model: deepseek:deepseek-v4-flash" in output
+    assert "model_settings: deepseek" in output
+    assert "model_cfg: deepseek" in output
+
+
+@pytest.mark.asyncio
+async def test_tui_app_model_switch_applies_profile() -> None:
+    """The /model <name> command switches the main agent profile."""
+    profile = ModelProfileConfig(model="openai:gpt-4o", model_settings="openai_default", model_cfg="openai")
+    config = MockConfig(models={"gpt": profile})
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    app._runtime = MagicMock()
+
+    with patch("yaacli.app.tui.apply_model_profile") as apply_profile:
+        apply_profile.return_value = MagicMock(context_window=270_000)
+        await app._handle_command_inner("/model gpt")
+
+    apply_profile.assert_called_once_with(app.runtime, profile)
+    assert app._active_model_name == "gpt"
+    assert app._context_window_size == 270_000
+    assert "Model switched to gpt: openai:gpt-4o" in "\n".join(app._output_lines)
+
+
+@pytest.mark.asyncio
+async def test_tui_app_model_switch_rejects_while_running() -> None:
+    """Model switching is blocked while the agent is running."""
+    profile = ModelProfileConfig(model="openai:gpt-4o")
+    config = MockConfig(models={"gpt": profile})
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    app._runtime = MagicMock()
+    app._state = TUIState.RUNNING
+
+    with patch("yaacli.app.tui.apply_model_profile") as apply_profile:
+        await app._handle_command_inner("/model gpt")
+
+    apply_profile.assert_not_called()
+    assert "Cannot switch model while agent is running." in "\n".join(app._output_lines)
 
 
 @pytest.mark.asyncio

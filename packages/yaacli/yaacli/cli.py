@@ -43,6 +43,7 @@ PROVIDER_ENV_VARS = {
     "google-vertex": ("GOOGLE_API_KEY", None),
     "gemini": ("GOOGLE_API_KEY", None),
     "groq": ("GROQ_API_KEY", "GROQ_BASE_URL"),
+    "deepseek": ("DEEPSEEK_API_KEY", None),
     "bedrock": (None, None),  # Uses AWS credentials
 }
 
@@ -56,6 +57,7 @@ PROVIDER_MODEL_SETTINGS = {
     "google-vertex": "gemini_thinking_budget_default",
     "gemini": "gemini_thinking_budget_default",
     "groq": None,  # No preset
+    "deepseek": "deepseek",
     "bedrock": None,
 }
 
@@ -72,6 +74,7 @@ PROVIDER_MODEL_CFG = {
     "google-vertex": "gemini_1m",
     "gemini": "gemini_1m",
     "groq": None,  # Unknown - no capabilities
+    "deepseek": "deepseek",
     "bedrock": None,
 }
 
@@ -197,6 +200,7 @@ def run_setup_wizard(config_manager: ConfigManager) -> bool:
     click.echo("    - anthropic:claude-sonnet-4-20250514")
     click.echo("    - openai:gpt-4o")
     click.echo("    - google-gla:gemini-2.5-pro")
+    click.echo("    - deepseek:deepseek-v4-flash")
     click.echo("    - mygateway@anthropic:claude-sonnet-4")
     click.echo()
 

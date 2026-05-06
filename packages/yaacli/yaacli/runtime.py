@@ -26,13 +26,16 @@ Example:
 
 from __future__ import annotations
 
+import inspect
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic_ai import DeferredToolRequests, ModelSettings
+from pydantic_ai.models import Model
 from pydantic_ai.output import OutputSpec
 from ya_agent_sdk.agents.main import AgentRuntime, create_agent
+from ya_agent_sdk.agents.models import infer_model
 from ya_agent_sdk.context import ModelCapability, ModelConfig, ToolConfig
 from ya_agent_sdk.mcp import build_mcp_servers, extract_mcp_descriptions, extract_optional_mcps
 from ya_agent_sdk.presets import resolve_model_cfg, resolve_model_settings
@@ -52,7 +55,7 @@ from ya_agent_sdk.toolsets.tool_proxy.toolset import ToolProxyToolset
 from ya_agent_sdk.toolsets.tool_search import create_best_strategy
 
 from yaacli.browser import BrowserManager
-from yaacli.config import ConfigManager, MCPConfig, SubagentsConfig, YaacliConfig
+from yaacli.config import ConfigManager, MCPConfig, ModelProfileConfig, SubagentsConfig, YaacliConfig
 from yaacli.environment import TUIEnvironment
 from yaacli.guards import attach_loop_guard
 from yaacli.logging import get_logger
@@ -91,6 +94,51 @@ def _resolve_model_cfg(model_cfg_input: str | dict[str, Any] | None) -> ModelCon
             cfg_dict["capabilities"] = {ModelCapability(c) if isinstance(c, str) else c for c in caps}
 
     return ModelConfig(**cfg_dict)
+
+
+def _resolve_model_settings(model_settings_input: str | dict[str, Any] | None) -> ModelSettings | None:
+    """Resolve model settings from preset name or dict."""
+    return cast(ModelSettings | None, resolve_model_settings(model_settings_input))
+
+
+def resolve_startup_model_profile(config: YaacliConfig) -> tuple[str, ModelProfileConfig]:
+    """Resolve the model profile used when creating the TUI runtime."""
+    selected = config.get_startup_model_profile()
+    if selected is None:
+        raise ValueError("No model configured. Set [general].model or add [models.<name>] profiles.")
+    return selected
+
+
+def _build_effective_model(
+    runtime: AgentRuntime[TUIContext, str | DeferredToolRequests, TUIEnvironment],
+    profile: ModelProfileConfig,
+) -> Model | None:
+    """Build the pydantic-ai model instance for a profile, applying runtime wrappers."""
+    base_model = infer_model(profile.model) if profile.model else None
+    if base_model is not None and runtime.ctx.model_wrapper is not None:
+        wrapper_metadata = runtime.ctx.get_wrapper_metadata()
+        agent_name = getattr(runtime.agent, "name", None) or "main"
+        wrapped = runtime.ctx.model_wrapper(base_model, agent_name, wrapper_metadata)
+        if inspect.isawaitable(wrapped):
+            raise TypeError("Async model_wrapper cannot be used for /model switching.")
+        return cast(Model, wrapped)
+    return base_model
+
+
+def apply_model_profile(
+    runtime: AgentRuntime[TUIContext, str | DeferredToolRequests, TUIEnvironment],
+    profile: ModelProfileConfig,
+) -> ModelConfig:
+    """Apply a model profile to the active main agent.
+
+    This intentionally updates only the main agent. Subagents keep the model
+    values captured when the runtime was created.
+    """
+    model_cfg = _resolve_model_cfg(profile.model_cfg)
+    runtime.agent.model = _build_effective_model(runtime, profile)
+    runtime.agent.model_settings = _resolve_model_settings(profile.model_settings)
+    runtime.ctx.model_cfg = model_cfg
+    return model_cfg
 
 
 def _load_system_prompt(config: YaacliConfig) -> str:
@@ -261,15 +309,17 @@ def create_tui_runtime(
     # Shell environment isolation: configurable via config.toml
     env_kwargs["include_os_env"] = config.include_os_env
 
+    active_model_name, active_model_profile = resolve_startup_model_profile(config)
+
     # Model configuration - resolve from preset name or dict
-    model_cfg = _resolve_model_cfg(config.general.model_cfg)
-    if config.general.model_cfg:
-        logger.debug(f"Using model_cfg: {config.general.model_cfg}")
+    model_cfg = _resolve_model_cfg(active_model_profile.model_cfg)
+    if active_model_profile.model_cfg:
+        logger.debug(f"Using model_cfg: {active_model_profile.model_cfg}")
 
     # Resolve model settings from preset name or dict
-    model_settings = resolve_model_settings(config.general.model_settings)
+    model_settings = _resolve_model_settings(active_model_profile.model_settings)
     if model_settings:
-        logger.debug(f"Using model settings: {config.general.model_settings} -> {model_settings}")
+        logger.debug(f"Using model settings: {active_model_profile.model_settings} -> {model_settings}")
 
     # Tool configuration - setup media hooks if S3 is configured
     tool_config_kwargs: dict[str, Any] = {}
@@ -351,8 +401,8 @@ def create_tui_runtime(
         extra_ctx_kwargs = {"shell_env": dict(config.shell_env)}
 
     runtime = create_agent(
-        model=config.general.model or None,
-        model_settings=cast(ModelSettings, model_settings),
+        model=active_model_profile.model or None,
+        model_settings=model_settings,
         output_type=output_type,
         env=TUIEnvironment,
         env_kwargs=env_kwargs,
@@ -374,8 +424,9 @@ def create_tui_runtime(
     attach_loop_guard(runtime.agent)
 
     logger.info(
-        "Created TUI runtime: model=%s, toolsets=%d, output_retries=%d",
-        config.general.model,
+        "Created TUI runtime: model_profile=%s model=%s, toolsets=%d, output_retries=%d",
+        active_model_name,
+        active_model_profile.model,
         len(toolsets),
         output_retries,
     )

@@ -11,6 +11,7 @@ from yaacli.config import (
     GeneralConfig,
     MCPConfig,
     MCPServerConfig,
+    ModelProfileConfig,
     ToolsConfig,
     YaacliConfig,
 )
@@ -36,6 +37,28 @@ def test_create_tui_runtime_minimal(tmp_path: Path) -> None:
     assert runtime.env is not None
     assert runtime.ctx is not None
     assert runtime.agent is not None
+
+
+def test_create_tui_runtime_uses_active_model_profile(tmp_path: Path) -> None:
+    """Named active model profiles are used to create the main runtime."""
+    config = YaacliConfig(
+        general=GeneralConfig(active_model="gpt"),
+        models={
+            "gpt": ModelProfileConfig(
+                model="openai:gpt-4o",
+                model_settings="openai_default",
+                model_cfg="openai",
+            )
+        },
+    )
+
+    runtime = create_tui_runtime(
+        config=config,
+        working_dir=tmp_path,
+    )
+
+    assert runtime.agent.model is not None
+    assert runtime.ctx.model_cfg.context_window == 270_000
 
 
 async def test_create_tui_runtime_uses_custom_config_dir_for_allowed_paths(tmp_path: Path) -> None:

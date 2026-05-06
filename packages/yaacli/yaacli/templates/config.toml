@@ -2,6 +2,9 @@
 # Location: ~/.yaacli/config.toml
 
 [general]
+# Active model profile from [models]. Leave empty to use legacy model below.
+# active_model = "deepseek"
+
 # Model configuration (required)
 # Format: "provider:model_name"
 # Examples:
@@ -43,11 +46,35 @@ agent_stream_resume_prompt = "The previous streaming model request failed before
 # If empty, uses built-in default from CLI package
 # system_prompt_file = "~/.yaacli/system_prompt.md"
 
+# Named model profiles selectable with /model.
+# /model             List available model profiles
+# /model current     Show the active model profile
+# /model deepseek    Switch the active session to the deepseek profile
+#
+# [models.deepseek]
+# description = "DeepSeek V4 Flash"
+# model = "deepseek:deepseek-v4-flash"
+# model_settings = "deepseek"
+# model_cfg = "deepseek"
+#
+# [models.deepseek_pro]
+# description = "DeepSeek V4 Pro"
+# model = "deepseek:deepseek-v4-pro"
+# model_settings = "deepseek_v4_max"
+# model_cfg = "deepseek_v4"
+#
+# [models.gpt]
+# description = "OpenAI GPT"
+# model = "openai:gpt-4o"
+# model_settings = "openai_default"
+# model_cfg = "openai"
+
 [env]
 # Environment variable overrides for API keys
 # ANTHROPIC_API_KEY = "sk-ant-..."
 # OPENAI_API_KEY = "sk-..."
 # GOOGLE_API_KEY = "..."
+# DEEPSEEK_API_KEY = "sk-..."
 
 [display]
 # Code highlighting theme ("dark" or "light")

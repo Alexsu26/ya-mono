@@ -141,6 +141,7 @@ BUILTIN_COMMANDS = frozenset({
     "clear",
     "cost",
     "tasks",
+    "model",
     "dump",
     "load",
     "exit",

@@ -41,6 +41,7 @@ __all__ = [
     "GeneralConfig",
     "MCPConfig",
     "MCPServerConfig",
+    "ModelProfileConfig",
     "SubagentOverride",
     "SubagentsConfig",
     "ToolsConfig",
@@ -56,6 +57,9 @@ __all__ = [
 
 class GeneralConfig(BaseModel):
     """General agent configuration (global only)."""
+
+    active_model: str = ""
+    """Name of the active model profile from [models]. Empty uses legacy general.model."""
 
     model: str = ""
     """Default model for main agent. Format: 'provider:model_name'. Empty means not configured."""
@@ -162,6 +166,32 @@ class SubagentsConfig(BaseModel):
     """Override settings for specific subagents."""
 
 
+class ModelProfileConfig(BaseModel):
+    """Named model profile selectable at runtime."""
+
+    model: str
+    """Model string. Format: 'provider:model_name'."""
+
+    model_settings: str | dict[str, Any] | None = None
+    """Model settings: preset name or dict of actual values."""
+
+    model_cfg: str | dict[str, Any] | None = None
+    """Model config for context management: preset name or dict."""
+
+    description: str = ""
+    """Human-friendly description shown by /model."""
+
+    @classmethod
+    def from_general(cls, general: GeneralConfig) -> ModelProfileConfig:
+        """Create a model profile from legacy [general] model fields."""
+        return cls(
+            model=general.model,
+            model_settings=general.model_settings,
+            model_cfg=general.model_cfg,
+            description="Legacy [general] model",
+        )
+
+
 class CommandDefinition(BaseModel):
     """Definition for a custom slash command.
 
@@ -238,6 +268,8 @@ class YaacliConfig(BaseModel):
 
     # From global config
     general: GeneralConfig = Field(default_factory=GeneralConfig)
+    models: dict[str, ModelProfileConfig] = Field(default_factory=dict)
+    """Named model profiles selectable with /model."""
     display: DisplayConfig = Field(default_factory=DisplayConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
@@ -272,10 +304,35 @@ class YaacliConfig(BaseModel):
         result.update(self.commands)
         return result
 
+    def get_model_profiles(self) -> dict[str, ModelProfileConfig]:
+        """Get selectable model profiles, including legacy [general] as default."""
+        profiles = dict(self.models)
+        if self.general.model and "default" not in profiles:
+            profiles["default"] = ModelProfileConfig.from_general(self.general)
+        return profiles
+
+    def get_model_profile(self, name: str) -> ModelProfileConfig:
+        """Get a named model profile."""
+        profiles = self.get_model_profiles()
+        if name not in profiles:
+            raise KeyError(f"Unknown model profile: {name}")
+        return profiles[name]
+
+    def get_startup_model_profile(self) -> tuple[str, ModelProfileConfig] | None:
+        """Resolve the model profile used at startup."""
+        if self.general.active_model:
+            return self.general.active_model, self.get_model_profile(self.general.active_model)
+        if self.general.model:
+            return "default", ModelProfileConfig.from_general(self.general)
+        if self.models:
+            first_name = next(iter(self.models))
+            return first_name, self.models[first_name]
+        return None
+
     @property
     def is_configured(self) -> bool:
         """Check if minimum required configuration is present."""
-        return self.general.is_configured
+        return bool(self.general.model or self.models)
 
 
 # =============================================================================
