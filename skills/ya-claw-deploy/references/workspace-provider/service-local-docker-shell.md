@@ -6,12 +6,12 @@ Use this shape when YA Claw runs as a host process and agent shell execution sho
 
 ```mermaid
 flowchart LR
-    CLIENT[Client] --> SERVICE[YA Claw host process]
-    SERVICE --> WORKSPACE[Host workspace path]
-    SERVICE --> DOCKER[Docker Engine]
-    DOCKER --> WSC[Workspace container]
+    CLIENT["Client"] --> SERVICE["YA Claw host process"]
+    SERVICE --> WORKSPACE["Host workspace path"]
+    SERVICE --> DOCKER["Docker Engine"]
+    DOCKER --> WSC["Workspace container"]
     WORKSPACE <--> WSC
-    WSC --> VPATH[/workspace]
+    WSC --> VPATH["/workspace"]
 ```
 
 ## Configuration

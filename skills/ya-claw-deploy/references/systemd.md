@@ -1,18 +1,18 @@
-# systemd Deployment
+# Host Service Deployment
 
-Use this path when the YA Claw service runs directly on a host. Pair it with either service local + Docker shell or service local + local shell from the workspace provider matrix.
+Use this path when the YA Claw service runs directly on a host and is supervised by systemd. Pair it with either service local + Docker shell or service local + local shell from the workspace provider matrix.
 
 ## Runtime Shape
 
 ```mermaid
 flowchart LR
-    NGINX[Nginx or LB] --> SVC[systemd ya-claw service]
-    SVC --> DB[(SQLite or PostgreSQL)]
-    SVC --> DATA[/var/lib/ya-claw/data]
-    SVC --> WS[/var/lib/ya-claw/workspace]
-    SVC --> DOCKER[Docker Engine for Docker shell shape]
-    DOCKER --> WSC[Reusable workspace container]
-    SVC --> LOCAL[Local shell shape]
+    NGINX["Nginx or LB"] --> SVC["systemd ya-claw service"]
+    SVC --> DB[("SQLite or PostgreSQL")]
+    SVC --> DATA["/var/lib/ya-claw/data"]
+    SVC --> WS["/var/lib/ya-claw/workspace"]
+    SVC --> DOCKER["Docker Engine for Docker shell shape"]
+    DOCKER --> WSC["Reusable workspace container"]
+    SVC --> LOCAL["Local shell shape"]
 ```
 
 ## Host Layout

@@ -13,13 +13,13 @@ Use the Docker workspace provider for production-like deployments. Choose the ex
 
 ```mermaid
 flowchart LR
-    CLIENT[Web/API Client] --> SVC[YA Claw Service]
-    SVC --> DB[(SQLite or PostgreSQL)]
-    SVC --> DATA[Persistent Data Dir]
-    SVC --> PROVIDER[WorkspaceProvider]
-    PROVIDER --> LOCAL[Local shell]
-    PROVIDER --> DOCKER[Docker shell]
-    DOCKER --> WSC[Reusable Workspace Container]
+    CLIENT["Web/API Client"] --> SVC["YA Claw Service"]
+    SVC --> DB[("SQLite or PostgreSQL")]
+    SVC --> DATA["Persistent Data Dir"]
+    SVC --> PROVIDER["WorkspaceProvider"]
+    PROVIDER --> LOCAL["Local shell"]
+    PROVIDER --> DOCKER["Docker shell"]
+    DOCKER --> WSC["Reusable Workspace Container"]
 ```
 
 The Docker shell shapes give agents an isolated workspace container with Python, Node.js, Chromium, `agent-browser`, `lark-cli`, and bundled workspace skills.
@@ -86,7 +86,7 @@ Every deployment needs:
 | Docker deployment         | [`references/docker.md`](references/docker.md)                                           | You deploy the YA Claw server as a Docker service                                                               |
 | Workspace provider matrix | [`references/workspace-provider/overview.md`](references/workspace-provider/overview.md) | You choose between service local + Docker shell, service Docker + Docker shell, and service local + local shell |
 | Docker workspace provider | [`references/workspace-provider/docker.md`](references/workspace-provider/docker.md)     | You configure Docker Engine access, path mapping, workspace mounts, and container reuse                         |
-| systemd                   | [`references/systemd.md`](references/systemd.md)                                         | You run YA Claw as a supervised host service                                                                    |
+| Host service              | [`references/systemd.md`](references/systemd.md)                                         | You run YA Claw as a supervised host service                                                                    |
 | Database                  | [`references/database.md`](references/database.md)                                       | You choose SQLite or PostgreSQL, migrate, backup, or restore storage                                            |
 | Profiles                  | [`references/profiles.md`](references/profiles.md)                                       | You seed profiles or manage AgentProfile configuration                                                          |
 | Bridge overview           | [`references/bridge/overview.md`](references/bridge/overview.md)                         | You configure bridge dispatch, adapter enablement, and event-to-run routing                                     |

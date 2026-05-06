@@ -44,16 +44,16 @@ YA_CLAW_BRIDGE_ENABLED_ADAPTERS=lark
 
 ```mermaid
 flowchart TD
-    EXT[External event source] --> ADAPTER[Bridge adapter]
-    ADAPTER --> NORMALIZE[Normalize inbound event]
-    NORMALIZE --> DEDUPE[Event/message dedupe]
-    DEDUPE --> CONVERSATION[Resolve bridge conversation]
-    CONVERSATION --> SESSION[Create or reuse YA Claw session]
-    SESSION --> RUN[Create bridge-triggered run]
-    RUN --> DISPATCH[DispatchMode.ASYNC]
-    DISPATCH --> EXEC[ExecutionSupervisor]
-    EXEC --> WORKSPACE[Agent workspace]
-    WORKSPACE --> REPLY[External reply/action tool]
+    EXT["External event source"] --> ADAPTER["Bridge adapter"]
+    ADAPTER --> NORMALIZE["Normalize inbound event"]
+    NORMALIZE --> DEDUPE["Event/message dedupe"]
+    DEDUPE --> CONVERSATION["Resolve bridge conversation"]
+    CONVERSATION --> SESSION["Create or reuse YA Claw session"]
+    SESSION --> RUN["Create bridge-triggered run"]
+    RUN --> DISPATCH["DispatchMode.ASYNC"]
+    DISPATCH --> EXEC["ExecutionSupervisor"]
+    EXEC --> WORKSPACE["Agent workspace"]
+    WORKSPACE --> REPLY["External reply/action tool"]
 ```
 
 Bridge event handling stores an inbound event record before run creation. Dedupe checks `(adapter, tenant_key, event_id)` first, then `(adapter, tenant_key, external_message_id)`. Conversation resolution maps `(adapter, tenant_key, external_chat_id)` to one YA Claw session.

@@ -8,13 +8,13 @@ Read [`workspace-provider/service-docker-docker-shell.md`](workspace-provider/se
 
 ```mermaid
 flowchart TB
-    RP[Reverse Proxy or Direct Client] --> SVC[YA Claw Server Container]
-    SVC --> DB[(SQLite file or PostgreSQL)]
-    SVC --> DATA[/var/lib/ya-claw/data]
-    SVC --> SERVICE_WS[/var/lib/ya-claw/workspace]
-    SVC --> SOCK[/var/run/docker.sock]
-    SOCK --> WSC[Reusable ya-claw-workspace Container]
-    HOST_WS[/srv/ya-claw/workspace] <--> WSC
+    RP["Reverse Proxy or Direct Client"] --> SVC["YA Claw Server Container"]
+    SVC --> DB[("SQLite file or PostgreSQL")]
+    SVC --> DATA["/var/lib/ya-claw/data"]
+    SVC --> SERVICE_WS["/var/lib/ya-claw/workspace"]
+    SVC --> SOCK["/var/run/docker.sock"]
+    SOCK --> WSC["Reusable ya-claw-workspace Container"]
+    HOST_WS["/srv/ya-claw/workspace"] <--> WSC
 ```
 
 ## Images

@@ -6,14 +6,14 @@ Use this shape when the YA Claw server runs in the `Dockerfile.ya-claw` service 
 
 ```mermaid
 flowchart LR
-    CLIENT[Client] --> SERVICE[YA Claw service container]
-    SERVICE --> SERVICE_WS[Service path: /var/lib/ya-claw/workspace]
-    SERVICE --> SOCK[Docker socket]
-    SOCK --> DAEMON[Docker daemon]
-    DAEMON --> HOST_WS[Host path: /srv/ya-claw/workspace]
-    DAEMON --> WSC[Workspace container]
+    CLIENT["Client"] --> SERVICE["YA Claw service container"]
+    SERVICE --> SERVICE_WS["Service path: /var/lib/ya-claw/workspace"]
+    SERVICE --> SOCK["Docker socket"]
+    SOCK --> DAEMON["Docker daemon"]
+    DAEMON --> HOST_WS["Host path: /srv/ya-claw/workspace"]
+    DAEMON --> WSC["Workspace container"]
     HOST_WS <--> WSC
-    WSC --> VPATH[/workspace]
+    WSC --> VPATH["/workspace"]
 ```
 
 ## Configuration

@@ -6,10 +6,10 @@ Use this shape when YA Claw runs as a trusted host process and agent file/shell 
 
 ```mermaid
 flowchart LR
-    CLIENT[Client] --> SERVICE[YA Claw host process]
-    SERVICE --> WORKSPACE[Real workspace path]
-    WORKSPACE --> FILES[LocalFileOperator]
-    WORKSPACE --> SHELL[LocalShell]
+    CLIENT["Client"] --> SERVICE["YA Claw host process"]
+    SERVICE --> WORKSPACE["Real workspace path"]
+    WORKSPACE --> FILES["LocalFileOperator"]
+    WORKSPACE --> SHELL["LocalShell"]
 ```
 
 ## Configuration
