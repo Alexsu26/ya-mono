@@ -26,6 +26,7 @@ import os
 import shutil
 import signal
 import sys
+import textwrap
 import time
 import traceback
 import uuid
@@ -46,7 +47,7 @@ from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import TextArea
+from prompt_toolkit.widgets import Frame, TextArea
 from pydantic_ai import BinaryContent, DeferredToolRequests, DeferredToolResults, ToolDenied, UsageLimits, UserContent
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
@@ -235,6 +236,8 @@ class TUIApp:
 
     # Virtual viewport rendering (only parse ANSI for visible lines)
     _scroll_offset: int = field(default=0, init=False)  # Display line offset from top
+    _auto_scroll: bool = field(default=True, init=False)
+    _unread_output_lines: int = field(default=0, init=False)
     _block_line_counts: list[int] = field(default_factory=list, init=False)  # Line count per output block
     _total_line_count: int = field(default=0, init=False)  # Sum of all block line counts
     _output_generation: int = field(default=0, init=False)  # Bumped on any content change
@@ -304,7 +307,7 @@ class TUIApp:
 
     # Streaming render throttle (separate from UI invalidation)
     _last_stream_render_time: float = field(default=0.0, init=False)
-    _stream_render_interval: float = field(default=0.08, init=False)  # ~12fps for markdown re-render
+    _stream_render_interval: float = field(default=0.025, init=False)  # ~40fps for lightweight live text
 
     # HITL (Human-in-the-Loop) approval state
     _hitl_pending: bool = field(default=False, init=False)
@@ -648,6 +651,49 @@ class TUIApp:
         self._total_line_count += new_count - old_count
         self._output_generation += 1
 
+    def _update_pinned_unread_count(self) -> None:
+        """Refresh unread line count while the viewport is pinned away from tail."""
+        if self._auto_scroll:
+            self._unread_output_lines = 0
+            return
+        visible_bottom = self._scroll_offset + self._get_viewport_height()
+        self._unread_output_lines = max(0, self._total_line_count - visible_bottom)
+
+    def _maybe_scroll_to_bottom(self) -> None:
+        """Follow output tail only when the user has not pinned the viewport."""
+        if self._auto_scroll:
+            self._scroll_to_bottom()
+        else:
+            self._update_pinned_unread_count()
+
+    def _follow_latest_output(self) -> None:
+        """Restore tail-following behavior and move the viewport to latest output."""
+        self._auto_scroll = True
+        self._unread_output_lines = 0
+        self._scroll_to_bottom()
+
+    def _scroll_output_up(self, lines: int) -> None:
+        """Scroll output up and pin the viewport against streaming auto-follow."""
+        self._scroll_offset = max(0, self._scroll_offset - lines)
+        self._auto_scroll = False
+        self._update_pinned_unread_count()
+        if self._app:
+            self._app.invalidate()
+
+    def _scroll_output_down(self, lines: int) -> None:
+        """Scroll output down; re-enable auto-follow when reaching the tail."""
+        tail_offset = self._get_tail_scroll_offset()
+        self._scroll_offset = min(self._scroll_offset + lines, tail_offset)
+        if self._scroll_offset >= self._get_max_scroll():
+            self._auto_scroll = True
+            self._unread_output_lines = 0
+            self._scroll_to_bottom()
+        else:
+            self._auto_scroll = False
+            self._update_pinned_unread_count()
+        if self._app:
+            self._app.invalidate()
+
     def _append_output(self, text: str) -> None:
         """Append text to output buffer with auto-scroll when running."""
         self._append_block(text)
@@ -655,11 +701,15 @@ class TUIApp:
         # Trim old lines to prevent memory issues
         if len(self._output_lines) > self._max_output_lines:
             trim_count = len(self._output_lines) - self._max_output_lines
+            removed_line_count = 0
             # Subtract line counts of removed blocks
             for i in range(trim_count):
-                self._total_line_count -= self._block_line_counts[i]
+                removed_line_count += self._block_line_counts[i]
+            self._total_line_count -= removed_line_count
             self._output_lines = self._output_lines[trim_count:]
             self._block_line_counts = self._block_line_counts[trim_count:]
+            if not self._auto_scroll:
+                self._scroll_offset = max(0, self._scroll_offset - removed_line_count)
             # Adjust streaming indices to account for removed blocks
             if self._streaming_line_index is not None:
                 self._streaming_line_index -= trim_count
@@ -674,9 +724,7 @@ class TUIApp:
                     self._streaming_thinking = ""
                     self._streaming_thinking_line_index = None
 
-        # Auto-scroll to bottom when agent is running
-        if self._state == TUIState.RUNNING:
-            self._scroll_to_bottom()
+        self._maybe_scroll_to_bottom()
         # Invalidate app to refresh display (throttled during streaming)
         self._throttled_invalidate()
 
@@ -684,21 +732,24 @@ class TUIApp:
         """Get visible output height in lines."""
         if self._app and self._app.output:
             terminal_size = self._app.output.get_size()
-            # Reserve: status bar (2) + steering (dynamic) + input area (5) + margins
+            # Reserve: status bar + steering + framed composer + margins
             return max(5, terminal_size.rows - 9)
         return 40
+
+    def _get_tail_scroll_offset(self) -> int:
+        """Return the tail-follow offset, including a small bottom breathing room."""
+        visible_height = self._get_viewport_height()
+        bottom_padding = 4
+        if self._total_line_count > visible_height:
+            return self._total_line_count - visible_height + bottom_padding
+        return 0
 
     def _scroll_to_bottom(self) -> None:
         """Scroll output to bottom.
 
         Uses cached line count for performance - O(1) operation.
         """
-        visible_height = self._get_viewport_height()
-        bottom_padding = 4
-        if self._total_line_count > visible_height:
-            self._scroll_offset = self._total_line_count - visible_height + bottom_padding
-        else:
-            self._scroll_offset = 0
+        self._scroll_offset = self._get_tail_scroll_offset()
 
     def _get_output_text(self) -> ANSI:
         """Get formatted output for display using virtual viewport.
@@ -773,6 +824,44 @@ class TUIApp:
         # TODO: Make configurable via config
         return "monokai"
 
+    def _wrap_live_text(self, text: str, *, width: int | None = None) -> str:
+        """Cheap terminal-width wrapping for live streaming text.
+
+        Finalized assistant output is still rendered as Markdown. During streaming,
+        avoid full Rich Markdown re-renders so token updates feel continuous.
+        """
+        wrap_width = max(20, (width or self._get_terminal_width()) - 1)
+        wrapped_lines: list[str] = []
+        for line in text.split("\n"):
+            if not line:
+                wrapped_lines.append("")
+                continue
+            wrapped_lines.extend(
+                textwrap.wrap(
+                    line,
+                    width=wrap_width,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                    drop_whitespace=False,
+                    replace_whitespace=False,
+                )
+                or [""]
+            )
+        return "\n".join(wrapped_lines)
+
+    def _render_live_streaming_text(self, text: str) -> str:
+        """Render assistant text cheaply while it is still streaming."""
+        return self._wrap_live_text(text).rstrip("\n")
+
+    def _render_live_streaming_thinking(self, text: str) -> str:
+        """Render thinking cheaply while it is still streaming."""
+        wrapped = self._wrap_live_text(text, width=self._get_terminal_width() - 2)
+        lines = wrapped.split("\n")
+        prefix = "\x1b[2;35m> \x1b[0m"
+        content_start = "\x1b[2;3m"
+        reset = "\x1b[0m"
+        return "\n".join(f"{prefix}{content_start}{line}{reset}" for line in lines).rstrip("\n")
+
     def _start_streaming_text(self, initial_content: str = "") -> None:
         """Start tracking a new streaming text block."""
         self._streaming_text = initial_content
@@ -781,7 +870,9 @@ class TUIApp:
         if initial_content:
             # Add placeholder that will be updated.
             # Empty text blocks should not create a visible blank line.
-            self._append_block(initial_content)
+            self._append_block(self._render_live_streaming_text(initial_content))
+            self._maybe_scroll_to_bottom()
+            self._throttled_invalidate()
 
     def _update_streaming_text(self, delta: str) -> None:
         """Update the current streaming text block with delta.
@@ -797,20 +888,16 @@ class TUIApp:
             return  # Delta buffered in _streaming_text, will render on next interval or finalize
         self._last_stream_render_time = now
 
-        # Re-render markdown for the complete text so far
+        # Live updates are intentionally plain, width-wrapped text. A full
+        # Markdown render happens once in _finalize_streaming_text().
         if self._streaming_line_index is not None:
-            with perf_timer("stream_render_markdown"):
-                rendered = self._renderer.render_markdown(
-                    self._streaming_text,
-                    code_theme=self._get_code_theme(),
-                    width=self._get_terminal_width(),
-                ).rstrip("\n")
+            with perf_timer("stream_render_text"):
+                rendered = self._render_live_streaming_text(self._streaming_text)
             if self._streaming_line_index < len(self._output_lines):
                 self._update_block(self._streaming_line_index, rendered)
             elif rendered:
                 self._append_block(rendered)
-            if self._state == TUIState.RUNNING:
-                self._scroll_to_bottom()
+            self._maybe_scroll_to_bottom()
             self._throttled_invalidate()
 
     def _finalize_streaming_text(self) -> None:
@@ -826,6 +913,7 @@ class TUIApp:
                 self._update_block(self._streaming_line_index, rendered)
             elif rendered:
                 self._append_block(rendered)
+            self._maybe_scroll_to_bottom()
         self._streaming_text = ""
         self._streaming_line_index = None
 
@@ -834,9 +922,9 @@ class TUIApp:
         self._streaming_thinking = initial_content
         self._streaming_thinking_line_index = len(self._output_lines)
         self._last_stream_render_time = 0.0  # Reset throttle for new block
-        # Render initial content with thinking style
-        rendered = self._event_renderer.render_thinking(initial_content, width=self._get_terminal_width()).rstrip("\n")
+        rendered = self._render_live_streaming_thinking(initial_content)
         self._append_block(rendered)
+        self._maybe_scroll_to_bottom()
         self._throttled_invalidate()
 
     def _update_streaming_thinking(self, delta: str) -> None:
@@ -856,13 +944,9 @@ class TUIApp:
         if self._streaming_thinking_line_index is not None and self._streaming_thinking_line_index < len(
             self._output_lines
         ):
-            rendered = self._event_renderer.render_thinking(
-                self._streaming_thinking,
-                width=self._get_terminal_width(),
-            ).rstrip("\n")
+            rendered = self._render_live_streaming_thinking(self._streaming_thinking)
             self._update_block(self._streaming_thinking_line_index, rendered)
-            if self._state == TUIState.RUNNING:
-                self._scroll_to_bottom()
+            self._maybe_scroll_to_bottom()
             self._throttled_invalidate()
 
     def _finalize_streaming_thinking(self) -> None:
@@ -875,6 +959,7 @@ class TUIApp:
             ).rstrip("\n")
             if self._streaming_thinking_line_index < len(self._output_lines):
                 self._update_block(self._streaming_thinking_line_index, rendered)
+            self._maybe_scroll_to_bottom()
         self._streaming_thinking = ""
         self._streaming_thinking_line_index = None
 
@@ -913,7 +998,7 @@ class TUIApp:
         self._current_input_backup = ""
 
     def _append_user_input(self, text: str, attachments: Sequence[PendingAttachment] | None = None) -> None:
-        """Render user input with styled prompt indicator and attachment markers."""
+        """Render user input as a visually distinct turn boundary."""
         width = self._get_terminal_width()
         from rich.text import Text as RichText
 
@@ -924,14 +1009,20 @@ class TUIApp:
             noun = "image" if count == 1 else "images"
             display_text = f"[Attached {count} {noun}]"
 
+        delimiter_width = max(width - 1, 24)
+        top_delimiter = " User ".center(delimiter_width, "-")
+        bottom_delimiter = "-" * delimiter_width
+
         user_text = RichText()
-        user_text.append("> ", style="bold green")
         user_text.append(display_text)
         for attachment in attachment_list:
             user_text.append("\n")
             user_text.append("  [Attached] ", style="dim cyan")
             user_text.append(self._format_attachment_description(attachment), style="dim cyan")
-        rendered = self._renderer.render(user_text, width=width).rstrip("\n")
+        body = self._renderer.render(user_text, width=width).rstrip("\n")
+        green = "\x1b[1;32m"
+        reset = "\x1b[0m"
+        rendered = f"{green}{top_delimiter}{reset}\n{body}\n{green}{bottom_delimiter}{reset}"
         self._append_output(rendered)
 
     def _append_error_output(self, e: BaseException) -> None:
@@ -1048,6 +1139,35 @@ class TUIApp:
     # Status Bar
     # =========================================================================
 
+    def _get_status_model_label(self) -> str:
+        """Return compact active model label for the status bar."""
+        current = self._get_current_model_profile()
+        if current is None:
+            return "--"
+        name, _ = current
+        return name
+
+    def _get_context_percent_label(self) -> str:
+        """Return compact context usage percentage for the status bar."""
+        if self._current_context_tokens > 0 and self._context_window_size > 0:
+            return f"{self._current_context_tokens / self._context_window_size * 100:.0f}%"
+        return "--"
+
+    def _append_pinned_status(self, parts: list[tuple[str, str]]) -> None:
+        """Append pinned-scroll status when the user is reading historical output."""
+        if self._auto_scroll:
+            return
+        self._update_pinned_unread_count()
+        label = "Pinned"
+        if self._unread_output_lines:
+            label = f"Pinned: +{self._unread_output_lines} lines"
+        parts.extend([
+            ("class:status-bar", " | "),
+            ("class:status-bar.warning", label),
+            ("class:status-bar", " | "),
+            ("class:status-bar", "Ctrl+L: Bottom"),
+        ])
+
     def _get_status_text(self) -> list[tuple[str, str]]:
         """Get formatted status bar text."""
         if self._shutdown_status:
@@ -1060,27 +1180,29 @@ class TUIApp:
         mode_style = f"class:status-bar.mode-{self._mode.value}"
         state_text = "RUNNING" if self._state == TUIState.RUNNING else "IDLE"
         attachment_label = self._format_pending_attachments_label()
-
-        # Calculate context usage percentage
-        if self._current_context_tokens > 0 and self._context_window_size > 0:
-            context_pct = f"{self._current_context_tokens / self._context_window_size * 100:.0f}"
-        else:
-            context_pct = "--"
+        context_pct = self._get_context_percent_label()
+        model_label = self._get_status_model_label()
 
         # Build status based on state
         if self._state == TUIState.RUNNING:
             # Check if waiting for HITL approval
             if self._hitl_pending:
                 approval_progress = f"{self._current_approval_index + 1}/{len(self._pending_approvals)}"
-                return [
+                parts = [
                     (mode_style, f" {self._mode.value.upper()} "),
+                    ("class:status-bar", " | "),
+                    ("class:status-bar", "State: RUNNING"),
+                    ("class:status-bar", " | "),
+                    ("class:status-bar", f"Model: {model_label}"),
                     ("class:status-bar", " | "),
                     ("class:status-bar.warning", f"Approval: {approval_progress}"),
                     ("class:status-bar", " | "),
-                    ("class:status-bar", f"Context: {context_pct}%"),
+                    ("class:status-bar", f"Context: {context_pct}"),
                     ("class:status-bar", " | "),
                     ("class:status-bar", "Enter/Y: Approve | Text: Reject | Ctrl+C: Cancel"),
                 ]
+                self._append_pinned_status(parts)
+                return parts
             else:
                 # Show phase-specific status
                 phase_display = {"thinking": "Thinking...", "tools": "Running tools..."}.get(
@@ -1089,9 +1211,13 @@ class TUIApp:
                 parts = [
                     (mode_style, f" {self._mode.value.upper()} "),
                     ("class:status-bar", " | "),
+                    ("class:status-bar", "State: RUNNING"),
+                    ("class:status-bar", " | "),
+                    ("class:status-bar", f"Model: {model_label}"),
+                    ("class:status-bar", " | "),
                     ("class:status-bar", phase_display),
                     ("class:status-bar", " | "),
-                    ("class:status-bar", f"Context: {context_pct}%"),
+                    ("class:status-bar", f"Context: {context_pct}"),
                 ]
                 ctx = self.runtime.ctx
                 if ctx.loop_active:
@@ -1114,6 +1240,7 @@ class TUIApp:
                     ("class:status-bar", " | "),
                     ("class:status-bar", "Ctrl+C: Interrupt "),
                 ])
+                self._append_pinned_status(parts)
                 return parts
         else:
             # IDLE: show input mode and scroll hint
@@ -1129,7 +1256,9 @@ class TUIApp:
                 ("class:status-bar", " | "),
                 ("class:status-bar", f"State: {state_text}"),
                 ("class:status-bar", " | "),
-                ("class:status-bar", f"Context: {context_pct}%"),
+                ("class:status-bar", f"Model: {model_label}"),
+                ("class:status-bar", " | "),
+                ("class:status-bar", f"Context: {context_pct}"),
             ]
             bg_label = self._format_background_label()
             if bg_label:
@@ -1148,15 +1277,16 @@ class TUIApp:
                 ("class:status-bar", " | "),
                 ("class:status-bar", scroll_hint),
                 ("class:status-bar", " | "),
+                ("class:status-bar", "Mouse: Scroll" if self._mouse_enabled else "Mouse: Select"),
+                ("class:status-bar", " | "),
                 ("class:status-bar", "Ctrl+C: Exit "),
             ])
+            self._append_pinned_status(parts)
             return parts
 
     def _get_prompt(self) -> str:
         """Get the input prompt based on current state."""
-        state_indicator = "*" if self._state == TUIState.RUNNING else ">"
-        mouse_mode = "scroll" if self._mouse_enabled else "select"
-        return f"[{mouse_mode}] {state_indicator} "
+        return "> "
 
     # =========================================================================
     # Agent Execution
@@ -1749,6 +1879,7 @@ class TUIApp:
             "agent_name": agent_name,
         }
         self._append_block(rendered.rstrip())
+        self._maybe_scroll_to_bottom()
         self._throttled_invalidate()
 
     def _handle_subagent_complete(self, event: SubagentCompleteEvent) -> None:
@@ -1804,6 +1935,7 @@ class TUIApp:
         # Update the line in place
         if line_index < len(self._output_lines):
             self._update_block(line_index, rendered.rstrip())
+            self._maybe_scroll_to_bottom()
 
         # Clean up state
         del self._subagent_states[agent_id]
@@ -1837,6 +1969,7 @@ class TUIApp:
         # Update the line in place
         if line_index < len(self._output_lines):
             self._update_block(line_index, rendered.rstrip())
+            self._maybe_scroll_to_bottom()
             self._throttled_invalidate()
 
     @staticmethod
@@ -2111,12 +2244,14 @@ class TUIApp:
         if text.startswith("/"):
             self._add_prompt_history(text)
             input_area.buffer.reset()
+            self._follow_latest_output()
             self._track_managed_task(asyncio.create_task(self._handle_command(text)))
             return
 
         if text.startswith("!"):
             self._add_prompt_history(text)
             input_area.buffer.reset()
+            self._follow_latest_output()
             self._track_managed_task(asyncio.create_task(self._execute_shell_command(text[1:])))
             return
 
@@ -2128,6 +2263,7 @@ class TUIApp:
         self._add_prompt_history(text)
 
         input_area.buffer.reset()
+        self._follow_latest_output()
         self._append_user_input(text, attachments)
         self._agent_task = asyncio.create_task(self._run_agent(text, attachments))
         self._agent_task.add_done_callback(self._on_agent_task_done)
@@ -2269,16 +2405,11 @@ class TUIApp:
         # Scroll functions
         def _scroll_up(event: KeyPressEvent) -> None:
             """Scroll output up."""
-            self._scroll_offset = max(0, self._scroll_offset - 10)
-            if self._app:
-                self._app.invalidate()
+            self._scroll_output_up(10)
 
         def _scroll_down(event: KeyPressEvent) -> None:
             """Scroll output down."""
-            max_scroll = self._get_max_scroll()
-            self._scroll_offset = min(self._scroll_offset + 10, max_scroll)
-            if self._app:
-                self._app.invalidate()
+            self._scroll_output_down(10)
 
         # Register scroll keybindings
         kb.add("pageup")(_scroll_up)
@@ -2293,7 +2424,7 @@ class TUIApp:
         @kb.add("c-l")
         def handle_ctrl_l(event: KeyPressEvent) -> None:
             """Scroll to bottom of output."""
-            self._scroll_to_bottom()
+            self._follow_latest_output()
             if self._app:
                 self._app.invalidate()
 
@@ -2374,6 +2505,7 @@ class TUIApp:
             "status-bar.mode-plan": "bg:ansiblue fg:white bold",
             "steering-pane": "bg:ansibrightblack fg:ansicyan",
             "input-area": "",
+            "input-frame": "fg:ansiblue",
         })
 
     # =========================================================================
@@ -2388,7 +2520,7 @@ class TUIApp:
             logger.exception("Command failed: %s", command)
             self._append_error_output(e)
         finally:
-            self._scroll_to_bottom()
+            self._follow_latest_output()
             if self._app:
                 self._app.invalidate()
 
@@ -2660,6 +2792,7 @@ class TUIApp:
         kb_table.add_row("Escape", "Toggle mouse mode")
         kb_table.add_row("Up/Down, Ctrl+P/N", "Browse history")
         kb_table.add_row("PageUp/PageDown", "Scroll output")
+        kb_table.add_row("Ctrl+L", "Jump to latest output")
         lines.append(self._renderer.render(kb_table).rstrip())
 
         self._append_output("\n".join(lines))
@@ -2684,6 +2817,8 @@ class TUIApp:
         self._output_generation = 0
         self._total_line_count = 0
         self._scroll_offset = 0
+        self._auto_scroll = True
+        self._unread_output_lines = 0
         # Reset streaming state
         self._streaming_text = ""
         self._streaming_line_index = None
@@ -3229,15 +3364,10 @@ class TUIApp:
             def mouse_handler(self, mouse_event: MouseEvent) -> object:
                 """Handle mouse scroll events."""
                 if mouse_event.event_type == MouseEventType.SCROLL_UP:
-                    tui_ref._scroll_offset = max(0, tui_ref._scroll_offset - 3)
-                    if tui_ref._app:
-                        tui_ref._app.invalidate()
+                    tui_ref._scroll_output_up(3)
                     return None
                 elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
-                    max_scroll = tui_ref._get_max_scroll()
-                    tui_ref._scroll_offset = min(tui_ref._scroll_offset + 3, max_scroll)
-                    if tui_ref._app:
-                        tui_ref._app.invalidate()
+                    tui_ref._scroll_output_down(3)
                     return None
                 return super().mouse_handler(mouse_event)
 
@@ -3260,9 +3390,9 @@ class TUIApp:
         # Status bar
         status_bar = Window(
             content=FormattedTextControl(self._get_status_text),
-            height=2,
+            height=1,
             style="class:status-bar",
-            wrap_lines=True,
+            wrap_lines=False,
         )
 
         # Input area with mouse scroll support
@@ -3294,7 +3424,7 @@ class TUIApp:
             prompt=self._get_prompt,
             style="class:input-area",
             focusable=True,
-            height=5,
+            height=4,
             scrollbar=True,
         )
 
@@ -3311,13 +3441,19 @@ class TUIApp:
         input_area.window.content = scrollable_control
         input_area.control = scrollable_control
 
-        # Layout: Output | Steering | Status | Input
+        input_frame = Frame(
+            body=input_area,
+            title=" Composer ",
+            style="class:input-frame",
+        )
+
+        # Layout: Output | Steering | Composer | Status
         layout = Layout(
             HSplit([
                 output_window,
                 steering_window,
+                input_frame,
                 status_bar,
-                input_area,
             ]),
             focused_element=input_area,
         )

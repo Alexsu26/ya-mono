@@ -7,6 +7,7 @@ Focus on testable components and state transitions.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,6 +31,8 @@ from yaacli.app import TUIApp, TUIMode, TUIState
 from yaacli.app.tui import PendingAttachment, _is_benign_contextvar_cleanup_error
 from yaacli.clipboard import ClipboardImage, ClipboardImageReadResult
 from yaacli.config import CommandDefinition, ModelProfileConfig
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 @dataclass
@@ -229,6 +232,64 @@ def test_tui_app_append_output():
     assert app._output_generation > 0
     assert len(app._block_line_counts) == 2
     assert app._total_line_count == 2
+
+
+def test_tui_app_user_prompt_uses_turn_separator():
+    """Submitted user prompts render as a distinct turn boundary."""
+    config = MockConfig()
+    config_manager = MockConfigManager()
+
+    app = TUIApp(config=config, config_manager=config_manager)
+    mock_output = MagicMock()
+    mock_output.get_size.return_value = MagicMock(columns=100, rows=24)
+    app._app = MagicMock(output=mock_output)
+
+    app._append_user_input("hello")
+
+    output = ANSI_RE.sub("", "\n".join(app._output_lines))
+    first_line = output.splitlines()[0]
+    assert "User" in output
+    assert "hello" in output
+    assert "----" in output
+    assert len(first_line) == 99
+
+
+def test_tui_app_status_bar_shows_active_model():
+    """The bottom status text includes the active model profile name."""
+    config = MockConfig(models={"deepseek": ModelProfileConfig(model="deepseek:deepseek-v4-flash")})
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    app._active_model_name = "deepseek"
+
+    status = "".join(text for _, text in app._get_status_text())
+
+    assert "State: IDLE" in status
+    assert "Model: deepseek" in status
+
+
+def test_tui_app_pinned_scroll_does_not_follow_new_output():
+    """New output does not force the viewport to tail after the user scrolls up."""
+    config = MockConfig()
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    mock_output = MagicMock()
+    mock_output.get_size.return_value = MagicMock(columns=80, rows=20)
+    app._app = MagicMock(output=mock_output)
+
+    app._append_output("\n".join(f"line {i}" for i in range(30)))
+    app._scroll_output_up(10)
+    pinned_offset = app._scroll_offset
+
+    app._append_output("new line 1\nnew line 2")
+
+    assert app._scroll_offset == pinned_offset
+    assert app._auto_scroll is False
+    assert app._unread_output_lines > 0
+
+    status = "".join(text for _, text in app._get_status_text())
+    assert "Pinned:" in status
+
+    app._follow_latest_output()
+    assert app._auto_scroll is True
+    assert app._unread_output_lines == 0
 
 
 def test_tui_app_output_line_limit():
@@ -450,7 +511,7 @@ def test_tui_app_streaming_text_lifecycle():
     assert app._streaming_line_index == 0
     assert len(app._output_lines) == 1
 
-    # Update streaming - this renders markdown so needs proper width
+    # Update streaming uses lightweight live text rendering.
     app._update_streaming_text(" World")
     assert app._streaming_text == "Hello World"
 
@@ -458,6 +519,29 @@ def test_tui_app_streaming_text_lifecycle():
     app._finalize_streaming_text()
     assert app._streaming_text == ""
     assert app._streaming_line_index is None
+
+
+def test_tui_app_streaming_text_uses_lightweight_live_render():
+    """Live token updates avoid expensive Markdown rendering until finalization."""
+    config = MockConfig()
+    config_manager = MockConfigManager()
+
+    app = TUIApp(config=config, config_manager=config_manager)
+    mock_output = MagicMock()
+    mock_output.get_size.return_value = MagicMock(columns=80, rows=24)
+    app._app = MagicMock(output=mock_output)
+
+    with patch.object(app._renderer, "render_markdown", wraps=app._renderer.render_markdown) as render_markdown:
+        app._start_streaming_text("Hello")
+        app._update_streaming_text(" **World**")
+
+        assert render_markdown.call_count == 0
+        assert "**World**" in app._output_lines[0]
+
+        app._finalize_streaming_text()
+
+    assert render_markdown.call_count == 1
+    assert app._streaming_text == ""
 
 
 def test_tui_app_empty_streaming_text_does_not_append_blank_line():
