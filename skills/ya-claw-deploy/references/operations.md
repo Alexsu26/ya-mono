@@ -112,7 +112,29 @@ docker compose up -d
 curl http://127.0.0.1:9042/healthz
 ```
 
-Local image baseline:
+systemd + uv-managed tool baseline:
+
+```bash
+sudo env \
+  UV_TOOL_DIR=/opt/ya-claw/tools \
+  UV_TOOL_BIN_DIR=/opt/ya-claw/bin \
+  uv tool upgrade ya-claw
+sudo systemctl restart ya-claw
+curl http://127.0.0.1:9042/healthz
+```
+
+Pin a specific version:
+
+```bash
+YA_CLAW_VERSION=replace-with-release-version
+sudo env \
+  UV_TOOL_DIR=/opt/ya-claw/tools \
+  UV_TOOL_BIN_DIR=/opt/ya-claw/bin \
+  uv tool install "ya-claw==${YA_CLAW_VERSION}" --python 3.13 --force
+sudo systemctl restart ya-claw
+```
+
+Local source image baseline:
 
 ```bash
 git pull
@@ -230,5 +252,5 @@ YA_CLAW_AUTO_SEED_PROFILES=true
 ```
 
 ```bash
-uv run --package ya-claw ya-claw profiles seed --seed-file /etc/ya-claw/profiles.yaml
+ya-claw profiles seed --seed-file /etc/ya-claw/profiles.yaml
 ```

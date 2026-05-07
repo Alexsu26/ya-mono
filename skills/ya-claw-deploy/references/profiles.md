@@ -24,7 +24,7 @@ Seeded profiles use create/update semantics. Every startup refreshes matching da
 Manual seed:
 
 ```bash
-uv run --package ya-claw ya-claw profiles seed --file /etc/ya-claw/profiles.yaml
+ya-claw profiles seed --seed-file /etc/ya-claw/profiles.yaml
 ```
 
 API seed:
