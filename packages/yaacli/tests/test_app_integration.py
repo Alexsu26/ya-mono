@@ -24,6 +24,7 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.widgets import TextArea
 from pydantic_ai import BinaryContent
+from pydantic_ai.messages import FunctionToolCallEvent, FunctionToolResultEvent, ToolCallPart, ToolReturnPart
 from y_agent_environment.shell import BackgroundProcess
 
 # Import the components we're testing
@@ -595,6 +596,33 @@ def test_tui_app_streaming_thinking_lifecycle():
     app._finalize_streaming_thinking()
     assert app._streaming_thinking == ""
     assert app._streaming_thinking_line_index is None
+
+
+def test_tui_app_tool_result_replaces_running_tool_line():
+    """A completed tool dims the original running line instead of appending another row."""
+    config = MockConfig()
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    mock_output = MagicMock()
+    mock_output.get_size.return_value = MagicMock(columns=100, rows=24)
+    app._app = MagicMock(output=mock_output)
+
+    call_event = FunctionToolCallEvent(
+        part=ToolCallPart(tool_name="grep", args={"pattern": "needle"}, tool_call_id="call-1")
+    )
+    app._handle_stream_event(MagicMock(event=call_event, agent_id="main"))
+
+    assert len(app._output_lines) == 1
+    assert "running" in app._output_lines[0]
+
+    result_event = FunctionToolResultEvent(
+        result=ToolReturnPart(tool_name="grep", content="found", tool_call_id="call-1")
+    )
+    app._handle_stream_event(MagicMock(event=result_event, agent_id="main"))
+
+    output = ANSI_RE.sub("", "\n".join(app._output_lines))
+    assert len(app._output_lines) == 1
+    assert "grep done" in output
+    assert "running" not in output
 
 
 # =============================================================================

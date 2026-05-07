@@ -258,6 +258,7 @@ class TUIApp:
     # Tool tracking
     _tool_messages: dict[str, ToolMessage] = field(default_factory=dict, init=False)
     _printed_tool_calls: set[str] = field(default_factory=set, init=False)
+    _tool_call_line_indices: dict[str, int] = field(default_factory=dict, init=False)
 
     # Subagent state tracking: agent_id -> {"line_index": int, "tool_names": list[str]}
     _subagent_states: dict[str, dict[str, Any]] = field(default_factory=dict, init=False)
@@ -723,6 +724,12 @@ class TUIApp:
                     # Thinking block was trimmed away - reset
                     self._streaming_thinking = ""
                     self._streaming_thinking_line_index = None
+            for tool_call_id, line_index in list(self._tool_call_line_indices.items()):
+                new_index = line_index - trim_count
+                if new_index < 0:
+                    del self._tool_call_line_indices[tool_call_id]
+                else:
+                    self._tool_call_line_indices[tool_call_id] = new_index
 
         self._maybe_scroll_to_bottom()
         # Invalidate app to refresh display (throttled during streaming)
@@ -2068,6 +2075,7 @@ class TUIApp:
             )
             self._event_renderer.tracker.start_call(tool_call_id, tool_name, message_event.part.args)
             rendered = self._event_renderer.render_tool_call_start(tool_name, tool_call_id)
+            self._tool_call_line_indices[tool_call_id] = len(self._output_lines)
             self._append_output(rendered.rstrip())
 
         elif isinstance(message_event, FunctionToolResultEvent):
@@ -2086,7 +2094,14 @@ class TUIApp:
                     rendered = self._event_renderer.render_tool_call_complete(
                         tool_msg, duration=duration, width=self._get_terminal_width()
                     )
-                    self._append_output(rendered.rstrip())
+                    rendered = rendered.rstrip()
+                    line_index = self._tool_call_line_indices.pop(tool_call_id, None)
+                    if line_index is not None and line_index < len(self._output_lines):
+                        self._update_block(line_index, rendered)
+                        self._maybe_scroll_to_bottom()
+                        self._throttled_invalidate()
+                    else:
+                        self._append_output(rendered)
                     self._printed_tool_calls.add(tool_call_id)
 
         # Handle SDK events (compact, handoff)
@@ -2826,6 +2841,7 @@ class TUIApp:
         self._streaming_thinking_line_index = None
         self._printed_tool_calls.clear()
         self._tool_messages.clear()
+        self._tool_call_line_indices.clear()
         self._subagent_states.clear()
         self._steering_items.clear()
         self._reset_pending_attachments()

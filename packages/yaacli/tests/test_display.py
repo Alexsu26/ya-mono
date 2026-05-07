@@ -518,7 +518,8 @@ def test_event_renderer_render_tool_call_start():
     """Test rendering tool call start."""
     renderer = EventRenderer()
     result = renderer.render_tool_call_start("grep", "call-123")
-    assert "Calling" in result
+    assert "●" in result
+    assert "running" in result
     assert "grep" in result
 
 
@@ -533,7 +534,8 @@ def test_event_renderer_render_tool_call_complete_normal():
     )
     result = renderer.render_tool_call_complete(msg, duration=1.2)
     assert "grep" in result
-    assert "Complete" in result
+    assert "●" in result
+    assert "done" in result
 
 
 def test_event_renderer_render_tool_call_complete_special():
@@ -638,7 +640,7 @@ def test_full_tool_lifecycle():
     start_output = renderer.render_tool_call_start("view", "call-1")
     renderer.tracker.start_call("call-1", "view", {"file_path": "test.py"})
 
-    assert "Calling" in start_output
+    assert "running" in start_output
     assert renderer.tracker.has_active_calls()
 
     # Complete tool
@@ -841,5 +843,5 @@ def test_edit_tool_no_longer_special_panel():
     )
     # Should now use inline text format, not special panel
     result = renderer.render_tool_call_complete(msg, duration=0.1)
-    assert "Complete:" in result
+    assert "done" in result
     assert "edit" in result
