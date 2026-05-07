@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import pytest
 from prompt_toolkit import Application
 from prompt_toolkit.application import create_app_session
+from prompt_toolkit.completion import Completion
+from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import HSplit, Layout, Window
@@ -29,7 +31,12 @@ from y_agent_environment.shell import BackgroundProcess
 
 # Import the components we're testing
 from yaacli.app import TUIApp, TUIMode, TUIState
-from yaacli.app.tui import PendingAttachment, _is_benign_contextvar_cleanup_error
+from yaacli.app.tui import (
+    PendingAttachment,
+    SlashCommandCompleter,
+    _is_benign_contextvar_cleanup_error,
+    _is_shift_enter_event_data,
+)
 from yaacli.clipboard import ClipboardImage, ClipboardImageReadResult
 from yaacli.config import CommandDefinition, ModelProfileConfig
 
@@ -860,7 +867,7 @@ def test_tui_app_input_keybindings_are_eager():
 
     key_bindings = app._setup_input_keybindings(input_area)
     eager_handlers = {
-        tuple(key.value for key in binding.keys): binding.handler.__name__
+        tuple(getattr(key, "value", key) for key in binding.keys): binding.handler.__name__
         for binding in key_bindings.bindings
         if bool(binding.eager())
     }
@@ -871,6 +878,81 @@ def test_tui_app_input_keybindings_are_eager():
     assert eager_handlers[("c-n",)] == "handle_ctrl_n"
     assert eager_handlers[("c-m",)] == "handle_enter"
     assert eager_handlers[("c-j",)] == "handle_ctrl_j"
+    assert eager_handlers[("escape", "[", "1", "3", ";", "2", "u")] == "handle_shift_enter"
+    assert eager_handlers[("escape", "[", "1", "3", ";", "2", "~")] == "handle_shift_enter"
+    assert eager_handlers[("/",)] == "handle_slash"
+
+
+def test_tui_app_shift_enter_event_data_detection():
+    """Known enhanced keyboard encodings are treated as Shift+Enter."""
+    assert _is_shift_enter_event_data("\x1b[13;2u")
+    assert _is_shift_enter_event_data("\x1b[13;2~")
+    assert _is_shift_enter_event_data("\x1b[27;2;13~")
+    assert not _is_shift_enter_event_data("\r")
+
+
+def test_tui_app_history_keys_move_completion_menu_when_open():
+    """History navigation keys move completion candidates before browsing history."""
+    config = MockConfig()
+    config_manager = MockConfigManager()
+    app = TUIApp(config=config, config_manager=config_manager)
+    input_area = TextArea(multiline=True)
+    input_area.buffer.text = "/"
+    input_area.buffer.cursor_position = 1
+    input_area.buffer._set_completions([
+        Completion("/help", start_position=-1),
+        Completion("/model", start_position=-1),
+        Completion("/tasks", start_position=-1),
+    ])
+    app._prompt_history = ["previous prompt"]
+
+    key_bindings = app._setup_input_keybindings(input_area)
+    handlers = {
+        tuple(getattr(key, "value", key) for key in binding.keys): binding.handler for binding in key_bindings.bindings
+    }
+
+    handlers[("down",)](MagicMock())
+    assert input_area.buffer.complete_state is not None
+    assert input_area.buffer.complete_state.complete_index == 0
+    assert input_area.buffer.text == "/help"
+
+    handlers[("c-n",)](MagicMock())
+    assert input_area.buffer.complete_state.complete_index == 1
+    assert input_area.buffer.text == "/model"
+
+    handlers[("up",)](MagicMock())
+    assert input_area.buffer.complete_state.complete_index == 0
+    assert input_area.buffer.text == "/help"
+
+    handlers[("c-p",)](MagicMock())
+    assert input_area.buffer.complete_state.complete_index == 0
+    assert input_area.buffer.text == "/help"
+
+
+def test_tui_app_slash_command_completer_lists_and_filters_commands():
+    """Slash completer lists commands for / and filters by typed prefix."""
+    config = MockConfig(
+        commands={
+            "commit": CommandDefinition(
+                prompt="Create a git commit for the current changes.",
+                mode="act",
+                description="Commit changes",
+            )
+        }
+    )
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    completer = SlashCommandCompleter(app._get_slash_command_entries)
+
+    all_commands = list(completer.get_completions(Document("/"), MagicMock()))
+    all_texts = {completion.text for completion in all_commands}
+    assert "/model" in all_texts
+    assert "/commit" in all_texts
+
+    model_commands = list(completer.get_completions(Document("/m"), MagicMock()))
+    assert [completion.text for completion in model_commands] == ["/model"]
+
+    non_command = list(completer.get_completions(Document("hello /m"), MagicMock()))
+    assert non_command == []
 
 
 def test_tui_app_focused_input_keybindings_win_in_application_registry():
@@ -1104,15 +1186,16 @@ def test_tui_app_context_token_tracking():
 # =============================================================================
 
 
-def test_tui_app_input_mode():
-    """Test input mode tracking."""
+def test_tui_app_input_key_hint():
+    """Status text advertises Enter send and Shift+Enter newline."""
     config = MockConfig()
     config_manager = MockConfigManager()
 
     app = TUIApp(config=config, config_manager=config_manager)
 
-    # Default mode
-    assert app._input_mode == "send"
+    status = "".join(text for _, text in app._get_status_text())
+    assert "Enter:Send" in status
+    assert "Shift+Enter:Newline" in status
 
 
 def test_tui_app_mouse_enabled():

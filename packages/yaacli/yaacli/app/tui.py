@@ -6,7 +6,7 @@ This module provides the main TUI application with:
 - Steering message injection during execution
 - Mode switching (ACT/PLAN) via /act and /plan slash commands
 - Scrollable output with keyboard and mouse support
-- Input mode switching (send/edit) with Tab key
+- Slash command completion in the input composer
 - Double Ctrl+C exit confirmation
 
 Example:
@@ -30,7 +30,7 @@ import textwrap
 import time
 import traceback
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -40,11 +40,14 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, cast
 
 from prompt_toolkit import Application
+from prompt_toolkit.completion import CompleteEvent, Completer, Completion
+from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame, TextArea
@@ -110,6 +113,30 @@ logger = get_logger(__name__)
 _SHUTDOWN_AGENT_TASK_TIMEOUT = 8.0
 _SHUTDOWN_MANAGED_TASKS_TIMEOUT = 5.0
 _DIRECT_SHELL_TERMINATE_TIMEOUT = 2.0
+_MODIFY_OTHER_KEYS_ENABLE = "\x1b[>4;2m"
+_MODIFY_OTHER_KEYS_DISABLE = "\x1b[>4;0m"
+_SHIFT_ENTER_EVENT_DATA = frozenset({
+    "\x1b[13;2u",
+    "\x1b[13;2~",
+    "\x1b[27;2;13~",
+})
+
+_BUILTIN_SLASH_COMMAND_DESCRIPTIONS = {
+    "help": "Show available commands",
+    "clear": "Clear the screen and conversation history",
+    "cost": "Show token usage and estimated cost",
+    "perf": "Show performance metrics",
+    "dump": "Dump current session history",
+    "session": "List or restore saved sessions",
+    "load": "Load conversation history from a folder",
+    "exit": "Exit yaacli",
+    "act": "Switch to ACT mode",
+    "plan": "Switch to PLAN mode",
+    "tasks": "Show active tasks, subagents, and processes",
+    "model": "List, show, or switch model profiles",
+    "paste-image": "Attach an image from the clipboard",
+    "loop": "Run iterative task loop",
+}
 
 
 # =============================================================================
@@ -158,6 +185,45 @@ def _get_elapsed_seconds(started_at: datetime) -> float:
         return (datetime.now() - started_at).total_seconds()
 
     return (datetime.now(UTC) - started_at.astimezone(UTC)).total_seconds()
+
+
+class SlashCommandCompleter(Completer):
+    """Complete slash commands at the beginning of the input buffer."""
+
+    def __init__(self, get_entries: Callable[[], dict[str, str]]) -> None:
+        self._get_entries = get_entries
+
+    @staticmethod
+    def _command_prefix(text_before_cursor: str) -> str | None:
+        if not text_before_cursor.startswith("/"):
+            return None
+        if "\n" in text_before_cursor:
+            return None
+        if any(ch.isspace() for ch in text_before_cursor):
+            return None
+        return text_before_cursor[1:].lower()
+
+    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Iterable[Completion]:
+        prefix = self._command_prefix(document.text_before_cursor)
+        if prefix is None:
+            return
+
+        replace_len = len(prefix) + 1
+        for name, description in sorted(self._get_entries().items()):
+            if not name.startswith(prefix):
+                continue
+            command = f"/{name}"
+            yield Completion(
+                command,
+                start_position=-replace_len,
+                display=command,
+                display_meta=description,
+            )
+
+
+def _is_shift_enter_event_data(data: str) -> bool:
+    """Return whether key event data is a known Shift+Enter encoding."""
+    return data in _SHIFT_ENTER_EVENT_DATA
 
 
 # =============================================================================
@@ -266,9 +332,6 @@ class TUIApp:
     # Steering pane
     _steering_items: list[tuple[str, str, str]] = field(default_factory=list, init=False)
     _max_steering_lines: int = field(default=5, init=False)
-
-    # Input mode: "send" (Enter sends) or "edit" (Enter inserts newline)
-    _input_mode: str = field(default="send", init=False)
 
     # Mouse support mode
     _mouse_enabled: bool = field(default=True, init=False)
@@ -1250,12 +1313,7 @@ class TUIApp:
                 self._append_pinned_status(parts)
                 return parts
         else:
-            # IDLE: show input mode and scroll hint
-            if self._input_mode == "send":
-                input_mode_text = "Enter:Send | Tab:Multiline"
-            else:
-                input_mode_text = "Enter:Newline | Tab:Send"
-
+            input_mode_text = "Enter:Send | Shift+Enter:Newline"
             scroll_hint = "Fn+Up/Down: Scroll" if sys.platform == "darwin" else "Ctrl+Up/Down: Scroll"
 
             parts = [
@@ -2303,6 +2361,58 @@ class TUIApp:
     # UI Setup
     # =========================================================================
 
+    def _get_slash_command_entries(self) -> dict[str, str]:
+        """Return slash command names and descriptions for completion."""
+        entries = dict(_BUILTIN_SLASH_COMMAND_DESCRIPTIONS)
+        for name, cmd_def in self.config.get_commands().items():
+            entries[name] = cmd_def.description or "Custom command"
+        return entries
+
+    @staticmethod
+    def _apply_selected_completion(input_area: TextArea) -> bool:
+        """Apply the current completion when the completion menu is open."""
+        complete_state = input_area.buffer.complete_state
+        if complete_state is None:
+            return False
+
+        completion = complete_state.current_completion
+        if completion is None:
+            input_area.buffer.complete_next()
+            complete_state = input_area.buffer.complete_state
+            completion = complete_state.current_completion if complete_state else None
+        if completion is None:
+            return False
+
+        input_area.buffer.apply_completion(completion)
+        return True
+
+    @staticmethod
+    def _move_completion(input_area: TextArea, *, forward: bool) -> bool:
+        """Move within the active completion menu, if it is open."""
+        if input_area.buffer.complete_state is None:
+            return False
+        if forward:
+            input_area.buffer.complete_next(disable_wrap_around=True)
+        else:
+            input_area.buffer.complete_previous(disable_wrap_around=True)
+        return True
+
+    @staticmethod
+    def _start_slash_completion(input_area: TextArea) -> None:
+        """Open slash command completions when the cursor is at a slash prefix."""
+        if SlashCommandCompleter._command_prefix(input_area.buffer.document.text_before_cursor) is None:
+            return
+        input_area.buffer.start_completion(select_first=False)
+
+    @staticmethod
+    def _write_terminal_sequence(app: Application[Any], sequence: str) -> None:
+        """Best-effort raw terminal sequence write."""
+        try:
+            app.output.write_raw(sequence)
+            app.output.flush()
+        except Exception:
+            logger.debug("Failed to write terminal control sequence", exc_info=True)
+
     def _setup_input_keybindings(self, input_area: TextArea) -> KeyBindings:
         """Set up key bindings owned by the focused input control."""
         kb = KeyBindings()
@@ -2336,51 +2446,78 @@ class TUIApp:
         @kb.add("up", eager=True)
         def handle_up(event: KeyPressEvent) -> None:
             """Navigate to previous prompt in history."""
+            if self._move_completion(input_area, forward=False):
+                return
             previous_history()
 
         @kb.add("c-p", eager=True)
         def handle_ctrl_p(event: KeyPressEvent) -> None:
             """Navigate to previous prompt in history using a TTY-stable key."""
+            if self._move_completion(input_area, forward=False):
+                return
             previous_history()
 
         @kb.add("down", eager=True)
         def handle_down(event: KeyPressEvent) -> None:
             """Navigate to next prompt in history."""
+            if self._move_completion(input_area, forward=True):
+                return
             next_history()
 
         @kb.add("c-n", eager=True)
         def handle_ctrl_n(event: KeyPressEvent) -> None:
             """Navigate to next prompt in history using a TTY-stable key."""
+            if self._move_completion(input_area, forward=True):
+                return
             next_history()
 
         def submit_or_newline() -> None:
-            if self._input_mode == "send":
-                text = input_area.buffer.text.strip()
+            text = input_area.buffer.text.strip()
 
-                if self._hitl_pending and self._approval_event and not self._approval_event.is_set():
-                    input_area.buffer.reset()
-                    if text.lower() in ("", "y", "yes"):
-                        self._approval_result = True
-                        self._approval_reason = None
-                    else:
-                        self._approval_result = False
-                        self._approval_reason = text if text else None
-                    self._approval_event.set()
-                    return
+            if self._hitl_pending and self._approval_event and not self._approval_event.is_set():
+                input_area.buffer.reset()
+                if text.lower() in ("", "y", "yes"):
+                    self._approval_result = True
+                    self._approval_reason = None
+                else:
+                    self._approval_result = False
+                    self._approval_reason = text if text else None
+                self._approval_event.set()
+                return
 
-                self._submit_input(text, input_area)
-            else:
-                input_area.buffer.insert_text("\n")
+            self._submit_input(text, input_area)
 
-        @kb.add("enter", eager=True)
+        def insert_newline() -> None:
+            input_area.buffer.insert_text("\n")
+
+        @kb.add("c-m", eager=True)
         def handle_enter(event: KeyPressEvent) -> None:
-            """Handle Enter based on current input mode."""
-            submit_or_newline()
+            """Submit on Enter."""
+            if _is_shift_enter_event_data(event.data):
+                insert_newline()
+            else:
+                submit_or_newline()
 
         @kb.add("c-j", eager=True)
         def handle_ctrl_j(event: KeyPressEvent) -> None:
             """Handle terminals that emit Ctrl+J for Enter."""
-            submit_or_newline()
+            if _is_shift_enter_event_data(event.data):
+                insert_newline()
+            else:
+                submit_or_newline()
+
+        @kb.add("escape", "[", "1", "3", ";", "2", "u", eager=True)
+        @kb.add("escape", "[", "1", "3", ";", "2", "~", eager=True)
+        @kb.add("escape", "[", "2", "7", ";", "2", ";", "1", "3", "~", eager=True)
+        def handle_shift_enter(event: KeyPressEvent) -> None:
+            """Insert newline for terminals that emit Shift+Enter escape sequences."""
+            insert_newline()
+
+        @kb.add("/", eager=True)
+        def handle_slash(event: KeyPressEvent) -> None:
+            """Insert slash and open slash command completions immediately."""
+            input_area.buffer.insert_text("/")
+            self._start_slash_completion(input_area)
 
         return kb
 
@@ -2480,13 +2617,11 @@ class TUIApp:
 
         @kb.add("tab")
         def handle_tab(event: KeyPressEvent) -> None:
-            """Toggle input mode between send and edit."""
-            if self._input_mode == "send":
-                self._input_mode = "edit"
-            else:
-                self._input_mode = "send"
-            if self._app:
-                self._app.invalidate()
+            """Accept completion when active."""
+            if self._apply_selected_completion(input_area):
+                if self._app:
+                    self._app.invalidate()
+                return
 
         @kb.add("c-o")
         def handle_newline(event: KeyPressEvent) -> None:
@@ -2521,6 +2656,10 @@ class TUIApp:
             "steering-pane": "bg:ansibrightblack fg:ansicyan",
             "input-area": "",
             "input-frame": "fg:ansiblue",
+            "completion-menu": "bg:#25283a fg:#d7d9f0",
+            "completion-menu.completion.current": "bg:ansiblue fg:white",
+            "completion-menu.meta": "fg:ansibrightblack",
+            "completion-menu.meta.completion.current": "fg:white",
         })
 
     # =========================================================================
@@ -2803,7 +2942,8 @@ class TUIApp:
         kb_table.add_row("Ctrl+C", "Cancel / double-press exit")
         kb_table.add_row("Ctrl+D", "Exit")
         kb_table.add_row("Ctrl+V", "Attach image from clipboard")
-        kb_table.add_row("Tab", "Toggle input mode")
+        kb_table.add_row("Shift+Enter", "Insert newline")
+        kb_table.add_row("Tab", "Accept slash completion")
         kb_table.add_row("Escape", "Toggle mouse mode")
         kb_table.add_row("Up/Down, Ctrl+P/N", "Browse history")
         kb_table.add_row("PageUp/PageDown", "Scroll output")
@@ -3439,6 +3579,8 @@ class TUIApp:
             multiline=True,
             prompt=self._get_prompt,
             style="class:input-area",
+            completer=SlashCommandCompleter(self._get_slash_command_entries),
+            complete_while_typing=True,
             focusable=True,
             height=4,
             scrollbar=True,
@@ -3465,12 +3607,21 @@ class TUIApp:
 
         # Layout: Output | Steering | Composer | Status
         layout = Layout(
-            HSplit([
-                output_window,
-                steering_window,
-                input_frame,
-                status_bar,
-            ]),
+            FloatContainer(
+                content=HSplit([
+                    output_window,
+                    steering_window,
+                    input_frame,
+                    status_bar,
+                ]),
+                floats=[
+                    Float(
+                        xcursor=True,
+                        ycursor=True,
+                        content=CompletionsMenu(max_height=16, scroll_offset=1),
+                    )
+                ],
+            ),
             focused_element=input_area,
         )
 
@@ -3526,19 +3677,21 @@ class TUIApp:
             self._schedule_tui_recovery(loop)
 
         self._app._handle_exception = _quiet_exception_handler  # type: ignore[assignment]
+        app = self._app
 
         # Run with error handling
         try:
             self._tui_running = True
-            await self._app.run_async()
+            await app.run_async(pre_run=lambda: self._write_terminal_sequence(app, _MODIFY_OTHER_KEYS_ENABLE))
         except Exception as e:
             # Re-raise to be caught by cli.py with proper error display
             raise RuntimeError(f"TUI crashed: {e}") from e
         finally:
             self._tui_running = False
             self._show_shutdown_status("leaving TUI")
+            self._write_terminal_sequence(app, _MODIFY_OTHER_KEYS_DISABLE)
             # Restore original prompt_toolkit exception handler
-            self._app._handle_exception = original_handle_exception  # type: ignore[assignment]
+            app._handle_exception = original_handle_exception  # type: ignore[assignment]
             # Log performance report on shutdown
             perf_log_report()
             # Ensure agent task and tracked fire-and-forget tasks are fully cancelled
