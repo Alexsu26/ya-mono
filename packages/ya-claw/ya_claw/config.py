@@ -140,7 +140,8 @@ class ClawSettings(BaseSettings):
     bridge_lark_app_secret: SecretStr | None = None
     bridge_lark_default_profile: str | None = None
     bridge_lark_event_types: str = (
-        "im.chat.member.bot.added_v1,im.chat.member.user.added_v1,im.message.receive_v1,drive.notice.comment_add_v1"
+        "im.chat.member.bot.added_v1,im.chat.member.user.added_v1,im.message.receive_v1,"
+        "drive.notice.comment_add_v1,card.action.trigger"
     )
     bridge_lark_reply_identity: Literal["bot", "user"] = "bot"
     bridge_lark_domain: str = "https://open.feishu.cn"
@@ -161,6 +162,7 @@ class ClawSettings(BaseSettings):
     heartbeat_profile: str | None = None
     heartbeat_prompt: str = "Run heartbeat according to HEARTBEAT.md."
     heartbeat_on_active: Literal["skip", "queue"] = "skip"
+    unattended_shell_review_risk_threshold: Literal["low", "medium", "high", "extra_high"] | None = None
     memory_enabled: bool = True
     memory_extract_every_turns: int = 5
     memory_summary_every_extracts: int = 4
