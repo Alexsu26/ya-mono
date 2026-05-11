@@ -81,6 +81,7 @@ from ya_agent_sdk.events import (
     SubagentStartEvent,
     TaskEvent,
     ToolCallsStartEvent,
+    UsageSnapshotEvent,
 )
 from ya_agent_sdk.utils import get_latest_request_usage
 
@@ -1298,22 +1299,20 @@ class TUIApp:
         """Callback invoked when a background task completes.
 
         This is called synchronously from the asyncio event loop when
-        SpawnDelegateTool finishes. If the agent is idle and there
-        are pending bus messages, we schedule a new agent turn.
+        SpawnDelegateTool finishes. If the agent is idle, queued background
+        results are redelivered and a new agent turn is scheduled.
 
         Args:
             agent_id: The ID of the completed background agent.
         """
-        # Only trigger if agent is idle - if running, we set a flag to check
+        # Only trigger if agent is idle - if running, we set a flag to redeliver
         # after the current turn completes (see _check_pending_bus_messages)
         if self._state != TUIState.IDLE:
             logger.debug("Background task %s completed while agent running, will check after turn", agent_id)
             self._pending_bus_check_needed = True
             return
 
-        # Check if there are actually pending bus messages
-        ctx = self.runtime.ctx
-        if not ctx.message_bus.has_pending(ctx.agent_id):
+        if not self._deliver_background_messages():
             logger.debug("Background task %s completed but no pending messages", agent_id)
             return
 
@@ -1347,12 +1346,23 @@ class TUIApp:
                 self._app.invalidate()
             return
 
+    def _deliver_background_messages(self) -> bool:
+        """Redeliver queued background notifications into the current main-agent bus."""
+        monitor = self._get_background_monitor()
+        ctx = self.runtime.ctx
+        delivered = 0
+        if monitor is not None:
+            for snapshot in monitor.drain_usage_snapshots():
+                self._session_usage.set_run_snapshot(snapshot)
+                self._session_usage.commit_run_snapshot(snapshot.run_id)
+            delivered = monitor.deliver_pending_messages(ctx.message_bus, ctx.agent_id)
+        return delivered > 0 or ctx.message_bus.has_pending(ctx.agent_id)
+
     def _check_pending_bus_messages(self) -> None:
         """Check for pending bus messages and trigger agent turn if needed.
 
-        Called after agent execution completes to handle messages that
-        arrived after the last LLM request (e.g., from background tasks
-        that completed while we were still running).
+        Called after agent execution completes to redeliver messages that
+        arrived while the main agent was still running.
         """
         # Only proceed if flag was set (background task completed during run)
         if not self._pending_bus_check_needed:
@@ -1363,9 +1373,7 @@ class TUIApp:
         if self._state != TUIState.IDLE:
             return
 
-        # Check if there are actually pending bus messages
-        ctx = self.runtime.ctx
-        if not ctx.message_bus.has_pending(ctx.agent_id):
+        if not self._deliver_background_messages():
             return
 
         logger.info("Pending bus messages detected after agent turn, triggering new turn")
@@ -1539,24 +1547,20 @@ class TUIApp:
                     latest_usage = get_latest_request_usage(self._message_history)
                     self._current_context_tokens = latest_usage.total_tokens if latest_usage else usage.total_tokens
 
-                    # Accumulate session usage
-                    model_id = cast(Model, self.runtime.agent.model).model_name
-                    self._session_usage.add("main", model_id, usage)
-
-                    # Also accumulate extra_usages (subagents, image_understanding, etc.)
-                    ctx = self.runtime.ctx
-                    for record in ctx.extra_usages:
-                        self._session_usage.add(record.agent, record.model_id, record.usage)
+                    # Accumulate main-agent usage when no realtime snapshot was emitted.
+                    if not self._session_usage.has_run_snapshot:
+                        model_id = cast(Model, self.runtime.agent.model).model_name
+                        self._session_usage.add("main", model_id, usage)
+                    self._session_usage.commit_run_snapshot()
             except Exception:
                 logger.debug("Failed to save message history from errored run", exc_info=True)
 
             # Persist the latest recoverable state before surfacing stream errors.
-            # Successful runs exclude extra_usages so future restores start clean.
-            # Error paths include extra_usages to preserve crash-recovery context.
+            # Error paths include the usage ledger to preserve crash-recovery context.
             try:
                 stream.raise_if_exception()
             except Exception:
-                self._save_session_snapshot(include_extra_usages=True, save_reason="error")
+                self._save_session_snapshot(include_usage_ledger=True, save_reason="error")
                 raise
 
             self._auto_save_history()
@@ -1892,6 +1896,11 @@ class TUIApp:
                 self._subagent_states[agent_id]["tool_names"].append(tool_name)
                 self._update_subagent_progress_line(agent_id)
             # Ignore all other subagent events (text streaming, tool results, etc.)
+            return
+
+        if isinstance(message_event, UsageSnapshotEvent):
+            if message_event.snapshot is not None:
+                self._session_usage.set_run_snapshot(message_event.snapshot)
             return
 
         # Main agent events - normal processing
@@ -2908,11 +2917,13 @@ class TUIApp:
                 state = ResumableState.model_validate_json(state_data)
                 state.restore(self.runtime.ctx)
 
-                # Re-populate session usage from restored extra_usages
-                for record in self.runtime.ctx.extra_usages:
-                    self._session_usage.add(record.agent, record.model_id, record.usage)
-                # Clear after populating to avoid double counting on next run
-                self.runtime.ctx.extra_usages.clear()
+                # Re-populate session usage from restored usage ledger entries.
+                if self.runtime.ctx.usage_snapshot_entries:
+                    snapshot = self.runtime.ctx.build_usage_snapshot()
+                    self._session_usage.set_run_snapshot(snapshot)
+                    self._session_usage.commit_run_snapshot()
+                    # Clear after populating to avoid double counting on next run.
+                    self.runtime.ctx.usage_snapshot_entries.clear()
 
                 self._append_system_output(f"Session loaded from {load_dir}")
                 self._append_system_output(f"  - message_history.json ({len(history)} messages)")
@@ -2929,19 +2940,24 @@ class TUIApp:
     def _save_session_snapshot(
         self,
         *,
-        include_extra_usages: bool,
+        include_usage_ledger: bool | None = None,
         save_reason: str,
+        include_extra_usages: bool | None = None,
     ) -> bool:
         """Persist the current session to disk.
 
         Args:
-            include_extra_usages: Whether to include extra_usages in exported state.
+            include_usage_ledger: Whether to include the usage ledger in exported state.
                 Use True for error recovery snapshots.
             save_reason: Metadata tag describing why the snapshot was saved.
+            include_extra_usages: Backward-compatible alias for include_usage_ledger.
 
         Returns:
             True when a snapshot was written, False when there is no message history.
         """
+        if include_usage_ledger is None:
+            include_usage_ledger = bool(include_extra_usages)
+
         if not self._message_history:
             return False
 
@@ -2957,7 +2973,10 @@ class TUIApp:
 
         # Save context state
         state_file = save_dir / "context_state.json"
-        state = self.runtime.ctx.export_state(include_extra_usages=include_extra_usages)
+        if include_extra_usages is None:
+            state = self.runtime.ctx.export_state(include_usage_ledger=include_usage_ledger)
+        else:
+            state = self.runtime.ctx.export_state(include_extra_usages=include_extra_usages)
         state_file.write_text(state.model_dump_json(indent=2))
 
         # Save/update metadata
@@ -2983,7 +3002,7 @@ class TUIApp:
 
     def _auto_save_history(self) -> None:
         """Auto-save session to session-specific directory after a successful run."""
-        self._save_session_snapshot(include_extra_usages=False, save_reason="success")
+        self._save_session_snapshot(include_usage_ledger=False, save_reason="success")
 
     @property
     def session_id(self) -> str:
