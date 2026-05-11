@@ -1,5 +1,5 @@
 # YAACLI CLI Project Configuration
-# Location: .yaacli/tools.toml
+# Location: .xunocli/tools.toml
 
 [tools]
 # Tools requiring user approval before execution

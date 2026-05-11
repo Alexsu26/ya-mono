@@ -162,7 +162,7 @@ def test_load_project_tools_config(
     clean_env: None,
 ) -> None:
     """Test loading project tools.toml (tools only)."""
-    project_config_dir = temp_project_dir / ".yaacli"
+    project_config_dir = temp_project_dir / ".xunocli"
     project_config_dir.mkdir()
     config_file = project_config_dir / "tools.toml"
     config_file.write_text("""
@@ -194,7 +194,7 @@ model = "openai:gpt-4o"
 code_theme = "light"
 """)
 
-    project_config_dir = temp_project_dir / ".yaacli"
+    project_config_dir = temp_project_dir / ".xunocli"
     project_config_dir.mkdir()
     project_config = project_config_dir / "tools.toml"
     project_config.write_text("""
@@ -241,7 +241,7 @@ need_approval = ["global_tool"]
 """)
 
     # Project tools (should override)
-    project_config_dir = temp_project_dir / ".yaacli"
+    project_config_dir = temp_project_dir / ".xunocli"
     project_config_dir.mkdir()
     project_tools = project_config_dir / "tools.toml"
     project_tools.write_text("""
@@ -301,7 +301,7 @@ code_theme = "dark"
 """)
 
     # Project config (replaces global entirely)
-    project_config_dir = temp_project_dir / ".yaacli"
+    project_config_dir = temp_project_dir / ".xunocli"
     project_config_dir.mkdir()
     project_config = project_config_dir / "config.toml"
     project_config.write_text("""
@@ -325,7 +325,7 @@ def test_tools_toml_ignores_non_tools(
     clean_env: None,
 ) -> None:
     """Test that tools.toml ignores non-tools sections."""
-    project_config_dir = temp_project_dir / ".yaacli"
+    project_config_dir = temp_project_dir / ".xunocli"
     project_config_dir.mkdir()
     config_file = project_config_dir / "tools.toml"
     config_file.write_text("""
@@ -383,7 +383,7 @@ def test_save_project_config(
     temp_project_dir: Path,
 ) -> None:
     """Test save_project_config."""
-    config_file = temp_project_dir / ".yaacli" / "tools.toml"
+    config_file = temp_project_dir / ".xunocli" / "tools.toml"
     assert not config_file.exists()
 
     result = config_manager.save_project_config()
@@ -392,6 +392,45 @@ def test_save_project_config(
     content = config_file.read_text()
     assert "[tools]" in content
     assert "need_approval" in content
+
+
+def test_migrates_legacy_global_config_dir(tmp_path: Path, monkeypatch: Any) -> None:
+    """Default config manager copies ~/.yaacli to ~/.xunocli when needed."""
+    legacy_dir = tmp_path / ".yaacli"
+    new_dir = tmp_path / ".xunocli"
+    project_dir = tmp_path / "project"
+    legacy_dir.mkdir()
+    project_dir.mkdir()
+    (legacy_dir / "config.toml").write_text('[general]\nmodel = "openai:gpt-4o"\n')
+    (legacy_dir / "subagents").mkdir()
+    (legacy_dir / "subagents" / "custom.md").write_text("# Custom")
+
+    monkeypatch.setattr(ConfigManager, "LEGACY_CONFIG_DIR", legacy_dir)
+    monkeypatch.setattr(ConfigManager, "DEFAULT_CONFIG_DIR", new_dir)
+
+    config_manager = ConfigManager(project_dir=project_dir)
+
+    assert (new_dir / "config.toml").exists()
+    assert (new_dir / "subagents" / "custom.md").exists()
+    assert (legacy_dir / "config.toml").exists()
+    assert config_manager.load().general.model == "openai:gpt-4o"
+
+
+def test_migrates_legacy_project_config_dir(tmp_path: Path) -> None:
+    """Config manager copies .yaacli to .xunocli when needed."""
+    config_dir = tmp_path / "global"
+    project_dir = tmp_path / "project"
+    legacy_project_dir = project_dir / ".yaacli"
+    new_project_dir = project_dir / ".xunocli"
+    config_dir.mkdir()
+    legacy_project_dir.mkdir(parents=True)
+    (legacy_project_dir / "tools.toml").write_text('[tools]\nneed_approval = ["legacy_tool"]\n')
+
+    config_manager = ConfigManager(config_dir=config_dir, project_dir=project_dir)
+
+    assert (new_project_dir / "tools.toml").exists()
+    assert (legacy_project_dir / "tools.toml").exists()
+    assert config_manager.load().tools.need_approval == ["legacy_tool"]
 
 
 # =============================================================================
@@ -443,7 +482,7 @@ def test_load_mcp_config_project_priority(
     global_mcp = temp_config_dir / "mcp.json"
     global_mcp.write_text('{"servers": {"global_server": {"transport": "stdio", "command": "global"}}}')
 
-    project_config_dir = temp_project_dir / ".yaacli"
+    project_config_dir = temp_project_dir / ".xunocli"
     project_config_dir.mkdir()
     project_mcp = project_config_dir / "mcp.json"
     project_mcp.write_text('{"servers": {"project_server": {"transport": "stdio", "command": "project"}}}')
@@ -466,7 +505,7 @@ def test_get_mcp_config_file(
     global_mcp.write_text("{}")
     assert config_manager.get_mcp_config_file() == global_mcp
 
-    project_config_dir = temp_project_dir / ".yaacli"
+    project_config_dir = temp_project_dir / ".xunocli"
     project_config_dir.mkdir()
     project_mcp = project_config_dir / "mcp.json"
     project_mcp.write_text("{}")

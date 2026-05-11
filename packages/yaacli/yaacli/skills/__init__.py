@@ -2,8 +2,8 @@
 
 Skills are loaded from the following locations (in order of priority):
 1. Built-in skills: yaacli/skills/ (shipped with package)
-2. Global skills: ~/.yaacli/skills/
-3. Project skills: .yaacli/skills/
+2. Global skills: ~/.xunocli/skills/
+3. Project skills: .xunocli/skills/
 
 Later directories take precedence over earlier ones for skills with the same name.
 """

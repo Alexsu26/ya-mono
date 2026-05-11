@@ -60,8 +60,8 @@ need_approval = ["shell", "write"]
 ```
 
 Location priority:
-1. Project: `.yaacli/tools.toml` (overrides global)
-2. Global: `~/.yaacli/tools.toml`
+1. Project: `.xunocli/tools.toml` (overrides global)
+2. Global: `~/.xunocli/tools.toml`
 
 ### Runtime Configuration
 

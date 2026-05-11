@@ -16,7 +16,7 @@ from yaacli.config import ConfigManager
 
 def test_get_sessions_dir(tmp_path: Path) -> None:
     """Test get_sessions_dir returns correct path."""
-    config_dir = tmp_path / ".yaacli"
+    config_dir = tmp_path / ".xunocli"
     config_dir.mkdir()
     (config_dir / "config.toml").write_text('model = "anthropic:test"\n')
 

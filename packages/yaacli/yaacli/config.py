@@ -1,20 +1,20 @@
-"""Configuration management for yaacli.
+"""Configuration management for xunocli.
 
 Configuration files are loaded with project-level priority (no merging):
 
 1. **config.toml** (model + TUI settings):
-   - Global: ~/.yaacli/config.toml
-   - Project: .yaacli/config.toml (overrides global entirely)
+   - Global: ~/.xunocli/config.toml
+   - Project: .xunocli/config.toml (overrides global entirely)
    - Contains: model, model_settings, display, steering, session, browser, subagents, env
 
 2. **tools.toml** (tool permissions):
-   - Global: ~/.yaacli/tools.toml
-   - Project: .yaacli/tools.toml (overrides global entirely)
+   - Global: ~/.xunocli/tools.toml
+   - Project: .xunocli/tools.toml (overrides global entirely)
    - Contains: need_approval list
 
 3. **mcp.json** (MCP server configurations):
-   - Global: ~/.yaacli/mcp.json
-   - Project: .yaacli/mcp.json (overrides global entirely)
+   - Global: ~/.xunocli/mcp.json
+   - Project: .xunocli/mcp.json (overrides global entirely)
 
 4. **Environment variables** (YAACLI_*):
    - TUI configuration overrides only (merged on top of config.toml)
@@ -23,6 +23,7 @@ Configuration files are loaded with project-level priority (no merging):
 
 from __future__ import annotations
 
+import shutil
 import tomllib
 from importlib import resources
 from pathlib import Path
@@ -155,8 +156,8 @@ class SubagentOverride(BaseModel):
 class SubagentsConfig(BaseModel):
     """Subagent configuration.
 
-    Subagents are loaded from ~/.yaacli/subagents/
-    which is initialized by `yaacli setup`.
+    Subagents are loaded from ~/.xunocli/subagents/
+    which is initialized by `xunocli setup`.
     """
 
     disabled: list[str] = Field(default_factory=list)
@@ -264,7 +265,7 @@ class MediaConfig(BaseModel):
 
 
 class YaacliConfig(BaseModel):
-    """Complete yaacli configuration."""
+    """Complete xunocli configuration."""
 
     # From global config
     general: GeneralConfig = Field(default_factory=GeneralConfig)
@@ -387,8 +388,10 @@ class EnvSettings(BaseSettings):
 class ConfigManager:
     """Manages configuration loading from global, project, and environment sources."""
 
-    DEFAULT_CONFIG_DIR = Path.home() / ".yaacli"
-    PROJECT_CONFIG_DIR = ".yaacli"
+    DEFAULT_CONFIG_DIR = Path.home() / ".xunocli"
+    LEGACY_CONFIG_DIR = Path.home() / ".yaacli"
+    PROJECT_CONFIG_DIR = ".xunocli"
+    LEGACY_PROJECT_CONFIG_DIR = ".yaacli"
 
     def __init__(
         self,
@@ -399,6 +402,9 @@ class ConfigManager:
         self._project_dir = project_dir or Path.cwd()
         self._config: YaacliConfig | None = None
         self._loaded_sources: list[str] = []
+        if config_dir is None:
+            self._migrate_legacy_global_config()
+        self._migrate_legacy_project_config()
 
     @property
     def config(self) -> YaacliConfig:
@@ -573,7 +579,7 @@ class ConfigManager:
             return global_mcp
         return None
 
-    # Directories to exclude from file tree context in ~/.yaacli/
+    # Directories to exclude from file tree context in ~/.xunocli/
     _TREEIGNORE_ENTRIES = frozenset({"sessions", "message_history", "worktrees"})
 
     def ensure_config_dir(self) -> None:
@@ -640,9 +646,19 @@ class ConfigManager:
 
         Returns:
             Path to the sessions directory under global config.
-            Format: ~/.yaacli/sessions/
+            Format: ~/.xunocli/sessions/
         """
         return self._config_dir / "sessions"
+
+    def _migrate_legacy_global_config(self) -> None:
+        """Copy ~/.yaacli to ~/.xunocli on first use when the new directory is absent."""
+        _copy_legacy_config_dir(self.LEGACY_CONFIG_DIR, self._config_dir)
+
+    def _migrate_legacy_project_config(self) -> None:
+        """Copy .yaacli to .xunocli on first use when the new directory is absent."""
+        legacy_project_dir = self._project_dir / self.LEGACY_PROJECT_CONFIG_DIR
+        project_dir = self._project_dir / self.PROJECT_CONFIG_DIR
+        _copy_legacy_config_dir(legacy_project_dir, project_dir)
 
 
 # =============================================================================
@@ -653,7 +669,7 @@ class ConfigManager:
 class WorktreeMetadata(TypedDict):
     """Metadata for a git worktree managed by yaacli.
 
-    Stored as JSON in ~/.yaacli/worktrees/{project_hash}/metadata.json.
+    Stored as JSON in ~/.xunocli/worktrees/{project_hash}/metadata.json.
     """
 
     git_root: str
@@ -683,6 +699,14 @@ def _load_template(name: str) -> str:
     """Load a template file."""
     template_files = resources.files("yaacli").joinpath("templates")
     return template_files.joinpath(name).read_text(encoding="utf-8")
+
+
+def _copy_legacy_config_dir(source: Path, target: Path) -> None:
+    """Copy a legacy config directory to the new location without overwriting."""
+    if not source.exists() or target.exists() or not source.is_dir():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target)
 
 
 # =============================================================================

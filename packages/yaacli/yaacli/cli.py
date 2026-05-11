@@ -519,7 +519,7 @@ def _create_worktree(branch_name: str | None) -> tuple[Path, str, bool]:
         timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         branch_name = f"yaacli/{timestamp}"
 
-    # Create worktree directory under ~/.yaacli/worktrees/{project_hash}/{branch}
+    # Create worktree directory under ~/.xunocli/worktrees/{project_hash}/{branch}
     proj_hash = _project_hash(git_root)
     worktrees_dir = ConfigManager.DEFAULT_CONFIG_DIR / "worktrees" / proj_hash
     worktrees_dir.mkdir(parents=True, exist_ok=True)

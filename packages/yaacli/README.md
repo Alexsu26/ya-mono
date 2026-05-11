@@ -36,6 +36,11 @@ Run as a module:
 python -m yaacli
 ```
 
+## Configuration
+
+Xuno CLI stores global configuration under `~/.xunocli/` and project-level configuration under `.xunocli/`.
+On first use, existing `~/.yaacli/` or project `.yaacli/` directories are copied to the new location when the corresponding `.xunocli` directory does not already exist.
+
 ## Built-in Skills
 
 YAACLI ships with `building-agents` from the repository canonical source `skills/agent-builder/`.
@@ -56,7 +61,7 @@ cp packages/yaacli/.env.example packages/yaacli/.env
 ```
 
 YAACLI loads `.env` from `packages/yaacli/.env` and the current working directory.
-Provider API keys can live in that `.env` file or in `~/.yaacli/config.toml` under `[env]`.
+Provider API keys can live in that `.env` file or in `~/.xunocli/config.toml` under `[env]`.
 SDK and tool variables such as `YA_AGENT_*`, `YA_AGENT_BROWSER_USE_*`, and search API keys can also live in that same `.env` file because YAACLI loads it into the process environment at startup.
 Use [`packages/ya-agent-sdk/.env.example`](../ya-agent-sdk/.env.example) as the reference list for SDK and tool variables.
 

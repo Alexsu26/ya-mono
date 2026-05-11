@@ -98,7 +98,7 @@ async def test_create_tui_runtime_orders_skill_paths_by_priority(tmp_path: Path)
             config_dir.resolve(),
             (Path.home() / ".agents").resolve(),
             working_dir.resolve(),
-            (working_dir / ".yaacli").resolve(),
+            (working_dir / ".xunocli").resolve(),
         ]
         assert allowed_paths[:4] == expected_prefix
 

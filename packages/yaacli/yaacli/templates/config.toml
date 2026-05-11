@@ -1,5 +1,5 @@
 # YAACLI CLI Global Configuration
-# Location: ~/.yaacli/config.toml
+# Location: ~/.xunocli/config.toml
 
 [general]
 # Active model profile from [models]. Leave empty to use legacy model below.
@@ -44,7 +44,7 @@ agent_stream_resume_prompt = "The previous streaming model request failed before
 
 # Custom system prompt file path (optional)
 # If empty, uses built-in default from CLI package
-# system_prompt_file = "~/.yaacli/system_prompt.md"
+# system_prompt_file = "~/.xunocli/system_prompt.md"
 
 # Named model profiles selectable with /model.
 # /model             List available model profiles
@@ -98,8 +98,8 @@ browser_image = "zenika/alpine-chrome:latest"
 browser_timeout = 30
 
 [subagents]
-# Subagents are loaded from ~/.yaacli/subagents/
-# Run `yaacli setup` to initialize default subagents
+# Subagents are loaded from ~/.xunocli/subagents/
+# Run `xunocli setup` to initialize default subagents
 
 # Disable specific subagents by name
 disabled = []

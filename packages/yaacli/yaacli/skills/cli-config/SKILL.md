@@ -11,8 +11,8 @@ Configuration is loaded from multiple locations with project-level priority (no 
 
 | Level | Location | Priority |
 |-------|----------|----------|
-| Global | `~/.yaacli/` | Default |
-| Project | `.yaacli/` | Overrides global |
+| Global | `~/.xunocli/` | Default |
+| Project | `.xunocli/` | Overrides global |
 
 ## Configuration Files
 
@@ -62,7 +62,7 @@ disabled = []                 # Subagents to disable by name
 
 ### tools.toml (Project)
 
-Project-level tool permissions in `.yaacli/tools.toml`:
+Project-level tool permissions in `.xunocli/tools.toml`:
 
 ```toml
 [tools]
@@ -109,7 +109,7 @@ Built-in commands: `/init`, `/commit`, `/review`
 
 ## Subagent Configuration
 
-Create markdown files in `~/.yaacli/subagents/`:
+Create markdown files in `~/.xunocli/subagents/`:
 
 ```markdown
 ---
@@ -163,8 +163,8 @@ You are a specialist in [domain].
 Skills are loaded from (highest priority last):
 
 1. Built-in: `yaacli/skills/` (package bundled)
-2. Global: `~/.yaacli/skills/`
-3. Project: `.yaacli/skills/`
+2. Global: `~/.xunocli/skills/`
+3. Project: `.xunocli/skills/`
 
 ## Environment Variables
 
@@ -177,4 +177,4 @@ TUI settings can be overridden via `YAACLI_*` environment variables:
 
 ## Quick Setup
 
-Run `yaacli setup` to initialize global configuration with defaults.
+Run `xunocli setup` to initialize global configuration with defaults.
