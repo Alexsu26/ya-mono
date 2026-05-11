@@ -1,33 +1,33 @@
-# YAACLI CLI
+# Xuno CLI
 
 TUI reference implementation for [ya-agent-sdk](https://github.com/wh1isper/ya-mono/tree/main/packages/ya-agent-sdk).
 
 ## Usage
 
-Run with uvx:
+Run from the workspace with uvx:
 
 ```bash
-uvx yaacli
+uvx --from ./packages/yaacli xunocli
 ```
 
-Install with uv:
+Install globally from the workspace with uv:
 
 ```bash
-uv tool install yaacli
-yaacli
+uv tool install ./packages/yaacli
+xunocli
 ```
 
-Update with uv:
+Update the global install from the workspace with uv:
 
 ```bash
-uv tool upgrade yaacli
+uv tool install --force ./packages/yaacli
 ```
 
 Install with pip:
 
 ```bash
-pip install yaacli
-yaacli
+pip install ./packages/yaacli
+xunocli
 ```
 
 Run as a module:

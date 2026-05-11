@@ -359,7 +359,7 @@ def run_setup_wizard(config_manager: ConfigManager) -> bool:
     click.echo(f"  - Custom subagents: {config_manager.config_dir / 'subagents/'}")
     click.echo(f"  - MCP servers: {config_manager.config_dir / 'mcp.json'}")
     click.echo()
-    click.echo("Run 'yaacli' again to start!")
+    click.echo("Run 'xunocli' again to start!")
     click.echo()
 
     return True
@@ -569,9 +569,9 @@ def _create_worktree(branch_name: str | None) -> tuple[Path, str, bool]:
     metavar="BRANCH",
     help="Branch name for worktree (implies --worktree).",
 )
-@click.version_option(version=__version__, prog_name="yaacli")
+@click.version_option(version=__version__, prog_name="xunocli")
 def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
-    """YAACLI CLI - AI-powered coding assistant.
+    """Xuno CLI - AI-powered coding assistant.
 
     Inside TUI, use slash commands:
       /help     - Show available commands
@@ -586,7 +586,7 @@ def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
       /exit     - Exit application
     """
     configure_logging(verbose=verbose)
-    logger.info("Starting yaacli v%s", __version__)
+    logger.info("Starting xunocli v%s", __version__)
 
     load_package_env_files()
 
@@ -674,7 +674,7 @@ def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
         click.echo(f"  Directory: {worktree_dir}")
         click.echo()
         click.echo("To resume in this worktree:")
-        click.echo(f"  yaacli -w -b {actual_branch}")
+        click.echo(f"  xunocli -w -b {actual_branch}")
         click.echo()
         click.echo("To remove when done:")
         click.echo(f"  git worktree remove {worktree_dir}")
