@@ -64,6 +64,50 @@ Provider API keys can live in that `.env` file or in `~/.yaacli/config.toml` und
 SDK and tool variables such as `YA_AGENT_*`, `YA_AGENT_BROWSER_USE_*`, and search API keys can also live in that same `.env` file because YAACLI loads it into the process environment at startup.
 Use [`packages/ya-agent-sdk/.env.example`](../ya-agent-sdk/.env.example) as the reference list for SDK and tool variables.
 
+Codex OAuth credentials can be created once and reused from YAACLI:
+
+```bash
+uvx ya-oauth login codex
+```
+
+Then set `model = "oauth@codex:gpt-5.5"` in a YAACLI model profile.
+
+Model profiles are configured in `~/.yaacli/config.toml` and selected with `/model` inside the TUI:
+
+```toml
+[general]
+model = "anthropic:claude-sonnet-4-5"
+model_settings = "anthropic_adaptive_high"
+model_cfg = "claude_200k"
+
+[model_profiles.fast]
+label = "Fast"
+model = "openai-responses:gpt-5-mini"
+model_settings = "openai_responses_low"
+model_cfg = "gpt5_270k"
+
+[model_profiles.codex_oauth]
+label = "Codex OAuth"
+model = "oauth@codex:gpt-5.5"
+model_settings = "openai_responses_high"
+model_cfg = "gpt5_270k"
+```
+
+`[general]` is the startup fallback profile. The last selected profile is remembered in `~/.yaacli/state.json` and restored on the next launch when that profile still exists.
+
+Shell command review is configured in `~/.yaacli/config.toml` under `security.shell_review`:
+
+```toml
+[security.shell_review]
+enabled = true
+model = "gateway@openai-responses:gpt-5.4-mini"
+model_settings = "openai_responses_low"
+on_needs_approval = "defer"
+risk_threshold = "high"
+```
+
+When enabled, `model` is required. `model_settings` accepts SDK preset names or an inline TOML table. `risk_threshold` defaults to `high` and controls when the configured action triggers.
+
 Run CLI tests from the workspace root:
 
 ```bash

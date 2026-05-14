@@ -1,57 +1,92 @@
 """Usage tracking models for agent token consumption.
 
-This module provides models for tracking token usage from both main agents
-and internal agent calls (sub-agents, image understanding, video understanding, etc.).
+This module provides the unified per-run usage ledger and realtime usage
+snapshot models used by agents, CLI clients, and runtime services.
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from dataclasses import fields, is_dataclass
+from typing import Any
+
+from pydantic import BaseModel, Field
 from pydantic_ai.usage import RunUsage
 
-
-class InternalUsage(BaseModel):
-    """Usage record with model information for internal agent calls.
-
-    This model captures token usage along with the model identifier,
-    enabling accurate cost tracking and usage attribution per model.
-
-    Example::
-
-        from ya_agent_sdk.usage import InternalUsage
-
-        # Return from internal agent functions
-        async def get_image_description(...) -> tuple[str, InternalUsage]:
-            result = await agent.run(...)
-            return result.output, InternalUsage(
-                model_id="openai:gpt-4o",
-                usage=result.usage(),
-            )
-    """
-
-    model_id: str
-    """Model identifier that generated this usage (e.g., 'openai:gpt-4o', 'anthropic:claude-sonnet-4')."""
-
-    usage: RunUsage
-    """Token usage from this call."""
+_RUN_USAGE_FIELD_NAMES = frozenset(field.name for field in fields(RunUsage))
 
 
-class ExtraUsageRecord(BaseModel):
-    """Record of extra usage from tool calls or filters.
+def coerce_run_usage(usage: RunUsage) -> RunUsage:
+    """Convert Pydantic AI usage wrappers into a concrete ``RunUsage`` instance."""
+    if type(usage) is RunUsage:
+        return RunUsage(**_run_usage_data(usage))
+    if callable(usage):
+        usage = usage()
+    return RunUsage(**_run_usage_data(usage))
 
-    This model captures additional token usage that occurs outside the main
-    agent run, such as from sub-agents, filters, or tool calls that invoke
-    other models.
-    """
 
-    uuid: str
-    """Unique identifier for this usage record (e.g., tool_call_id or generated UUID)."""
+def _run_usage_data(usage: Any) -> dict[str, Any]:
+    if not is_dataclass(usage):
+        raise TypeError(f"Expected RunUsage-compatible dataclass, got {type(usage).__name__}")
 
-    agent: str
-    """Agent name that generated this usage (e.g., 'compact', 'search', 'image_understanding')."""
+    data: dict[str, Any] = {}
+    for name in _RUN_USAGE_FIELD_NAMES:
+        value = getattr(usage, name)
+        if name == "details":
+            value = dict(value)
+        data[name] = value
+    return data
+
+
+class UsageSnapshotEntry(BaseModel):
+    """Cumulative usage for one agent/source in the current run."""
+
+    agent_id: str
+    """Agent/source instance that generated this usage (e.g., 'main', 'searcher-a1b2', 'compact')."""
+
+    agent_name: str
+    """Human-readable agent/source name (e.g., 'main', 'searcher', 'compact')."""
 
     model_id: str
-    """Model identifier that generated this usage (e.g., 'openai:gpt-4o', 'anthropic:claude-sonnet-4')."""
+    """Model identifier that generated this usage."""
 
     usage: RunUsage
-    """Token usage from this call."""
+    """Cumulative token usage for this agent/source instance."""
+
+    usage_id: str | None = None
+    """Stable usage record ID for idempotent updates."""
+
+    source: str = "model_request"
+    """Component that reported this usage."""
+
+
+class UsageAgentTotal(BaseModel):
+    """Cumulative usage grouped by agent/source."""
+
+    agent_name: str
+    model_id: str
+    usage: RunUsage
+    usage_id: str | None = None
+    source: str = "model_request"
+
+
+class UsageSnapshot(BaseModel):
+    """Cumulative usage snapshot for the current run.
+
+    Realtime consumers and billing systems treat each snapshot as a replacement
+    for the previous snapshot with the same run ID.
+    """
+
+    run_id: str
+    """Run identifier for the snapshot."""
+
+    total_usage: RunUsage = Field(default_factory=RunUsage)
+    """Cumulative usage across all known agents in this run."""
+
+    entries: list[UsageSnapshotEntry] = Field(default_factory=list)
+    """Per-agent/source cumulative usage entries."""
+
+    agent_usages: dict[str, UsageAgentTotal] = Field(default_factory=dict)
+    """Cumulative usage grouped by agent ID."""
+
+    model_usages: dict[str, RunUsage] = Field(default_factory=dict)
+    """Cumulative usage grouped by model identifier."""

@@ -88,7 +88,7 @@ def parse_model_string(model_str: str) -> tuple[str | None, str, str]:
 
     Examples:
         "anthropic:claude-sonnet-4" -> (None, "anthropic", "claude-sonnet-4")
-        "mygateway@openai:gpt-4o" -> ("mygateway", "openai", "gpt-4o")
+        "mygateway@openai-chat:gpt-4o" -> ("mygateway", "openai", "gpt-4o")
     """
     gateway = None
     if "@" in model_str:
@@ -200,7 +200,7 @@ def run_setup_wizard(config_manager: ConfigManager) -> bool:
     click.echo("  Format: [gateway@]provider:model_id")
     click.echo("  Examples:")
     click.echo("    - anthropic:claude-sonnet-4-20250514")
-    click.echo("    - openai:gpt-4o")
+    click.echo("    - openai-chat:gpt-4o")
     click.echo("    - google-gla:gemini-2.5-pro")
     click.echo("    - deepseek:deepseek-v4-flash")
     click.echo("    - mygateway@anthropic:claude-sonnet-4")

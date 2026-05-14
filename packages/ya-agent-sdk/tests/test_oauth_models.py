@@ -67,10 +67,10 @@ def test_create_agent_passes_codex_headers_only_to_oauth_codex(
 
     monkeypatch.setattr("ya_agent_sdk.agents.main.infer_model", fake_infer)
 
-    create_agent("openai:gpt-4o", model_cfg=ModelConfig(context_window=1000))
+    create_agent("openai-chat:gpt-4o", model_cfg=ModelConfig(context_window=1000))
     create_agent("oauth@codex:gpt-5.5", model_cfg=ModelConfig(context_window=1000))
 
-    assert calls[0] == ("openai:gpt-4o", None)
+    assert calls[0] == ("openai-chat:gpt-4o", None)
     assert calls[1][0] == "oauth@codex:gpt-5.5"
     assert calls[1][1] is not None
     assert calls[1][1]["session_id"]
@@ -91,3 +91,8 @@ async def test_model_http_client_uses_httpx_proxy_env(monkeypatch: pytest.Monkey
 
     client = model_utils.create_async_http_client()
     await client.aclose()
+
+
+def test_infer_model_rejects_ambiguous_openai_provider() -> None:
+    with pytest.raises(ValueError, match=r"openai-chat:<model>.*openai-responses:<model>"):
+        infer_model("openai:gpt-4o")

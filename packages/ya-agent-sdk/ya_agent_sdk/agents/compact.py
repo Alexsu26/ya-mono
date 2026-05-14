@@ -70,7 +70,6 @@ from ya_agent_sdk.filters._builders import (
     build_original_request_parts,
     build_steering_parts,
 )
-from ya_agent_sdk.usage import InternalUsage
 from ya_agent_sdk.utils import get_latest_request_usage
 
 # =============================================================================
@@ -600,14 +599,19 @@ def create_cache_friendly_compact_filter(
                     usage_limits=UsageLimits(request_limit=1),
                 ) as result:
                     summary_markdown = str(await result.get_output())
-                    usage = result.usage()
+                    usage = result.usage
 
                 model = ctx.model
                 model_id = model.model_name if model is not None else "unknown"
-                agent_ctx.add_extra_usage(
-                    agent=AGENT_NAME,
-                    internal_usage=InternalUsage(model_id=model_id, usage=usage),
-                    uuid=uuid4().hex,
+                usage_id = uuid4().hex
+                agent_ctx.update_usage_snapshot_entry(
+                    agent_id=AGENT_NAME,
+                    agent_name=AGENT_NAME,
+                    model_id=model_id,
+                    usage=usage,
+                    source="compact",
+                    usage_id=usage_id,
+                    ledger_key=usage_id,
                 )
                 logger.info("Recorded cache-friendly compact usage: model_id=%s usage=%r", model_id, usage)
 
@@ -706,9 +710,9 @@ def create_compact_filter(
 
     Example::
 
-        compact_filter = await create_compact_filter(model="openai:gpt-4o-mini")
+        compact_filter = await create_compact_filter(model="openai-chat:gpt-4o-mini")
         agent = Agent(
-            'openai:gpt-4',
+            'openai-chat:gpt-4',
             deps_type=AgentContext,
             capabilities=[ProcessHistory(compact_filter)],
         )
@@ -781,13 +785,16 @@ def create_compact_filter(
                     ),
                 )
 
-                # Record usage in extra_usages
-
                 model_id = cast(Model, agent.model).model_name
-                agent_ctx.add_extra_usage(
-                    agent=AGENT_NAME,
-                    internal_usage=InternalUsage(model_id=model_id, usage=result.usage()),
-                    uuid=uuid4().hex,
+                usage_id = uuid4().hex
+                agent_ctx.update_usage_snapshot_entry(
+                    agent_id=AGENT_NAME,
+                    agent_name=AGENT_NAME,
+                    model_id=model_id,
+                    usage=result.usage,
+                    source="compact",
+                    usage_id=usage_id,
+                    ledger_key=usage_id,
                 )
 
                 condense_result: CondenseResult = result.output
@@ -818,7 +825,7 @@ def create_compact_filter(
                     trimmed_messages=trimmed_result.messages,
                     handoff_messages=compacted,
                     summary_markdown=condense_markdown,
-                    usage=result.usage(),
+                    usage=result.usage,
                     metadata={"trim": trimmed_result},
                     compacted_messages=compacted,
                     condense_result=condense_result,

@@ -9,7 +9,7 @@
 # Format: "provider:model_name"
 # Examples:
 #   - anthropic:claude-sonnet-4-5
-#   - openai:gpt-4o
+#   - openai-chat:gpt-4o
 #   - google:gemini-2.5-pro
 #   - oauth@codex:gpt-5.5  # run `uvx ya-oauth login codex` first
 model = ""
@@ -22,6 +22,26 @@ model = ""
 # Presets: claude_200k, claude_1m, gpt5_270k, gemini_200k, gemini_1m
 # Aliases: claude, anthropic, openai, gemini
 # model_cfg = "claude_200k"
+#
+# /model can switch between selectable profiles for the current session.
+# The last selected profile is remembered in ~/.yaacli/state.json.
+# [model_profiles.fast]
+# label = "Fast"
+# model = "openai-responses:gpt-5-mini"
+# model_settings = "openai_responses_low"
+# model_cfg = "gpt5_270k"
+#
+# [model_profiles.deep]
+# label = "Deep"
+# model = "anthropic:claude-sonnet-4-5"
+# model_settings = "anthropic_adaptive_high"
+# model_cfg = "claude_200k"
+#
+# [model_profiles.codex_oauth]
+# label = "Codex OAuth"
+# model = "oauth@codex:gpt-5.5"
+# model_settings = "openai_responses_high"
+# model_cfg = "gpt5_270k"
 #
 # Or custom configuration:
 # [general.model_cfg]
@@ -66,7 +86,7 @@ agent_stream_resume_prompt = "The previous streaming model request failed before
 #
 # [models.gpt]
 # description = "OpenAI GPT"
-# model = "openai:gpt-4o"
+# model = "openai-chat:gpt-4o"
 # model_settings = "openai_default"
 # model_cfg = "openai"
 #
@@ -128,7 +148,7 @@ disabled = []
 
 # Override settings for specific subagents
 # [subagents.overrides.explorer]
-# model = "openai:gpt-4o"
+# model = "openai-chat:gpt-4o"
 # model_settings = "openai_default"
 
 # =============================================================================

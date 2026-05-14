@@ -26,7 +26,7 @@ Example:
         from ya_agent_sdk.agents.main import create_agent, stream_agent
 
         # create_agent returns AgentRuntime (not a context manager)
-        runtime = create_agent("openai:gpt-4")
+        runtime = create_agent("openai-chat:gpt-4")
 
         # stream_agent manages runtime lifecycle automatically
         async with stream_agent(runtime, "Hello") as streamer:
@@ -35,7 +35,7 @@ Example:
 
     Using create_agent with manual agent.run::
 
-        runtime = create_agent("openai:gpt-4")
+        runtime = create_agent("openai-chat:gpt-4")
         async with runtime:  # Enter runtime to manage env/ctx/agent
             result = await runtime.agent.run("Hello", deps=runtime.ctx)
             print(result.output)
@@ -65,20 +65,19 @@ Example:
 from __future__ import annotations
 
 import asyncio
-import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any, Self
 from uuid import uuid4
 from xml.dom.minidom import parseString
 from xml.etree.ElementTree import Element, SubElement, tostring
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_ai import (
     DeferredToolRequests,
     FunctionToolCallEvent,
@@ -102,12 +101,13 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from pydantic_ai.models import Model
+from pydantic_ai.usage import RunUsage
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from y_agent_environment import Environment, FileOperator, ResourceRegistry, Shell
+from ya_agent_environment import Environment, FileOperator, ResourceRegistry, Shell
 
 from ya_agent_sdk.agents.lifecycle import LifecycleExtension
-from ya_agent_sdk.events import AgentEvent
-from ya_agent_sdk.usage import ExtraUsageRecord, InternalUsage
+from ya_agent_sdk.events import AgentEvent, UsageSnapshotEvent
+from ya_agent_sdk.usage import UsageAgentTotal, UsageSnapshot, UsageSnapshotEntry, coerce_run_usage
 from ya_agent_sdk.utils import get_latest_request_usage
 
 from .bus import BusMessage, MessageBus
@@ -115,10 +115,6 @@ from .note import NoteManager
 from .tasks import TaskManager, TaskStatus
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
-
-if TYPE_CHECKING:
-    from typing import Self
-
 
 # =============================================================================
 # Injected Context Tag Names
@@ -187,7 +183,7 @@ Example::
         return LangfuseModel(model, name=agent_name)
 
     runtime = create_agent(
-        "openai:gpt-4",
+        "openai-chat:gpt-4",
         model_wrapper=my_wrapper,
     )
 """
@@ -226,7 +222,7 @@ Example::
             yield
 
     runtime = create_agent(
-        "openai:gpt-4",
+        "openai-chat:gpt-4",
         subagent_wrapper=trace_subagent,
     )
 """
@@ -427,7 +423,7 @@ class ToolIdWrapper:
             case FunctionToolCallEvent():
                 event.part.tool_call_id = self.upsert_tool_call_id(event.tool_call_id)
             case FunctionToolResultEvent():
-                event.result.tool_call_id = self.upsert_tool_call_id(event.tool_call_id)
+                event.part.tool_call_id = self.upsert_tool_call_id(event.tool_call_id)
             case PartStartEvent() | PartEndEvent():
                 if isinstance(event.part, (ToolCallPart, ToolReturnPart, RetryPromptPart)):
                     event.part.tool_call_id = self.upsert_tool_call_id(event.part.tool_call_id)
@@ -437,10 +433,20 @@ class ToolIdWrapper:
         return event
 
     def wrap_deferred_tool_requests(self, deferred_tool_requests: DeferredToolRequests) -> DeferredToolRequests:
+        metadata = deferred_tool_requests.metadata or {}
+        wrapped_metadata: dict[str, dict[str, Any]] = {}
         for call in deferred_tool_requests.calls or []:
+            original_tool_call_id = call.tool_call_id
             call.tool_call_id = self.upsert_tool_call_id(call.tool_call_id)
+            if original_tool_call_id in metadata:
+                wrapped_metadata[call.tool_call_id] = metadata[original_tool_call_id]
         for approval in deferred_tool_requests.approvals or []:
+            original_tool_call_id = approval.tool_call_id
             approval.tool_call_id = self.upsert_tool_call_id(approval.tool_call_id)
+            if original_tool_call_id in metadata:
+                wrapped_metadata[approval.tool_call_id] = metadata[original_tool_call_id]
+        if wrapped_metadata:
+            deferred_tool_requests.metadata = wrapped_metadata
         return deferred_tool_requests
 
     def wrap_messages(
@@ -478,6 +484,59 @@ MediaToUrlHook = Callable[[RunContext["AgentContext"], bytes, str], Awaitable[st
 # =============================================================================
 # Tool Config
 # =============================================================================
+
+
+class ShellReviewAction(StrEnum):
+    """Action when shell command review requires approval."""
+
+    DEFER = "defer"
+    DENY = "deny"
+
+
+class ShellReviewRiskLevel(StrEnum):
+    """Shell command review risk levels."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    EXTRA_HIGH = "extra_high"
+
+
+class ShellReviewConfig(BaseModel):
+    """Configuration for shell command safety review."""
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    enabled: bool = False
+    model: str | None = None
+    model_settings: dict[str, Any] | None = None
+    on_needs_approval: ShellReviewAction = ShellReviewAction.DEFER
+    risk_threshold: ShellReviewRiskLevel = ShellReviewRiskLevel.HIGH
+    system_prompt: str | None = None
+
+    @field_validator("model_settings", mode="before")
+    @classmethod
+    def resolve_model_settings_preset(cls, value: Any) -> dict[str, Any] | None:
+        """Resolve model settings preset names at the SDK config boundary."""
+        if value is None:
+            return None
+        from ya_agent_sdk.presets import resolve_model_settings
+
+        return resolve_model_settings(value)
+
+    @model_validator(mode="after")
+    def validate_model_when_enabled(self) -> Self:
+        if self.enabled and (self.model is None or self.model.strip() == ""):
+            msg = "shell_review.model is required when shell review is enabled."
+            raise ValueError(msg)
+        return self
+
+
+class SecurityConfig(BaseModel):
+    """Security-related runtime configuration."""
+
+    shell_review: ShellReviewConfig | None = None
+    """Optional shell command safety review configuration."""
 
 
 class ToolConfig(BaseModel):
@@ -788,8 +847,8 @@ class ResumableState(BaseModel):
     subagent_history: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     """Serialized subagent history, keyed by agent_id. Values are list[dict] from ModelMessagesTypeAdapter.dump_python()."""
 
-    extra_usages: list[ExtraUsageRecord] = Field(default_factory=list)
-    """Extra usage records from tool calls and filters."""
+    usage_snapshot_entries: dict[str, UsageSnapshotEntry] = Field(default_factory=dict)
+    """Serialized usage ledger entries, keyed by agent/source ID."""
 
     user_prompts: str | Sequence[UserContent] | None = None
     """User prompts collected during the session."""
@@ -811,6 +870,9 @@ class ResumableState(BaseModel):
 
     need_user_approve_mcps: list[str] = Field(default_factory=list)
     """List of MCP server names that require user approval for all tools."""
+
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
+    """Security-related runtime configuration."""
 
     auto_load_files: list[str] = Field(default_factory=list)
     """Files to auto-load on next request. Set by handoff/compact, consumed by auto_load_files filter."""
@@ -857,7 +919,7 @@ class ResumableState(BaseModel):
                     ctx.custom_field = self.custom_field
         """
         ctx.subagent_history = self.to_subagent_history()
-        ctx.extra_usages = list(self.extra_usages)
+        ctx.usage_snapshot_entries = dict(self.usage_snapshot_entries)
         ctx.user_prompts = self.user_prompts
         ctx.steering_messages = list(self.steering_messages)
         ctx.handoff_message = self.handoff_message
@@ -866,6 +928,9 @@ class ResumableState(BaseModel):
         ctx.agent_registry = {agent_id: AgentInfo(**info) for agent_id, info in self.agent_registry.items()}
         ctx.need_user_approve_tools = list(self.need_user_approve_tools)
         ctx.need_user_approve_mcps = list(self.need_user_approve_mcps)
+        # Security is a runtime policy supplied by the current profile/config.
+        # Keep the freshly constructed context security instead of restoring
+        # stale or default policy from persisted conversation state.
         ctx.auto_load_files = list(self.auto_load_files)
         # Restore task_manager from serialized tasks (always reset to avoid stale state)
         ctx.task_manager = TaskManager.from_exported(self.tasks) if self.tasks else TaskManager()
@@ -884,7 +949,9 @@ def _generate_run_id() -> str:
 
 
 def _string_header_value(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 def _xml_to_string(element: Element) -> str:
@@ -919,7 +986,7 @@ class AgentContext(BaseModel):
 
             from ya_agent_sdk.agents.main import create_agent, stream_agent
 
-            runtime = create_agent("openai:gpt-4")
+            runtime = create_agent("openai-chat:gpt-4")
             # stream_agent manages runtime lifecycle automatically
             async with stream_agent(runtime, "Hello") as streamer:
                 async for event in streamer:
@@ -927,7 +994,7 @@ class AgentContext(BaseModel):
 
         Using create_agent with manual agent.run::
 
-            runtime = create_agent("openai:gpt-4")
+            runtime = create_agent("openai-chat:gpt-4")
             async with runtime:
                 result = await runtime.agent.run("Hello", deps=runtime.ctx)
 
@@ -950,10 +1017,10 @@ class AgentContext(BaseModel):
     """Parent run_id if this is a subagent context."""
 
     provider_session_id: str | None = None
-    """Optional provider-specific stable session id for model request headers."""
+    """Provider-facing session identifier for model request headers."""
 
     provider_thread_id: str | None = None
-    """Optional provider-specific thread id for model request headers."""
+    """Provider-facing thread identifier for model request headers."""
 
     start_at: datetime | None = None
     """Timestamp when the context was entered."""
@@ -994,8 +1061,11 @@ class AgentContext(BaseModel):
     tool_config: ToolConfig = Field(default_factory=ToolConfig)
     """Tool-level configuration for API keys and tool-specific settings."""
 
-    extra_usages: list[ExtraUsageRecord] = Field(default_factory=list)
-    """Extra usage records from tool calls and filters."""
+    usage_snapshot_entries: dict[str, UsageSnapshotEntry] = Field(default_factory=dict)
+    """Unified per-run usage ledger, keyed by agent/source ID."""
+
+    shell_review_records: deque[Any] = Field(default_factory=lambda: deque(maxlen=10), exclude=True)
+    """Recent shell review records for current-run safety context."""
 
     user_prompts: str | Sequence[UserContent] | None = None
     """User prompts collected during the session for compact."""
@@ -1041,6 +1111,9 @@ class AgentContext(BaseModel):
         ctx.need_user_approve_mcps = ["filesystem", "github"]
         # All tools from these servers will require approval
     """
+
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
+    """Security-related runtime configuration."""
 
     subagent_history: dict[str, list[ModelMessage]] = Field(default_factory=dict)
     """Subagent history for resuming sessions."""
@@ -1150,7 +1223,7 @@ class AgentContext(BaseModel):
             return traced_model(model, name=agent_name, trace_id=context.get("run_id"))
 
         runtime = create_agent(
-            "openai:gpt-4",
+            "openai-chat:gpt-4",
             model_wrapper=my_wrapper,
         )
     """
@@ -1182,7 +1255,7 @@ class AgentContext(BaseModel):
                 yield
 
         runtime = create_agent(
-            "openai:gpt-4",
+            "openai-chat:gpt-4",
             subagent_wrapper=trace_subagent,
         )
     """
@@ -1200,7 +1273,7 @@ class AgentContext(BaseModel):
     Example::
 
         runtime = create_agent(
-            "openai:gpt-4",
+            "openai-chat:gpt-4",
             model_wrapper=my_wrapper,
             extra_context_kwargs={
                 "wrapper_metadata": {
@@ -1273,8 +1346,8 @@ class AgentContext(BaseModel):
         OAuth-backed Codex models use both underscore and hyphen header variants,
         matching OpenAI Codex session header behavior.
         """
-        session_id = _string_header_value(self.provider_session_id) or self.run_id
-        thread_id = _string_header_value(self.provider_thread_id) or self.run_id
+        session_id = _string_header_value(getattr(self, "provider_session_id", None)) or self.run_id
+        thread_id = _string_header_value(getattr(self, "provider_thread_id", None)) or self.run_id
         return {
             "session_id": session_id,
             "session-id": session_id,
@@ -1542,7 +1615,7 @@ class AgentContext(BaseModel):
         Per-run state (fresh for each run):
             - run_id, start_at, end_at
             - tool_id_wrapper, agent_stream_queues
-            - extra_usages, deferred_tool_metadata
+            - usage_snapshot_entries, shell_review_records, deferred_tool_metadata
             - force_inject_instructions
 
         Shared state (same reference as original):
@@ -1562,7 +1635,8 @@ class AgentContext(BaseModel):
             "end_at": None,
             "tool_id_wrapper": ToolIdWrapper(),
             "agent_stream_queues": _create_stream_queue_factory(),
-            "extra_usages": [],
+            "usage_snapshot_entries": {},
+            "shell_review_records": deque(maxlen=10),
             "deferred_tool_metadata": {},
             "force_inject_instructions": False,
         }
@@ -1628,6 +1702,8 @@ class AgentContext(BaseModel):
             "steering_messages": [],  # Subagent has its own steering queue
             "tool_id_wrapper": ToolIdWrapper(),  # Fresh wrapper for subagent
             "tool_tags": set(),  # Fresh tags for subagent (recomputed by its own Toolset)
+            "shell_review_records": deque(maxlen=10),
+            "security": self.security.model_copy(deep=True),
             # env is inherited via model_copy (shares parent's env reference)
             **override,
         }
@@ -1686,47 +1762,106 @@ class AgentContext(BaseModel):
 
             async with AgentContext(...) as ctx:
                 agent = Agent(
-                    'openai:gpt-4',
+                    'openai-chat:gpt-4',
                     deps_type=AgentContext,
                     capabilities=ctx.get_history_capabilities(),
                 )
         """
         return [ProcessHistory(processor) for processor in self._build_history_processors()]
 
-    def get_history_processors(self) -> list[Callable[..., Any]]:
-        """Return context history processor callables.
-
-        Deprecated: use get_history_capabilities() and pass the result to Agent(capabilities=...).
-        """
-        warnings.warn(
-            "AgentContext.get_history_processors() is deprecated; use get_history_capabilities() instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._build_history_processors()
-
-    def add_extra_usage(
+    def update_usage_snapshot_entry(
         self,
-        agent: str,
-        internal_usage: InternalUsage,
-        uuid: str | None = None,
-    ) -> None:
-        """Add an extra usage record.
+        *,
+        agent_id: str,
+        agent_name: str,
+        model_id: str,
+        usage: RunUsage,
+        usage_id: str | None = None,
+        source: str = "model_request",
+        ledger_key: str | None = None,
+    ) -> UsageSnapshot:
+        """Update one cumulative usage ledger entry and return the latest run snapshot."""
+        self.usage_snapshot_entries[ledger_key or agent_id] = UsageSnapshotEntry(
+            agent_id=agent_id,
+            agent_name=agent_name,
+            model_id=model_id,
+            usage=coerce_run_usage(usage),
+            usage_id=usage_id,
+            source=source,
+        )
+        return self.build_usage_snapshot()
 
-        Args:
-            agent: Agent name that generated this usage.
-            internal_usage: Internal usage record containing model_id and token usage.
-            uuid: Unique identifier (defaults to generated UUID if not provided).
-        """
-        record_uuid = uuid or uuid4().hex
-        self.extra_usages.append(
-            ExtraUsageRecord(
-                uuid=record_uuid,
-                agent=agent,
-                model_id=internal_usage.model_id,
-                usage=internal_usage.usage,
+    def build_usage_snapshot(self) -> UsageSnapshot:
+        """Build a cumulative usage snapshot for this run."""
+        total_usage = RunUsage()
+        agent_usages: dict[str, UsageAgentTotal] = {}
+        model_usages: dict[str, RunUsage] = {}
+        entries = sorted(self.usage_snapshot_entries.values(), key=lambda entry: entry.agent_id)
+        for entry in entries:
+            total_usage += entry.usage
+            current_agent_usage = agent_usages.get(entry.agent_id)
+            if current_agent_usage is None:
+                agent_usages[entry.agent_id] = UsageAgentTotal(
+                    agent_name=entry.agent_name,
+                    model_id=entry.model_id,
+                    usage=entry.usage,
+                    usage_id=entry.usage_id,
+                    source=entry.source,
+                )
+            else:
+                current_agent_usage.usage = current_agent_usage.usage + entry.usage
+                if current_agent_usage.model_id != entry.model_id:
+                    current_agent_usage.model_id = "multiple"
+            current_model_usage = model_usages.get(entry.model_id, RunUsage())
+            model_usages[entry.model_id] = current_model_usage + entry.usage
+        return UsageSnapshot(
+            run_id=self.parent_run_id or self.run_id,
+            total_usage=total_usage,
+            entries=list(entries),
+            agent_usages=agent_usages,
+            model_usages=model_usages,
+        )
+
+    async def emit_usage_snapshot_event(self, *, source: str = "usage_snapshot") -> None:
+        """Emit the current cumulative usage snapshot without mutating the ledger."""
+        if not self.usage_snapshot_entries:
+            return
+
+        snapshot = self.build_usage_snapshot()
+        await self.emit_event(
+            UsageSnapshotEvent(
+                event_id=f"{snapshot.run_id}:usage_snapshot:{source}",
+                snapshot=snapshot,
+                source=source,
             )
         )
+
+    async def emit_usage_snapshot(
+        self,
+        *,
+        agent_id: str,
+        agent_name: str,
+        model_id: str,
+        usage: RunUsage,
+        source: str = "model_request",
+        usage_id: str | None = None,
+        ledger_key: str | None = None,
+    ) -> None:
+        """Update cumulative usage and emit a usage snapshot event.
+
+        Deprecated: use update_usage_snapshot_entry() for ledger updates and
+        emit_usage_snapshot_event() at stream/session boundaries.
+        """
+        self.update_usage_snapshot_entry(
+            agent_id=agent_id,
+            agent_name=agent_name,
+            model_id=model_id,
+            usage=usage,
+            usage_id=usage_id,
+            source=source,
+            ledger_key=ledger_key,
+        )
+        await self.emit_usage_snapshot_event(source=source)
 
     async def emit_event(self, event: AgentStreamEvent) -> None:
         """Emit a custom event to the sideband stream queue.
@@ -1850,7 +1985,8 @@ class AgentContext(BaseModel):
         self,
         *,
         include_subagent: bool = True,
-        include_extra_usages: bool = False,
+        include_usage_ledger: bool = False,
+        include_extra_usages: bool | None = None,
     ) -> ResumableState:
         """Export resumable session state.
 
@@ -1861,28 +1997,32 @@ class AgentContext(BaseModel):
             include_subagent: Whether to include subagent history and registry.
                 Defaults to True. Set to False to exclude subagent data,
                 which can reduce state size for main agent-only persistence.
-            include_extra_usages: Whether to include extra_usages in the state.
-                Defaults to False. extra_usages is per-run data for billing tracking.
-                Set to True only for crash recovery scenarios where you need to
-                preserve usage data from an interrupted run.
+            include_usage_ledger: Whether to include usage ledger entries in the state.
+                Defaults to False. Usage ledger data is per-run billing data.
+                Set to True for crash recovery scenarios where interrupted-run
+                usage should be preserved.
+            include_extra_usages: Backward-compatible alias for include_usage_ledger.
 
         Returns:
             ResumableState instance ready for serialization.
 
         Example::
 
-            # Save full state including subagent history (default, no extra_usages)
+            # Save full state including subagent history (default, no usage ledger records)
             state = ctx.export_state()
 
             # Save state without subagent data
             state = ctx.export_state(include_subagent=False)
 
-            # Save state with extra_usages for crash recovery
-            state = ctx.export_state(include_extra_usages=True)
+            # Save state with usage ledger records for crash recovery
+            state = ctx.export_state(include_usage_ledger=True)
 
             with open("session.json", "w") as f:
                 f.write(state.model_dump_json(indent=2))
         """
+        if include_extra_usages is not None:
+            include_usage_ledger = include_extra_usages
+
         serialized_history: dict[str, list[dict[str, Any]]] = {}
         serialized_registry: dict[str, dict[str, Any]] = {}
 
@@ -1904,7 +2044,7 @@ class AgentContext(BaseModel):
 
         return ResumableState(
             subagent_history=serialized_history,
-            extra_usages=list(self.extra_usages) if include_extra_usages else [],
+            usage_snapshot_entries=dict(self.usage_snapshot_entries) if include_usage_ledger else {},
             user_prompts=self.user_prompts,
             steering_messages=list(self.steering_messages),
             handoff_message=self.handoff_message,
@@ -1912,6 +2052,7 @@ class AgentContext(BaseModel):
             agent_registry=serialized_registry,
             need_user_approve_tools=list(self.need_user_approve_tools),
             need_user_approve_mcps=list(self.need_user_approve_mcps),
+            security=self.security.model_copy(deep=True),
             auto_load_files=list(self.auto_load_files),
             tasks=self.task_manager.export_tasks(),
             notes=self.note_manager.export_notes(),

@@ -1,22 +1,18 @@
 """Session-level usage tracking for yaacli.
 
 This module provides usage tracking across multiple agent runs in a CLI session.
-It aggregates token usage from:
-- Main agent runs (via stream.run.usage())
-- Extra usage from subagents, image/video understanding, compact filter, etc.
-  (via ctx.extra_usages)
+It consumes the SDK's realtime UsageSnapshotEvent as the primary usage surface.
 
 Uses pydantic-ai's RunUsage directly for accurate tracking including details field.
 
 Example:
     session_usage = SessionUsage()
 
-    # After each run - main agent
-    session_usage.add("main", "openai:gpt-4o", run.usage())
+    # During streaming
+    session_usage.set_run_snapshot(usage_snapshot)
 
-    # Extra usages from subagents, etc.
-    for record in ctx.extra_usages:
-        session_usage.add(record.agent, record.model_id, record.usage)
+    # After run completion
+    session_usage.commit_run_snapshot()
 
     # Show summary
     print(session_usage.format_summary())
@@ -27,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from pydantic_ai.usage import RunUsage
+from ya_agent_sdk.usage import UsageSnapshot, coerce_run_usage
 
 
 @dataclass
@@ -36,7 +33,7 @@ class SessionUsage:
     Tracks token usage across all agent runs in a CLI session.
     Usage is grouped by:
     - Agent name (main, subagent names, image_understanding, etc.)
-    - Model ID (openai:gpt-4o, anthropic:claude-sonnet-4, etc.)
+    - Model ID (openai-chat:gpt-4o, anthropic:claude-sonnet-4, etc.)
 
     Uses pydantic-ai's RunUsage for accurate tracking including details field.
 
@@ -47,29 +44,90 @@ class SessionUsage:
 
     agent_usages: dict[str, RunUsage] = field(default_factory=dict)
     model_usages: dict[str, RunUsage] = field(default_factory=dict)
+    _manual_agent_usages: dict[str, RunUsage] = field(default_factory=dict)
+    _manual_model_usages: dict[str, RunUsage] = field(default_factory=dict)
+    _run_snapshots: dict[str, UsageSnapshot] = field(default_factory=dict)
+    _uncommitted_run_ids: set[str] = field(default_factory=set)
 
     def add(self, agent: str, model_id: str, usage: RunUsage) -> None:
         """Add usage for a specific agent and model.
 
         Args:
             agent: Agent name (e.g., "main", "explorer", "image_understanding").
-            model_id: Model identifier (e.g., "openai:gpt-4o", "anthropic:claude-sonnet-4").
+            model_id: Model identifier (e.g., "openai-chat:gpt-4o", "anthropic:claude-sonnet-4").
             usage: The RunUsage to accumulate.
         """
+        usage = coerce_run_usage(usage)
+
         # Accumulate by agent
-        if agent not in self.agent_usages:
-            self.agent_usages[agent] = RunUsage()
-        self.agent_usages[agent].incr(usage)
+        if agent not in self._manual_agent_usages:
+            self._manual_agent_usages[agent] = RunUsage()
+        self._manual_agent_usages[agent].incr(usage)
 
         # Accumulate by model
-        if model_id not in self.model_usages:
-            self.model_usages[model_id] = RunUsage()
-        self.model_usages[model_id].incr(usage)
+        if model_id not in self._manual_model_usages:
+            self._manual_model_usages[model_id] = RunUsage()
+        self._manual_model_usages[model_id].incr(usage)
+        self._rebuild_totals()
+
+    def _rebuild_totals(self) -> None:
+        """Rebuild public totals from manual fallback usage and per-run snapshots."""
+        self.agent_usages = {
+            agent: RunUsage() + coerce_run_usage(usage) for agent, usage in self._manual_agent_usages.items()
+        }
+        self.model_usages = {
+            model_id: RunUsage() + coerce_run_usage(usage) for model_id, usage in self._manual_model_usages.items()
+        }
+
+        for snapshot in self._run_snapshots.values():
+            for agent, entry in snapshot.agent_usages.items():
+                if agent not in self.agent_usages:
+                    self.agent_usages[agent] = RunUsage()
+                self.agent_usages[agent].incr(coerce_run_usage(entry.usage))
+            for model_id, usage in snapshot.model_usages.items():
+                if model_id not in self.model_usages:
+                    self.model_usages[model_id] = RunUsage()
+                self.model_usages[model_id].incr(coerce_run_usage(usage))
+
+    def set_run_snapshot(self, snapshot: UsageSnapshot) -> None:
+        """Replace usage for one run with a realtime SDK snapshot."""
+        for entry in snapshot.entries:
+            entry.usage = coerce_run_usage(entry.usage)
+        for entry in snapshot.agent_usages.values():
+            entry.usage = coerce_run_usage(entry.usage)
+        snapshot.model_usages = {model_id: coerce_run_usage(usage) for model_id, usage in snapshot.model_usages.items()}
+        snapshot.total_usage = coerce_run_usage(snapshot.total_usage)
+        self._run_snapshots[snapshot.run_id] = snapshot
+        self._uncommitted_run_ids.add(snapshot.run_id)
+        self._rebuild_totals()
+
+    @property
+    def has_run_snapshot(self) -> bool:
+        """Whether current session totals include an uncommitted run snapshot."""
+        return bool(self._uncommitted_run_ids)
+
+    def commit_run_snapshot(self, run_id: str | None = None) -> None:
+        """Mark realtime snapshot usage as committed session usage."""
+        if run_id is None:
+            self._uncommitted_run_ids.clear()
+        else:
+            self._uncommitted_run_ids.discard(run_id)
+
+    def clear_run_snapshot(self) -> None:
+        """Remove uncommitted realtime run snapshots from session totals."""
+        for run_id in list(self._uncommitted_run_ids):
+            self._run_snapshots.pop(run_id, None)
+        self._uncommitted_run_ids.clear()
+        self._rebuild_totals()
 
     def clear(self) -> None:
         """Clear all accumulated usage."""
         self.agent_usages.clear()
         self.model_usages.clear()
+        self._manual_agent_usages.clear()
+        self._manual_model_usages.clear()
+        self._run_snapshots.clear()
+        self._uncommitted_run_ids.clear()
 
     @property
     def total_input_tokens(self) -> int:
