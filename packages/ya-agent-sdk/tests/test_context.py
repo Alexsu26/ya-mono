@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic_ai.usage import RunUsage
 from ya_agent_sdk.context import AgentContext, ModelConfig, ShellReviewConfig, TaskStatus
 from ya_agent_sdk.environment.local import LocalEnvironment
 
@@ -719,7 +720,7 @@ async def test_export_and_with_state_with_data(env: LocalEnvironment) -> None:
         ctx.update_usage_snapshot_entry(
             agent_id="search",
             agent_name="search",
-            model_id="openai:gpt-4o",
+            model_id="openai-chat:gpt-4o",
             usage=RunUsage(input_tokens=50, output_tokens=50),
             usage_id="test-uuid",
             ledger_key="test-uuid",
@@ -802,7 +803,7 @@ async def test_export_state_include_subagent_false(env: LocalEnvironment) -> Non
         ctx.update_usage_snapshot_entry(
             agent_id="search",
             agent_name="search",
-            model_id="openai:gpt-4o",
+            model_id="openai-chat:gpt-4o",
             usage=RunUsage(input_tokens=50, output_tokens=50),
             usage_id="test-uuid",
             ledger_key="test-uuid",
@@ -886,6 +887,31 @@ async def test_resumable_state_json_serialization(env: LocalEnvironment) -> None
         assert history["agent-1"][0].parts[0].content == "Hello"
 
 
+class _CallableRunUsage:
+    def __init__(self, usage: RunUsage) -> None:
+        self._usage = usage
+        self.details = {"provider_cached_tokens": 999}
+
+    def __call__(self) -> RunUsage:
+        return self._usage
+
+
+async def test_update_usage_snapshot_entry_normalizes_callable_usage_wrapper(env: LocalEnvironment) -> None:
+    async with AgentContext(env=env) as ctx:
+        ctx.update_usage_snapshot_entry(
+            agent_id="main",
+            agent_name="main",
+            model_id="openai-chat:gpt-4o",
+            usage=_CallableRunUsage(RunUsage(input_tokens=10, output_tokens=20, details={"cached_tokens": 3})),  # type: ignore[arg-type]
+        )
+
+        entry = ctx.build_usage_snapshot().entries[0]
+        assert type(entry.usage) is RunUsage
+        assert entry.usage.input_tokens == 10
+        assert entry.usage.output_tokens == 20
+        assert entry.usage.details == {"cached_tokens": 3}
+
+
 async def test_resumable_state_json_serialization_with_usage_ledger(env: LocalEnvironment) -> None:
     """Should serialize and deserialize ResumableState with usage ledger entries to/from JSON."""
     from pydantic_ai.usage import RunUsage
@@ -896,7 +922,7 @@ async def test_resumable_state_json_serialization_with_usage_ledger(env: LocalEn
         ctx.update_usage_snapshot_entry(
             agent_id="search",
             agent_name="search",
-            model_id="openai:gpt-4o",
+            model_id="openai-chat:gpt-4o",
             usage=RunUsage(input_tokens=100, output_tokens=200),
             usage_id="usage-1",
             ledger_key="usage-1",
@@ -1206,12 +1232,12 @@ def test_tool_id_wrapper_wrap_event_function_tool_result() -> None:
 
     wrapper = ToolIdWrapper()
     result_part = ToolReturnPart(tool_name="test_tool", tool_call_id="original-id", content="result")
-    event = FunctionToolResultEvent(result=result_part)
+    event = FunctionToolResultEvent(part=result_part)
 
     result = wrapper.wrap_event(event)
 
     assert result.tool_call_id.startswith("ya-")
-    assert result.result.tool_call_id.startswith("ya-")
+    assert result.part.tool_call_id.startswith("ya-")
 
 
 def test_tool_id_wrapper_wrap_event_part_start() -> None:
@@ -1370,7 +1396,7 @@ def test_tool_id_wrapper_consistency_across_methods() -> None:
 
     # Wrap via result event - should use same normalized ID
     result_part = ToolReturnPart(tool_name="test", tool_call_id=original_id, content="done")
-    result_event = FunctionToolResultEvent(result=result_part)
+    result_event = FunctionToolResultEvent(part=result_part)
     wrapper.wrap_event(result_event)
 
     # Wrap via messages - should use same normalized ID
@@ -1379,7 +1405,7 @@ def test_tool_id_wrapper_consistency_across_methods() -> None:
     wrapper.wrap_messages(mock_ctx, messages)
 
     # All should have same normalized ID
-    assert call_event.part.tool_call_id == result_event.result.tool_call_id
+    assert call_event.part.tool_call_id == result_event.part.tool_call_id
     assert call_event.part.tool_call_id == messages[0].parts[0].tool_call_id
 
 

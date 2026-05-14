@@ -11,7 +11,6 @@ import contextvars
 import inspect
 import sys
 import time
-import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
@@ -20,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Generic, cast
 
 import jinja2
 from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, UsageLimits, UserError
-from pydantic_ai._agent_graph import CallToolsNode, HistoryProcessor, ModelRequestNode
+from pydantic_ai._agent_graph import CallToolsNode, ModelRequestNode
 from pydantic_ai.capabilities import AbstractCapability, ProcessHistory
 from pydantic_ai.messages import (
     BaseToolCallPart,
@@ -74,7 +73,7 @@ from ya_agent_sdk.filters.system_prompt import create_system_prompt_filter
 from ya_agent_sdk.toolsets.core.base import BaseTool, GlobalHooks, Toolset
 from ya_agent_sdk.utils import AgentDepsT, EnvT, add_toolset_instructions
 
-from .capabilities import HISTORY_PROCESSORS_DEPRECATION_MESSAGE, is_process_history_for
+from .capabilities import is_process_history_for
 
 if TYPE_CHECKING:
     from pydantic_ai import ModelSettings
@@ -87,11 +86,6 @@ logger = get_logger(__name__)
 # =============================================================================
 # Exceptions
 # =============================================================================
-
-
-_PRE_HISTORY_PROCESSORS_DEPRECATION_MESSAGE = (
-    "`pre_history_processors=` is deprecated; use `pre_capabilities=[ProcessHistory(...)]` instead."
-)
 
 
 class AgentInterrupted(Exception):
@@ -184,14 +178,14 @@ class AgentRuntime(Generic[AgentDepsT, OutputT, EnvT]):
         core_toolset: The core toolset with BaseTool instances.
 
     Example:
-        runtime = create_agent("openai:gpt-4")
+        runtime = create_agent("openai-chat:gpt-4")
         async with runtime:
             result = await runtime.agent.run("Hello", deps=runtime.ctx)
             print(result.output)
 
         # Or with external env management:
         async with env:
-            runtime = create_agent("openai:gpt-4", env=env)
+            runtime = create_agent("openai-chat:gpt-4", env=env)
             async with runtime:  # Only enters ctx and agent
                 result = await runtime.agent.run("Hello", deps=runtime.ctx)
     """
@@ -386,8 +380,6 @@ def create_agent(
     agent_name: str = "main",
     system_prompt: str | None = None,
     system_prompt_template_vars: dict[str, Any] | None = None,
-    pre_history_processors: Sequence[HistoryProcessor[AgentDepsT]] | None = None,
-    history_processors: Sequence[HistoryProcessor[AgentDepsT]] | None = None,
     retries: int = 1,
     output_retries: int = 3,
     defer_model_check: bool = False,
@@ -401,7 +393,7 @@ def create_agent(
     the lifecycle of these components.
 
     Args:
-        model: Model string (e.g., "openai:gpt-4") or Model instance.
+        model: Model string (e.g., "openai-chat:gpt-4") or Model instance.
 
         model_settings: Optional model settings for inference configuration.
         model_wrapper: Optional wrapper for model instrumentation (observability, caching).
@@ -458,10 +450,6 @@ def create_agent(
             rendered as a Jinja2 template, supporting conditionals and default values.
         system_prompt_template_vars: Variables for Jinja2 template rendering. Works with
             both custom system_prompt strings and the default template file.
-        pre_history_processors: Deprecated sequence of history processors to run BEFORE built-in
-            ProcessHistory capabilities. Use pre_capabilities=[ProcessHistory(...)] for new code.
-        history_processors: Deprecated sequence of history processors to run AFTER built-in
-            ProcessHistory capabilities. Use capabilities=[ProcessHistory(...)] for new code.
         retries: Number of retries for agent run. Defaults to 1.
         output_retries: Number of retries for output parsing. Defaults to 3.
         defer_model_check: Defer model validation. Defaults to False.
@@ -472,7 +460,7 @@ def create_agent(
     Example:
         Basic usage::
 
-            runtime = create_agent("openai:gpt-4")
+            runtime = create_agent("openai-chat:gpt-4")
             async with runtime:
                 result = await runtime.agent.run("Hello", deps=runtime.ctx)
                 print(result.output)
@@ -494,12 +482,12 @@ def create_agent(
                 mounts=[VirtualMount(Path("."), Path("/workspace"))],
                 image="python:3.11",
             ) as sandbox_env:
-                runtime = create_agent("openai:gpt-4", env=sandbox_env)
+                runtime = create_agent("openai-chat:gpt-4", env=sandbox_env)
 
         With templated system prompt::
 
             runtime = create_agent(
-                "openai:gpt-4",
+                "openai-chat:gpt-4",
                 system_prompt="You are a {{ role }}. {{ extra_instructions | default('') }}",
                 system_prompt_template_vars={"role": "helpful assistant"},
             )
@@ -528,8 +516,7 @@ def create_agent(
     logger.debug("Context created: %s (run_id=%s)", type(ctx).__name__, ctx.run_id)
 
     # --- Capabilities ---
-    # Combine user capabilities, compatibility history processors, context history capabilities,
-    # built-in ProcessHistory capabilities, and user-provided compatibility processors.
+    # Combine user capabilities, context history capabilities, and built-in ProcessHistory capabilities.
     # Runtime instructions run after compact so restored histories receive fresh runtime context.
     context_history_capabilities = [
         capability
@@ -550,15 +537,6 @@ def create_agent(
         )
     )
 
-    pre_history_capabilities: list[AbstractCapability[AgentDepsT]] = []
-    post_history_capabilities: list[AbstractCapability[AgentDepsT]] = []
-    if pre_history_processors:
-        warnings.warn(_PRE_HISTORY_PROCESSORS_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
-        pre_history_capabilities.extend(ProcessHistory(processor) for processor in pre_history_processors)
-    if history_processors:
-        warnings.warn(HISTORY_PROCESSORS_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
-        post_history_capabilities.extend(ProcessHistory(processor) for processor in history_processors)
-
     user_pre_capabilities = list(pre_capabilities or [])
     user_capabilities = list(capabilities or [])
     sdk_history_capabilities: list[AbstractCapability[AgentDepsT]] = [
@@ -570,15 +548,11 @@ def create_agent(
         ProcessHistory(inject_runtime_instructions),
     ]
     internal_subagent_capabilities: list[AbstractCapability[AgentDepsT]] = [
-        *pre_history_capabilities,
         *sdk_history_capabilities,
-        *post_history_capabilities,
     ]
     all_capabilities: list[AbstractCapability[AgentDepsT]] = [
         *user_pre_capabilities,
-        *pre_history_capabilities,
         *sdk_history_capabilities,
-        *post_history_capabilities,
         *user_capabilities,
     ]
 
@@ -871,7 +845,7 @@ class AgentStreamer(Generic[AgentDepsT, OutputT]):
             streamer.raise_if_exception()
             # Access final result and usage
             if streamer.run:
-                print(f"Usage: {streamer.run.usage()}")
+                print(f"Usage: {streamer.run.usage}")
     """
 
     _output_queue: asyncio.Queue[StreamEvent]
@@ -1057,7 +1031,7 @@ async def stream_agent(  # noqa: C901
     Example::
 
         # Recommended: Let stream_agent manage the runtime lifecycle
-        runtime = create_agent("openai:gpt-4")
+        runtime = create_agent("openai-chat:gpt-4")
         async with stream_agent(
             runtime,
             "Search for Python tutorials",
@@ -1205,7 +1179,7 @@ async def stream_agent(  # noqa: C901
             agent_id=main_agent_info.agent_id,
             agent_name=main_agent_info.agent_name,
             model_id=base_model.model_name,
-            usage=run.usage(),
+            usage=run.usage,
             source="main_model_request",
         )
 

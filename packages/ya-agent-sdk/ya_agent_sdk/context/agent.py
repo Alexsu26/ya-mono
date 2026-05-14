@@ -26,7 +26,7 @@ Example:
         from ya_agent_sdk.agents.main import create_agent, stream_agent
 
         # create_agent returns AgentRuntime (not a context manager)
-        runtime = create_agent("openai:gpt-4")
+        runtime = create_agent("openai-chat:gpt-4")
 
         # stream_agent manages runtime lifecycle automatically
         async with stream_agent(runtime, "Hello") as streamer:
@@ -35,7 +35,7 @@ Example:
 
     Using create_agent with manual agent.run::
 
-        runtime = create_agent("openai:gpt-4")
+        runtime = create_agent("openai-chat:gpt-4")
         async with runtime:  # Enter runtime to manage env/ctx/agent
             result = await runtime.agent.run("Hello", deps=runtime.ctx)
             print(result.output)
@@ -65,11 +65,10 @@ Example:
 from __future__ import annotations
 
 import asyncio
-import warnings
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -108,7 +107,7 @@ from ya_agent_environment import Environment, FileOperator, ResourceRegistry, Sh
 
 from ya_agent_sdk.agents.lifecycle import LifecycleExtension
 from ya_agent_sdk.events import AgentEvent, UsageSnapshotEvent
-from ya_agent_sdk.usage import UsageAgentTotal, UsageSnapshot, UsageSnapshotEntry
+from ya_agent_sdk.usage import UsageAgentTotal, UsageSnapshot, UsageSnapshotEntry, coerce_run_usage
 from ya_agent_sdk.utils import get_latest_request_usage
 
 from .bus import BusMessage, MessageBus
@@ -184,7 +183,7 @@ Example::
         return LangfuseModel(model, name=agent_name)
 
     runtime = create_agent(
-        "openai:gpt-4",
+        "openai-chat:gpt-4",
         model_wrapper=my_wrapper,
     )
 """
@@ -223,7 +222,7 @@ Example::
             yield
 
     runtime = create_agent(
-        "openai:gpt-4",
+        "openai-chat:gpt-4",
         subagent_wrapper=trace_subagent,
     )
 """
@@ -330,11 +329,6 @@ def _create_stream_queue_factory() -> dict[str, asyncio.Queue[AgentStreamEvent]]
     return defaultdict(asyncio.Queue)
 
 
-def snapshot_run_usage(usage: RunUsage) -> RunUsage:
-    """Return an immutable-in-practice snapshot of current RunUsage values."""
-    return replace(usage, details=dict(usage.details))
-
-
 # =============================================================================
 # Agent Info and Stream Event
 # =============================================================================
@@ -429,7 +423,7 @@ class ToolIdWrapper:
             case FunctionToolCallEvent():
                 event.part.tool_call_id = self.upsert_tool_call_id(event.tool_call_id)
             case FunctionToolResultEvent():
-                event.result.tool_call_id = self.upsert_tool_call_id(event.tool_call_id)
+                event.part.tool_call_id = self.upsert_tool_call_id(event.tool_call_id)
             case PartStartEvent() | PartEndEvent():
                 if isinstance(event.part, (ToolCallPart, ToolReturnPart, RetryPromptPart)):
                     event.part.tool_call_id = self.upsert_tool_call_id(event.part.tool_call_id)
@@ -992,7 +986,7 @@ class AgentContext(BaseModel):
 
             from ya_agent_sdk.agents.main import create_agent, stream_agent
 
-            runtime = create_agent("openai:gpt-4")
+            runtime = create_agent("openai-chat:gpt-4")
             # stream_agent manages runtime lifecycle automatically
             async with stream_agent(runtime, "Hello") as streamer:
                 async for event in streamer:
@@ -1000,7 +994,7 @@ class AgentContext(BaseModel):
 
         Using create_agent with manual agent.run::
 
-            runtime = create_agent("openai:gpt-4")
+            runtime = create_agent("openai-chat:gpt-4")
             async with runtime:
                 result = await runtime.agent.run("Hello", deps=runtime.ctx)
 
@@ -1229,7 +1223,7 @@ class AgentContext(BaseModel):
             return traced_model(model, name=agent_name, trace_id=context.get("run_id"))
 
         runtime = create_agent(
-            "openai:gpt-4",
+            "openai-chat:gpt-4",
             model_wrapper=my_wrapper,
         )
     """
@@ -1261,7 +1255,7 @@ class AgentContext(BaseModel):
                 yield
 
         runtime = create_agent(
-            "openai:gpt-4",
+            "openai-chat:gpt-4",
             subagent_wrapper=trace_subagent,
         )
     """
@@ -1279,7 +1273,7 @@ class AgentContext(BaseModel):
     Example::
 
         runtime = create_agent(
-            "openai:gpt-4",
+            "openai-chat:gpt-4",
             model_wrapper=my_wrapper,
             extra_context_kwargs={
                 "wrapper_metadata": {
@@ -1768,24 +1762,12 @@ class AgentContext(BaseModel):
 
             async with AgentContext(...) as ctx:
                 agent = Agent(
-                    'openai:gpt-4',
+                    'openai-chat:gpt-4',
                     deps_type=AgentContext,
                     capabilities=ctx.get_history_capabilities(),
                 )
         """
         return [ProcessHistory(processor) for processor in self._build_history_processors()]
-
-    def get_history_processors(self) -> list[Callable[..., Any]]:
-        """Return context history processor callables.
-
-        Deprecated: use get_history_capabilities() and pass the result to Agent(capabilities=...).
-        """
-        warnings.warn(
-            "AgentContext.get_history_processors() is deprecated; use get_history_capabilities() instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._build_history_processors()
 
     def update_usage_snapshot_entry(
         self,
@@ -1803,7 +1785,7 @@ class AgentContext(BaseModel):
             agent_id=agent_id,
             agent_name=agent_name,
             model_id=model_id,
-            usage=snapshot_run_usage(usage),
+            usage=coerce_run_usage(usage),
             usage_id=usage_id,
             source=source,
         )
