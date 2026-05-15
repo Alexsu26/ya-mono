@@ -61,6 +61,41 @@ def test_create_tui_runtime_uses_active_model_profile(tmp_path: Path) -> None:
     assert runtime.ctx.model_cfg.context_window == 270_000
 
 
+def test_apply_model_profile_passes_codex_oauth_headers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Runtime /model switching preserves Codex OAuth session headers."""
+    from yaacli.runtime import apply_model_profile
+
+    calls: list[tuple[str, dict[str, str] | None]] = []
+
+    def fake_infer(model: str, extra_headers: dict[str, str] | None = None) -> None:
+        calls.append((model, extra_headers))
+        return None
+
+    runtime = create_tui_runtime(
+        config=YaacliConfig(general=GeneralConfig(model="openai:gpt-4")),
+        working_dir=tmp_path,
+    )
+    monkeypatch.setattr("yaacli.runtime.infer_model", fake_infer)
+
+    apply_model_profile(runtime, ModelProfileConfig(model="oauth@codex:gpt-5.5"))
+
+    assert calls == [
+        (
+            "oauth@codex:gpt-5.5",
+            {
+                "session_id": runtime.ctx.run_id,
+                "session-id": runtime.ctx.run_id,
+                "thread_id": runtime.ctx.run_id,
+                "thread-id": runtime.ctx.run_id,
+                "x-client-request-id": runtime.ctx.run_id,
+            },
+        )
+    ]
+
+
 async def test_create_tui_runtime_uses_custom_config_dir_for_allowed_paths(tmp_path: Path) -> None:
     """Test runtime wiring with a custom global config directory."""
     config = YaacliConfig(
@@ -98,7 +133,7 @@ async def test_create_tui_runtime_orders_skill_paths_by_priority(tmp_path: Path)
             config_dir.resolve(),
             (Path.home() / ".agents").resolve(),
             working_dir.resolve(),
-            (working_dir / ".xunocli").resolve(),
+            (working_dir / ".yaacli").resolve(),
         ]
         assert allowed_paths[:4] == expected_prefix
 

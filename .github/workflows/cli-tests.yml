@@ -7,6 +7,8 @@ on:
     paths:
       - "packages/yaacli/**"
       - "packages/ya-agent-sdk/**"
+      - "packages/ya-oauth/**"
+      - "packages/ya-oauth-provider/**"
       - "skills/**"
       - "scripts/sync-skills.sh"
       - "scripts/check-skills-sync.sh"
@@ -20,6 +22,8 @@ on:
     paths:
       - "packages/yaacli/**"
       - "packages/ya-agent-sdk/**"
+      - "packages/ya-oauth/**"
+      - "packages/ya-oauth-provider/**"
       - "skills/**"
       - "scripts/sync-skills.sh"
       - "scripts/check-skills-sync.sh"
@@ -58,4 +62,4 @@ jobs:
         run: python scripts/build-skill-zips.py --check
 
       - name: Run CLI tests
-        run: uv run python -m pytest packages/yaacli/tests -n auto
+        run: uv run python -m pytest packages/yaacli/tests packages/ya-oauth/tests packages/ya-oauth-provider/tests -n auto

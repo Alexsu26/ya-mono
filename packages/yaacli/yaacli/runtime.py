@@ -114,7 +114,10 @@ def _build_effective_model(
     profile: ModelProfileConfig,
 ) -> Model | None:
     """Build the pydantic-ai model instance for a profile, applying runtime wrappers."""
-    base_model = infer_model(profile.model) if profile.model else None
+    model_extra_headers = (
+        runtime.ctx.get_model_extra_headers() if profile.model and profile.model.startswith("oauth@codex:") else None
+    )
+    base_model = infer_model(profile.model, extra_headers=model_extra_headers) if profile.model else None
     if base_model is not None and runtime.ctx.model_wrapper is not None:
         wrapper_metadata = runtime.ctx.get_wrapper_metadata()
         agent_name = getattr(runtime.agent, "name", None) or "main"
@@ -168,7 +171,7 @@ def _load_subagent_configs(
 ) -> list[SubagentConfig]:
     """Load subagent configs from user config directory.
 
-    Subagents are loaded from ~/.xunocli/subagents/
+    Subagents are loaded from ~/.yaacli/subagents/
     and filtered based on the disabled list in config.
 
     Args:
@@ -292,7 +295,7 @@ def create_tui_runtime(
     # Include global config dir in allowed_paths so agent can modify configs directly.
     # Include ~/.agents for shared skills following the Agent Skills open standard.
     # Order matters for skill priority (later = higher priority):
-    #   ~/.xunocli < ~/.agents < project dir < project .xunocli
+    #   ~/.yaacli < ~/.agents < project dir < project .yaacli
     global_config_dir = config_dir or ConfigManager.DEFAULT_CONFIG_DIR
     # Ensure .gitignore exists in config dir to keep session data out of file tree context
     ConfigManager(config_dir=global_config_dir).ensure_config_dir()

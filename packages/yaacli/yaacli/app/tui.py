@@ -3284,7 +3284,7 @@ class TUIApp:
         to directory mtime.
 
         Args:
-            sessions_dir: Path to ~/.xunocli/sessions/
+            sessions_dir: Path to ~/.yaacli/sessions/
             max_sessions: Maximum number of sessions to retain.
         """
         if not sessions_dir.exists():

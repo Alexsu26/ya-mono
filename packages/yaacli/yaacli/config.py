@@ -1,20 +1,20 @@
-"""Configuration management for xunocli.
+"""Configuration management for yaacli.
 
 Configuration files are loaded with project-level priority (no merging):
 
 1. **config.toml** (model + TUI settings):
-   - Global: ~/.xunocli/config.toml
-   - Project: .xunocli/config.toml (overrides global entirely)
+   - Global: ~/.yaacli/config.toml
+   - Project: .yaacli/config.toml (overrides global entirely)
    - Contains: model, model_settings, display, steering, session, browser, subagents, env
 
 2. **tools.toml** (tool permissions):
-   - Global: ~/.xunocli/tools.toml
-   - Project: .xunocli/tools.toml (overrides global entirely)
+   - Global: ~/.yaacli/tools.toml
+   - Project: .yaacli/tools.toml (overrides global entirely)
    - Contains: need_approval list
 
 3. **mcp.json** (MCP server configurations):
-   - Global: ~/.xunocli/mcp.json
-   - Project: .xunocli/mcp.json (overrides global entirely)
+   - Global: ~/.yaacli/mcp.json
+   - Project: .yaacli/mcp.json (overrides global entirely)
 
 4. **Environment variables** (YAACLI_*):
    - TUI configuration overrides only (merged on top of config.toml)
@@ -29,7 +29,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PositiveInt
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from ya_agent_sdk.mcp import MCPConfig, MCPServerConfig, load_mcp_config_file
 
@@ -43,6 +43,8 @@ __all__ = [
     "MCPConfig",
     "MCPServerConfig",
     "ModelProfileConfig",
+    "OAuthRefreshConfig",
+    "SessionConfig",
     "SubagentOverride",
     "SubagentsConfig",
     "ToolsConfig",
@@ -120,6 +122,22 @@ class DisplayConfig(BaseModel):
     """Show elapsed time."""
 
 
+class SessionConfig(BaseModel):
+    """Local TUI session persistence configuration."""
+
+    session_dir: str = ""
+    """Override directory for saved sessions. Empty uses ~/.yaacli/sessions."""
+
+    auto_save_history: bool = True
+    """Persist transcript, message history, and context state after turns."""
+
+    auto_restore: bool = False
+    """Automatically restore the latest saved session for the current workspace."""
+
+    max_sessions: int = 100
+    """Maximum local sessions retained."""
+
+
 class BrowserConfig(BaseModel):
     """Browser automation configuration."""
 
@@ -156,8 +174,8 @@ class SubagentOverride(BaseModel):
 class SubagentsConfig(BaseModel):
     """Subagent configuration.
 
-    Subagents are loaded from ~/.xunocli/subagents/
-    which is initialized by `xunocli setup`.
+    Subagents are loaded from ~/.yaacli/subagents/
+    which is initialized by `yaacli setup`.
     """
 
     disabled: list[str] = Field(default_factory=list)
@@ -169,6 +187,9 @@ class SubagentsConfig(BaseModel):
 
 class ModelProfileConfig(BaseModel):
     """Named model profile selectable at runtime."""
+
+    label: str | None = None
+    """Human-friendly label shown by /model. If omitted, the profile name is used."""
 
     model: str
     """Model string. Format: 'provider:model_name'."""
@@ -264,18 +285,32 @@ class MediaConfig(BaseModel):
     """S3 configuration for media upload."""
 
 
+class OAuthRefreshConfig(BaseModel):
+    """OAuth proactive refresh configuration."""
+
+    enabled: bool = True
+    interval_seconds: PositiveInt = 1800
+    failure_retry_seconds: PositiveInt = 60
+    refresh_on_startup: bool = True
+
+
 class YaacliConfig(BaseModel):
-    """Complete xunocli configuration."""
+    """Complete yaacli configuration."""
 
     # From global config
     general: GeneralConfig = Field(default_factory=GeneralConfig)
     models: dict[str, ModelProfileConfig] = Field(default_factory=dict)
     """Named model profiles selectable with /model."""
+    model_profiles: dict[str, ModelProfileConfig] = Field(default_factory=dict)
+    """Upstream-compatible alias for named model profiles selectable with /model."""
     display: DisplayConfig = Field(default_factory=DisplayConfig)
+    session: SessionConfig = Field(default_factory=SessionConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
     media: MediaConfig = Field(default_factory=MediaConfig)
     """Media handling configuration (S3 upload, etc.)."""
+    oauth_refresh: OAuthRefreshConfig = Field(default_factory=OAuthRefreshConfig)
+    """OAuth proactive refresh configuration."""
     env: dict[str, str] = Field(default_factory=dict)
     """Environment variable overrides for the CLI process (e.g., API keys)."""
     shell_env: dict[str, str] = Field(default_factory=dict)
@@ -308,6 +343,7 @@ class YaacliConfig(BaseModel):
     def get_model_profiles(self) -> dict[str, ModelProfileConfig]:
         """Get selectable model profiles, including legacy [general] as default."""
         profiles = dict(self.models)
+        profiles.update(self.model_profiles)
         if self.general.model and "default" not in profiles:
             profiles["default"] = ModelProfileConfig.from_general(self.general)
         return profiles
@@ -325,15 +361,16 @@ class YaacliConfig(BaseModel):
             return self.general.active_model, self.get_model_profile(self.general.active_model)
         if self.general.model:
             return "default", ModelProfileConfig.from_general(self.general)
-        if self.models:
-            first_name = next(iter(self.models))
-            return first_name, self.models[first_name]
+        profiles = self.get_model_profiles()
+        if profiles:
+            first_name = next(iter(profiles))
+            return first_name, profiles[first_name]
         return None
 
     @property
     def is_configured(self) -> bool:
         """Check if minimum required configuration is present."""
-        return bool(self.general.model or self.models)
+        return bool(self.general.model or self.models or self.model_profiles)
 
 
 # =============================================================================
@@ -379,6 +416,12 @@ class EnvSettings(BaseSettings):
     agent_stream_resume_max_attempts: int | None = None
     agent_stream_resume_prompt: str | None = None
 
+    # OAuth refresh
+    oauth_refresh_enabled: bool | None = None
+    oauth_refresh_interval_seconds: PositiveInt | None = None
+    oauth_refresh_failure_retry_seconds: PositiveInt | None = None
+    oauth_refresh_on_startup: bool | None = None
+
 
 # =============================================================================
 # ConfigManager
@@ -388,10 +431,10 @@ class EnvSettings(BaseSettings):
 class ConfigManager:
     """Manages configuration loading from global, project, and environment sources."""
 
-    DEFAULT_CONFIG_DIR = Path.home() / ".xunocli"
-    LEGACY_CONFIG_DIR = Path.home() / ".yaacli"
-    PROJECT_CONFIG_DIR = ".xunocli"
-    LEGACY_PROJECT_CONFIG_DIR = ".yaacli"
+    DEFAULT_CONFIG_DIR = Path.home() / ".yaacli"
+    LEGACY_CONFIG_DIR = Path.home() / ".xunocli"
+    PROJECT_CONFIG_DIR = ".yaacli"
+    LEGACY_PROJECT_CONFIG_DIR = ".xunocli"
 
     def __init__(
         self,
@@ -547,6 +590,19 @@ class ConfigManager:
         if general:
             overrides["general"] = general
 
+        # OAuth refresh
+        oauth_refresh: dict[str, Any] = {}
+        if env.oauth_refresh_enabled is not None:
+            oauth_refresh["enabled"] = env.oauth_refresh_enabled
+        if env.oauth_refresh_interval_seconds is not None:
+            oauth_refresh["interval_seconds"] = env.oauth_refresh_interval_seconds
+        if env.oauth_refresh_failure_retry_seconds is not None:
+            oauth_refresh["failure_retry_seconds"] = env.oauth_refresh_failure_retry_seconds
+        if env.oauth_refresh_on_startup is not None:
+            oauth_refresh["refresh_on_startup"] = env.oauth_refresh_on_startup
+        if oauth_refresh:
+            overrides["oauth_refresh"] = oauth_refresh
+
         return overrides
 
     def load_mcp_config(self) -> MCPConfig | None:
@@ -579,7 +635,7 @@ class ConfigManager:
             return global_mcp
         return None
 
-    # Directories to exclude from file tree context in ~/.xunocli/
+    # Directories to exclude from file tree context in ~/.yaacli/
     _TREEIGNORE_ENTRIES = frozenset({"sessions", "message_history", "worktrees"})
 
     def ensure_config_dir(self) -> None:
@@ -646,16 +702,16 @@ class ConfigManager:
 
         Returns:
             Path to the sessions directory under global config.
-            Format: ~/.xunocli/sessions/
+            Format: ~/.yaacli/sessions/
         """
         return self._config_dir / "sessions"
 
     def _migrate_legacy_global_config(self) -> None:
-        """Copy ~/.yaacli to ~/.xunocli on first use when the new directory is absent."""
+        """Copy ~/.xunocli to ~/.yaacli without overwriting existing files."""
         _copy_legacy_config_dir(self.LEGACY_CONFIG_DIR, self._config_dir)
 
     def _migrate_legacy_project_config(self) -> None:
-        """Copy .yaacli to .xunocli on first use when the new directory is absent."""
+        """Copy .xunocli to .yaacli without overwriting existing files."""
         legacy_project_dir = self._project_dir / self.LEGACY_PROJECT_CONFIG_DIR
         project_dir = self._project_dir / self.PROJECT_CONFIG_DIR
         _copy_legacy_config_dir(legacy_project_dir, project_dir)
@@ -669,7 +725,7 @@ class ConfigManager:
 class WorktreeMetadata(TypedDict):
     """Metadata for a git worktree managed by yaacli.
 
-    Stored as JSON in ~/.xunocli/worktrees/{project_hash}/metadata.json.
+    Stored as JSON in ~/.yaacli/worktrees/{project_hash}/metadata.json.
     """
 
     git_root: str
@@ -703,10 +759,20 @@ def _load_template(name: str) -> str:
 
 def _copy_legacy_config_dir(source: Path, target: Path) -> None:
     """Copy a legacy config directory to the new location without overwriting."""
-    if not source.exists() or target.exists() or not source.is_dir():
+    if not source.exists() or not source.is_dir():
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, target)
+    if not target.exists():
+        shutil.copytree(source, target)
+        return
+    for item in source.iterdir():
+        destination = target / item.name
+        if destination.exists():
+            continue
+        if item.is_dir():
+            shutil.copytree(item, destination)
+        else:
+            shutil.copy2(item, destination)
 
 
 # =============================================================================

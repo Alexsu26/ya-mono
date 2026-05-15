@@ -359,7 +359,7 @@ def run_setup_wizard(config_manager: ConfigManager) -> bool:
     click.echo(f"  - Custom subagents: {config_manager.config_dir / 'subagents/'}")
     click.echo(f"  - MCP servers: {config_manager.config_dir / 'mcp.json'}")
     click.echo()
-    click.echo("Run 'xunocli' again to start!")
+    click.echo("Run 'yaacli' again to start!")
     click.echo()
 
     return True
@@ -519,7 +519,7 @@ def _create_worktree(branch_name: str | None) -> tuple[Path, str, bool]:
         timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         branch_name = f"yaacli/{timestamp}"
 
-    # Create worktree directory under ~/.xunocli/worktrees/{project_hash}/{branch}
+    # Create worktree directory under ~/.yaacli/worktrees/{project_hash}/{branch}
     proj_hash = _project_hash(git_root)
     worktrees_dir = ConfigManager.DEFAULT_CONFIG_DIR / "worktrees" / proj_hash
     worktrees_dir.mkdir(parents=True, exist_ok=True)
@@ -569,9 +569,9 @@ def _create_worktree(branch_name: str | None) -> tuple[Path, str, bool]:
     metavar="BRANCH",
     help="Branch name for worktree (implies --worktree).",
 )
-@click.version_option(version=__version__, prog_name="xunocli")
+@click.version_option(version=__version__, prog_name="yaacli")
 def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
-    """Xuno CLI - AI-powered coding assistant.
+    """YAACLI - AI-powered coding assistant.
 
     Inside TUI, use slash commands:
       /help     - Show available commands
@@ -586,7 +586,7 @@ def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
       /exit     - Exit application
     """
     configure_logging(verbose=verbose)
-    logger.info("Starting xunocli v%s", __version__)
+    logger.info("Starting yaacli v%s", __version__)
 
     load_package_env_files()
 
@@ -674,7 +674,7 @@ def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
         click.echo(f"  Directory: {worktree_dir}")
         click.echo()
         click.echo("To resume in this worktree:")
-        click.echo(f"  xunocli -w -b {actual_branch}")
+        click.echo(f"  yaacli -w -b {actual_branch}")
         click.echo()
         click.echo("To remove when done:")
         click.echo(f"  git worktree remove {worktree_dir}")
@@ -691,9 +691,44 @@ async def _run_tui(
 ) -> str | None:
     """Run the TUI application.
 
+    Honors the ``YAACLI_TUI`` env var:
+      - unset / ``v2`` / ``textual`` → Textual-based V2 TUI
+      - ``console`` / ``stream`` / ``streaming`` → modal-prompt v2 fallback
+      - ``v1`` / ``legacy`` / ``prompt_toolkit`` → v1 prompt_toolkit full-screen TUI
+
     Returns:
         Session ID if the session has saved data, None otherwise.
     """
+    tui_flavor = (
+        (
+            os.environ.get("YAACLI_TUI")
+            or os.environ.get("XUNOCLI_TUI")  # compatibility with the short-lived fork name
+            or "v2"
+        )
+        .strip()
+        .lower()
+    )
+    if tui_flavor in {"", "v2", "textual"}:
+        from yaacli.console.textual_app import run_textual_tui
+
+        return await run_textual_tui(
+            config,
+            config_manager,
+            verbose=verbose,
+            working_dir=working_dir,
+        )
+    if tui_flavor in {"console", "stream", "streaming"}:
+        from yaacli.console_app import run_console_tui
+
+        return await run_console_tui(
+            config,
+            config_manager,
+            verbose=verbose,
+            working_dir=working_dir,
+        )
+    if tui_flavor not in {"v1", "legacy", "prompt_toolkit", "prompt-toolkit"}:
+        logger.warning("Unknown YAACLI_TUI=%r; falling back to legacy v1 TUI", tui_flavor)
+
     from yaacli.app import TUIApp
 
     async with TUIApp(

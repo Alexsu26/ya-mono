@@ -135,6 +135,10 @@ check: ## Run code quality tools for all active packages
 	@uv run python -m pyright
 	@echo "Running deptry for ya-agent-sdk"
 	@(cd packages/ya-agent-sdk && uvx deptry ya_agent_sdk)
+	@echo "Running deptry for ya-oauth"
+	@(cd packages/ya-oauth && uvx deptry ya_oauth)
+	@echo "Running deptry for ya-oauth-provider"
+	@(cd packages/ya-oauth-provider && uvx deptry ya_oauth_provider)
 	@echo "Running deptry for yaacli"
 	@(cd packages/yaacli && uvx deptry yaacli)
 	@echo "Running deptry for ya-claw"
@@ -143,12 +147,12 @@ check: ## Run code quality tools for all active packages
 .PHONY: test
 test: ## Run SDK, CLI, and YA Claw tests
 	@echo "Running pytest for workspace packages"
-	@uv run python -m pytest packages/ya-agent-sdk/tests packages/yaacli/tests packages/ya-claw/tests -n auto -vv --inline-snapshot=disable --cov --cov-config=pyproject.toml --cov-report term-missing
+	@uv run python -m pytest packages/ya-agent-sdk/tests packages/ya-oauth/tests packages/ya-oauth-provider/tests packages/yaacli/tests packages/ya-claw/tests -n auto -vv --inline-snapshot=disable --cov --cov-config=pyproject.toml --cov-report term-missing
 
 .PHONY: test-sdk
 test-sdk: ## Run SDK tests
 	@echo "Running SDK pytest"
-	@uv run python -m pytest packages/ya-agent-sdk/tests -n auto -vv --inline-snapshot=disable --cov --cov-config=pyproject.toml --cov-report term-missing
+	@uv run python -m pytest packages/ya-agent-sdk/tests packages/ya-oauth/tests packages/ya-oauth-provider/tests -n auto -vv --inline-snapshot=disable --cov --cov-config=pyproject.toml --cov-report term-missing
 
 .PHONY: test-cli
 test-cli: ## Run CLI tests

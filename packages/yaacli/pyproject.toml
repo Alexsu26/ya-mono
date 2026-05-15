@@ -21,6 +21,7 @@ classifiers = [
 Repository = "https://github.com/wh1isper/ya-mono"
 
 [project.scripts]
+yaacli = "yaacli.cli:cli"
 xunocli = "yaacli.cli:cli"
 
 [build-system]
@@ -38,6 +39,8 @@ bump = true
 [tool.hatch.metadata.hooks.uv-dynamic-versioning]
 dependencies = [
     "ya-agent-sdk[all]=={{ version }}",
+    "ya-oauth=={{ version }}",
+    "ya-oauth-provider=={{ version }}",
     "click>=8.0",
     "pillow>=10.0.0",
     "pydantic>=2.0",
@@ -45,6 +48,7 @@ dependencies = [
     "pydantic-ai>=1.88",
     "pyobjc-framework-Cocoa>=10.0; platform_system == 'Darwin'",
     "python-dotenv>=1.0.0",
+    "textual>=0.87",
     "y-agent-environment>=0.1.0",
 ]
 
@@ -53,8 +57,10 @@ packages = ["yaacli"]
 
 [tool.uv.sources]
 ya-agent-sdk = { workspace = true }
+ya-oauth = { workspace = true }
+ya-oauth-provider = { workspace = true }
 
 [tool.deptry]
 ignore = ["DEP001"]
-package_module_name_map = { "click" = "click", "pillow" = "PIL", "pydantic" = "pydantic", "pydantic-ai" = "pydantic_ai", "pydantic-settings" = "pydantic_settings", "pyobjc-framework-Cocoa" = "AppKit|Foundation", "python-dotenv" = "dotenv", "ya-agent-sdk" = "ya_agent_sdk", "y-agent-environment" = "y_agent_environment" }
-per_rule_ignores = { DEP001 = ["quick_validate"], DEP003 = ["anyio", "click", "dotenv", "prompt_toolkit", "pillow", "pydantic", "pydantic_ai", "pydantic_settings", "pyobjc-framework-Cocoa", "rich", "yaml", "y_agent_environment", "ya_agent_sdk", "yaacli"], DEP004 = ["pytest"] }
+package_module_name_map = { "click" = "click", "pillow" = "PIL", "pydantic" = "pydantic", "pydantic-ai" = "pydantic_ai", "pydantic-settings" = "pydantic_settings", "pyobjc-framework-Cocoa" = "AppKit|Foundation", "python-dotenv" = "dotenv", "textual" = "textual", "ya-agent-sdk" = "ya_agent_sdk", "ya-oauth" = "ya_oauth", "ya-oauth-provider" = "ya_oauth_provider", "y-agent-environment" = "y_agent_environment" }
+per_rule_ignores = { DEP001 = ["quick_validate"], DEP003 = ["anyio", "click", "dotenv", "prompt_toolkit", "pillow", "pydantic", "pydantic_ai", "pydantic_settings", "pyobjc-framework-Cocoa", "rich", "textual", "yaml", "y_agent_environment", "ya_agent_sdk", "ya_oauth", "ya_oauth_provider", "yaacli"], DEP004 = ["pytest"] }

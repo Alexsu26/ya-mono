@@ -9,9 +9,10 @@
 | [03-tui-environment.md](./03-tui-environment.md)         | TUI Environment with ProcessManager as Resource   |
 | [04-steering.md](./04-steering.md)                       | Steering mechanism and TUISession design          |
 | [05-browser-integration.md](./05-browser-integration.md) | Browser Use integration with CDP                  |
-| [06-ui-layout.md](./06-ui-layout.md)                     | TUI layout and user experience design             |
+| [06-ui-layout.md](./06-ui-layout.md)                     | TUI layout and user experience design (v1)        |
 | [07-logging.md](./07-logging.md)                         | Logging configuration                             |
 | [08-hitl.md](./08-hitl.md)                               | Human-in-the-loop approval workflow               |
+| [10-tui-v2-streaming-console.md](./10-tui-v2-streaming-console.md) | TUI v2 — streaming console redesign (proposed)    |
 
 ## High-Level Architecture
 

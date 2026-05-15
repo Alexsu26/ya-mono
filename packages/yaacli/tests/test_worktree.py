@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tomllib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
-from yaacli.cli import _create_worktree, _get_git_root, _project_hash, cli
+from yaacli.cli import _create_worktree, _get_git_root, _project_hash, _run_tui, cli
 
 # =============================================================================
 # _get_git_root Tests
@@ -217,6 +218,55 @@ def test_cli_worktree_not_in_repo(tmp_path: Path) -> None:
         result = runner.invoke(cli, ["--worktree"])
     assert result.exit_code != 0
     assert "requires a git repository" in result.output
+
+
+def test_package_exposes_yaacli_console_script() -> None:
+    """The installed command should be yaacli."""
+    pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
+    pyproject = tomllib.loads(pyproject_path.read_text())
+
+    assert pyproject["project"]["scripts"]["yaacli"] == "yaacli.cli:cli"
+
+
+@pytest.mark.asyncio
+async def test_run_tui_defaults_to_textual_v2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plain yaacli should start the Textual V2 UI without an env flag."""
+    from yaacli.console import textual_app
+
+    calls: list[dict[str, object]] = []
+
+    async def fake_run_textual_tui(*args: object, **kwargs: object) -> str:
+        calls.append({"args": args, "kwargs": kwargs})
+        return "session-id"
+
+    class LegacyTUI:
+        has_session_data = False
+        session_id = None
+
+        def __init__(self, **_kwargs: object) -> None:
+            calls.append({"legacy": True})
+
+        async def __aenter__(self) -> LegacyTUI:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def run(self) -> None:
+            return None
+
+    monkeypatch.delenv("YAACLI_TUI", raising=False)
+    monkeypatch.delenv("XUNOCLI_TUI", raising=False)
+    monkeypatch.setattr(textual_app, "run_textual_tui", fake_run_textual_tui)
+    monkeypatch.setattr("yaacli.app.TUIApp", LegacyTUI)
+
+    result = await _run_tui(MagicMock(), MagicMock(), False, working_dir=tmp_path)
+
+    assert result == "session-id"
+    assert calls and "legacy" not in calls[0]
 
 
 def test_cli_branch_implies_worktree(tmp_path: Path) -> None:

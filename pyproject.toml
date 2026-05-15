@@ -14,6 +14,8 @@ package = false
 [tool.uv.workspace]
 members = [
     "packages/ya-agent-sdk",
+    "packages/ya-oauth",
+    "packages/ya-oauth-provider",
     "packages/yaacli",
     "packages/ya-claw",
     "packages/ya-agent-platform",
@@ -21,18 +23,24 @@ members = [
 
 [tool.uv.sources]
 ya-agent-sdk = { workspace = true }
+ya-oauth = { workspace = true }
+ya-oauth-provider = { workspace = true }
 ya-claw = { workspace = true }
 ya-agent-platform = { workspace = true }
 
 [tool.pyright]
 include = [
     "packages/ya-agent-sdk/ya_agent_sdk",
+    "packages/ya-oauth/ya_oauth",
+    "packages/ya-oauth-provider/ya_oauth_provider",
     "packages/yaacli/yaacli",
     "packages/ya-claw/ya_claw",
     "packages/ya-agent-platform/ya_agent_platform",
 ]
 exclude = [
     "packages/ya-agent-sdk/tests",
+    "packages/ya-oauth/tests",
+    "packages/ya-oauth-provider/tests",
     "packages/yaacli/tests",
     "packages/ya-claw/tests",
     "packages/ya-agent-platform/tests",
@@ -47,6 +55,8 @@ exclude = [
 pythonVersion = "3.11"
 extraPaths = [
     "packages/ya-agent-sdk",
+    "packages/ya-oauth",
+    "packages/ya-oauth-provider",
     "packages/yaacli",
     "packages/ya-claw",
     "packages/ya-agent-platform",
@@ -88,8 +98,15 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "packages/yaacli/yaacli/*" = ["C901", "SIM108"]
+"packages/yaacli/yaacli/console/blocks/edit.py" = ["RUF001"]
+"packages/yaacli/yaacli/console/blocks/hitl.py" = ["RUF001"]
+"packages/yaacli/yaacli/console/demo.py" = ["RUF001"]
+"packages/yaacli/yaacli/console_app.py" = ["S110"]
+"packages/yaacli/tests/test_console.py" = ["RUF001"]
 "packages/yaacli/tests/*" = ["S101", "S603", "S607", "SIM117", "RUF059", "TRY400", "B904"]
 "packages/ya-agent-sdk/tests/*" = ["S101", "S603", "S607", "SIM117", "RUF059", "TRY400", "B904"]
+"packages/ya-oauth/tests/*" = ["S101", "S603", "S607", "SIM117", "RUF059", "TRY400", "B904"]
+"packages/ya-oauth-provider/tests/*" = ["S101", "S603", "S607", "SIM117", "RUF059", "TRY400", "B904"]
 "packages/ya-claw/tests/*" = ["S101", "SIM117", "RUF059", "TRY400", "B904"]
 "packages/yaacli/yaacli/skills/**/*.py" = ["E402"]
 "skills/examples/*" = ["S101", "SIM117", "RUF059", "TRY400", "B904", "E402"]
@@ -109,6 +126,8 @@ skip_empty = true
 branch = true
 source = [
     "packages/ya-agent-sdk/ya_agent_sdk",
+    "packages/ya-oauth/ya_oauth",
+    "packages/ya-oauth-provider/ya_oauth_provider",
     "packages/yaacli/yaacli",
     "packages/ya-claw/ya_claw",
 ]
