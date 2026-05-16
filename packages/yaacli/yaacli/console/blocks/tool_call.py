@@ -31,9 +31,7 @@ _SHELL_TOOL_NAMES = {"bash", "shell", "shell_exec", "execute_bash"}
 
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
-        return {
-            k: ("***" if k.lower() in _SENSITIVE_KEYS else _redact(v)) for k, v in value.items()
-        }
+        return {k: ("***" if k.lower() in _SENSITIVE_KEYS else _redact(v)) for k, v in value.items()}
     if isinstance(value, list):
         return [_redact(v) for v in value]
     return value
@@ -347,9 +345,7 @@ class ToolCallBlock(BaseBlock):
                 if stderr.strip() or self.error:
                     meta.append(f"err {_line_count(stderr)}L")
             result_summary = summarize_result(self.name, self.result, error=self.error)
-            structured_shell_result = (
-                lname in _SHELL_TOOL_NAMES and _parse_json_mapping(self.result) is not None
-            )
+            structured_shell_result = lname in _SHELL_TOOL_NAMES and _parse_json_mapping(self.result) is not None
             summary = (
                 truncate_cells(summary, 26)
                 if structured_shell_result

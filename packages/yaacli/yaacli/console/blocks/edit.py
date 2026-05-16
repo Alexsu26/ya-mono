@@ -55,12 +55,14 @@ def _split_hunks(lines: list[str]) -> list[_DiffHunk]:
         nonlocal additions, body, deletions, header
         if not header and not body:
             return
-        hunks.append(_DiffHunk(
-            header=header or "@@",
-            lines=tuple(body),
-            additions=additions,
-            deletions=deletions,
-        ))
+        hunks.append(
+            _DiffHunk(
+                header=header or "@@",
+                lines=tuple(body),
+                additions=additions,
+                deletions=deletions,
+            )
+        )
         header = ""
         body = []
         additions = 0
@@ -136,9 +138,7 @@ class EditBlock(BaseBlock):
                 all_lines.extend(lines)
             else:
                 for hunk in hunks:
-                    all_lines.append(
-                        f"{hunk.header} · +{hunk.additions} −{hunk.deletions}"
-                    )
+                    all_lines.append(f"{hunk.header} · +{hunk.additions} −{hunk.deletions}")
             total_add += adds
             total_del += dels
 

@@ -126,7 +126,7 @@ check: ## Run code quality tools for all active packages
 	@echo "Checking bundled skills sync"
 	@./scripts/check-skills-sync.sh
 	@echo "Checking release skill zip build"
-	@python scripts/build-skill-zips.py --check
+	@uv run python scripts/build-skill-zips.py --check
 	@echo "Running web lint"
 	@$(MAKE) web-lint
 	@echo "Running web build"

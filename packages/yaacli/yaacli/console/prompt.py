@@ -32,9 +32,7 @@ class ConsolePrompt:
             multiline=False,
             mouse_support=False,
             complete_while_typing=True,
-            completer=SlashCompleter(
-                get_commands=get_commands or (lambda: DEFAULT_COMMANDS)
-            ),
+            completer=SlashCompleter(get_commands=get_commands or (lambda: DEFAULT_COMMANDS)),
             style=Style.from_dict(SLASH_PALETTE_STYLES),
             key_bindings=self._build_key_bindings(),
         )

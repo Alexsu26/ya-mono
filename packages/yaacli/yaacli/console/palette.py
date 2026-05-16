@@ -44,45 +44,39 @@ DEFAULT_COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("act", "Switch to ACT mode", "MODE"),
     SlashCommand("plan", "Switch to PLAN mode", "MODE"),
     SlashCommand("clear", "Clear conversation history", "SESSION"),
-    SlashCommand("session", "List or restore saved sessions", "SESSION",
-                 (SlashParam("id", required=False),)),
+    SlashCommand("session", "List or restore saved sessions", "SESSION", (SlashParam("id", required=False),)),
     SlashCommand("sessions", "List saved sessions", "SESSION"),
-    SlashCommand("resume", "Resume a saved session", "SESSION",
-                 (SlashParam("id", required=False),)),
-    SlashCommand("rename", "Rename current session", "SESSION",
-                 (SlashParam("name", required=True),)),
-    SlashCommand("export", "Export current session as Markdown", "SESSION",
-                 (SlashParam("path", required=False),)),
-    SlashCommand("dump", "Dump current session history", "SESSION",
-                 (SlashParam("path", required=False),)),
-    SlashCommand("load", "Load conversation from a folder", "SESSION",
-                 (SlashParam("folder", required=True),)),
+    SlashCommand("resume", "Resume a saved session", "SESSION", (SlashParam("id", required=False),)),
+    SlashCommand("rename", "Rename current session", "SESSION", (SlashParam("name", required=True),)),
+    SlashCommand("export", "Export current session as Markdown", "SESSION", (SlashParam("path", required=False),)),
+    SlashCommand("dump", "Dump current session history", "SESSION", (SlashParam("path", required=False),)),
+    SlashCommand("load", "Load conversation from a folder", "SESSION", (SlashParam("folder", required=True),)),
     SlashCommand("init", "Initialize AGENTS.md", "WORKSPACE"),
     SlashCommand("commit", "Review and commit changes", "WORKSPACE"),
     SlashCommand("review", "Comprehensive code review", "WORKSPACE"),
     SlashCommand("cost", "Show token usage and estimated cost", "INSPECT"),
-    SlashCommand("search", "Search output history", "INSPECT",
-                 (SlashParam("query", required=True),), "ctrl+f"),
-    SlashCommand("jump", "Jump to user/assistant/tool/error marker", "INSPECT",
-                 (SlashParam("marker", required=True),)),
+    SlashCommand("search", "Search output history", "INSPECT", (SlashParam("query", required=True),), "ctrl+f"),
+    SlashCommand("jump", "Jump to user/assistant/tool/error marker", "INSPECT", (SlashParam("marker", required=True),)),
     SlashCommand("perf", "Show performance metrics", "INSPECT"),
-    SlashCommand("model", "List or switch model profiles", "INSPECT",
-                 (SlashParam("name", required=False),)),
-    SlashCommand("skills", "List available skills", "INSPECT",
-                 (SlashParam("query", required=False),)),
-    SlashCommand("skill", "Show skill details", "INSPECT",
-                 (SlashParam("name", required=True),)),
-    SlashCommand("mcp", "List configured MCP servers", "INSPECT",
-                 (SlashParam("query", required=False),)),
-    SlashCommand("subagents", "List configured subagents", "INSPECT",
-                 (SlashParam("query", required=False),)),
-    SlashCommand("subagent", "Show subagent details", "INSPECT",
-                 (SlashParam("name", required=True),)),
+    SlashCommand("model", "List or switch model profiles", "INSPECT", (SlashParam("name", required=False),)),
+    SlashCommand("skills", "List available skills", "INSPECT", (SlashParam("query", required=False),)),
+    SlashCommand("skill", "Show skill details", "INSPECT", (SlashParam("name", required=True),)),
+    SlashCommand("mcp", "List configured MCP servers", "INSPECT", (SlashParam("query", required=False),)),
+    SlashCommand("subagents", "List configured subagents", "INSPECT", (SlashParam("query", required=False),)),
+    SlashCommand("subagent", "Show subagent details", "INSPECT", (SlashParam("name", required=True),)),
     SlashCommand("tasks", "Show active tasks and processes", "INSPECT"),
-    SlashCommand("delegate", "Run a subagent and wait for result", "OTHER",
-                 (SlashParam("subagent", required=True), SlashParam("prompt", required=True))),
-    SlashCommand("spawn", "Start a background subagent", "OTHER",
-                 (SlashParam("subagent", required=True), SlashParam("prompt", required=True))),
+    SlashCommand(
+        "delegate",
+        "Run a subagent and wait for result",
+        "OTHER",
+        (SlashParam("subagent", required=True), SlashParam("prompt", required=True)),
+    ),
+    SlashCommand(
+        "spawn",
+        "Start a background subagent",
+        "OTHER",
+        (SlashParam("subagent", required=True), SlashParam("prompt", required=True)),
+    ),
     SlashCommand("loop", "Run iterative task loop", "OTHER"),
     SlashCommand("paste-image", "Attach an image from the clipboard", "OTHER"),
     SlashCommand("help", "Show available commands", "OTHER"),
@@ -98,13 +92,9 @@ def _format_param(param: SlashParam) -> str:
 class SlashCompleter(Completer):
     """Custom completer that emits grouped, formatted slash entries."""
 
-    get_commands: Callable[[], Iterable[SlashCommand]] = field(
-        default=lambda: DEFAULT_COMMANDS
-    )
+    get_commands: Callable[[], Iterable[SlashCommand]] = field(default=lambda: DEFAULT_COMMANDS)
 
-    def get_completions(
-        self, document: Document, complete_event: CompleteEvent
-    ) -> Iterable[Completion]:
+    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Iterable[Completion]:
         text = document.text_before_cursor
         if not text.startswith("/"):
             return

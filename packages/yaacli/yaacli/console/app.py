@@ -153,9 +153,7 @@ class ConsoleApp:
         block.update_args(args)
         self.stream.update(block)
 
-    def handle_tool_call_complete(
-        self, tool_call_id: str, result: Any, *, error: bool = False
-    ) -> None:
+    def handle_tool_call_complete(self, tool_call_id: str, result: Any, *, error: bool = False) -> None:
         block = self._tool_blocks.pop(tool_call_id, None)
         if block is None:
             return

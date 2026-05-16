@@ -135,7 +135,7 @@ def _close_open_markdown_markers(text: str) -> str:
     # Split the last line into content + trailing whitespace so we can
     # insert the closer adjacent to a non-space character.
     stripped = last_line.rstrip()
-    trailing = last_line[len(stripped):]
+    trailing = last_line[len(stripped) :]
     patched = stripped
     # ``**bold**`` first (greedy) so it doesn't get eaten by the ``*`` rule.
     if patched.count("**") % 2 == 1:
@@ -160,13 +160,31 @@ def _close_open_markdown_markers(text: str) -> str:
 # the next delta, "## " becomes "## Section\n" which IS a valid heading.
 # We hide the partial "##" until the line completes.
 _BLOCK_MARKER_SUFFIXES = (
-    "######", "#####", "####", "###", "##", "#",
-    "```", "``", "`",
-    "**", "*",
-    "- ", "-",
-    "> ", ">",
-    "1. ", "2. ", "3. ", "4. ", "5. ",
-    "1.", "2.", "3.", "4.", "5.",
+    "######",
+    "#####",
+    "####",
+    "###",
+    "##",
+    "#",
+    "```",
+    "``",
+    "`",
+    "**",
+    "*",
+    "- ",
+    "-",
+    "> ",
+    ">",
+    "1. ",
+    "2. ",
+    "3. ",
+    "4. ",
+    "5. ",
+    "1.",
+    "2.",
+    "3.",
+    "4.",
+    "5.",
 )
 
 
@@ -565,9 +583,7 @@ class TextualSink:
         if self._current_thinking is None:
             self._thinking_strip_count = 0
             return
-        self._thinking_strip_count = self._write_strips_counted(
-            self._current_thinking.render(self.width)
-        )
+        self._thinking_strip_count = self._write_strips_counted(self._current_thinking.render(self.width))
         self._refresh_log()
 
     def _replace_thinking_render(self) -> None:
@@ -581,12 +597,10 @@ class TextualSink:
     def _active_operation_renderables(self) -> list[RenderableType]:
         renderables: list[RenderableType] = []
         renderables.extend(
-            block.render(self.width, frame=self._active_operations_frame)
-            for block in self._tools.values()
+            block.render(self.width, frame=self._active_operations_frame) for block in self._tools.values()
         )
         renderables.extend(
-            state.render(self.width, frame=self._active_operations_frame)
-            for state in self._subagent_states.values()
+            state.render(self.width, frame=self._active_operations_frame) for state in self._subagent_states.values()
         )
         return renderables
 
@@ -614,9 +628,7 @@ class TextualSink:
         if not self._has_active_operations():
             self._stop_active_operations_timer()
             return
-        self._active_operations_frame = (
-            self._active_operations_frame + 1
-        ) % len(SPINNER_FRAMES)
+        self._active_operations_frame = (self._active_operations_frame + 1) % len(SPINNER_FRAMES)
         self._replace_active_operations_render(notify_history=False)
 
     def _pop_active_operations_render(self) -> bool:
@@ -690,11 +702,7 @@ class TextualSink:
         # any trailing block-marker suffix (``... text. ##``) that would
         # otherwise render as literal text — Markdown only treats those as
         # block markers at line-start, not mid-line.
-        should_flush = (
-            first_delta
-            or self._stream_pending_chars >= self.STREAM_BATCH_MAX_CHARS
-            or "\n" in delta
-        )
+        should_flush = first_delta or self._stream_pending_chars >= self.STREAM_BATCH_MAX_CHARS or "\n" in delta
         if should_flush:
             self._cancel_stream_flush_timer()
             self._replace_streaming_render()
@@ -784,9 +792,7 @@ class TextualSink:
         self._replace_active_operations_render(notify_history=True)
         self._refresh_status_display()
 
-    def handle_tool_call_complete(
-        self, tool_call_id: str, result: Any, *, error: bool = False
-    ) -> None:
+    def handle_tool_call_complete(self, tool_call_id: str, result: Any, *, error: bool = False) -> None:
         self._pop_active_operations_render()
         block = self._tools.pop(tool_call_id, None)
         if block is None:
@@ -809,9 +815,7 @@ class TextualSink:
 
     # ------- subagent (collapsed) -------
 
-    def handle_subagent_start(
-        self, agent_id: str, name: str, prompt_preview: str = ""
-    ) -> None:
+    def handle_subagent_start(self, agent_id: str, name: str, prompt_preview: str = "") -> None:
         """Pin a single live block for the subagent. All tool calls under it
         will only update the running counter on this block — they don't
         appear as top-level blocks in the log."""
@@ -822,9 +826,7 @@ class TextualSink:
         self._replace_active_operations_render(notify_history=True)
         self._refresh_status_display()
 
-    def handle_subagent_progress(
-        self, agent_id: str, tool_name: str, tool_count: int
-    ) -> None:
+    def handle_subagent_progress(self, agent_id: str, tool_name: str, tool_count: int) -> None:
         state = self._subagent_states.get(agent_id)
         if state is None:
             return
@@ -926,7 +928,8 @@ class TextualSink:
         if not needle:
             return []
         return [
-            i for i, entry in enumerate(self._history_entries)
+            i
+            for i, entry in enumerate(self._history_entries)
             if needle in f"{entry.kind}\n{entry.label}\n{entry.text}".casefold()
         ]
 
@@ -955,15 +958,11 @@ class TextualSink:
         skip_entry_index: int | None = None,
     ) -> int | None:
         entries = [
-            (i, entry) for i, entry in enumerate(self._history_entries)
+            (i, entry)
+            for i, entry in enumerate(self._history_entries)
             if i != skip_entry_index
             and (
-                entry.kind == kind
-                or (
-                    kind == "error"
-                    and isinstance(entry.block, ToolCallBlock)
-                    and entry.block.error
-                )
+                entry.kind == kind or (kind == "error" and isinstance(entry.block, ToolCallBlock) and entry.block.error)
             )
         ]
         if not entries:
@@ -1079,9 +1078,7 @@ class HitlModal(ModalScreen[tuple[str, str | None]]):
         with Vertical():
             yield Static(title)
             yield Static(body)
-            yield Static(
-                Text("[y] approve once  [a] approve all  [n] reject", style="dim")
-            )
+            yield Static(Text("[y] approve once  [a] approve all  [n] reject", style="dim"))
             yield Vertical(
                 Button("Approve (y)", id="yes", variant="success"),
                 Button("All (a)", id="all", variant="warning"),
@@ -1175,9 +1172,7 @@ class YaacliTextualApp(App[None]):
         self._runtime = runtime
         self._cwd = cwd
         self._model_name = model_name or "(unset)"
-        self._active_model_name = self._resolve_initial_active_model_name(
-            active_model_name
-        )
+        self._active_model_name = self._resolve_initial_active_model_name(active_model_name)
         self._session_id = new_session_id()
         self._transcript: TranscriptStore | None = self._build_transcript_store()
         self._restoring_transcript = False
@@ -1263,11 +1258,7 @@ class YaacliTextualApp(App[None]):
         if self._config_manager is None:
             return None
         raw_dir = str(self._session_config_value("session_dir", "") or "")
-        sessions_dir = (
-            Path(raw_dir).expanduser()
-            if raw_dir
-            else self._config_manager.get_sessions_dir()
-        )
+        sessions_dir = Path(raw_dir).expanduser() if raw_dir else self._config_manager.get_sessions_dir()
         store = TranscriptStore(
             sessions_dir=sessions_dir,
             session_id=self._session_id,
@@ -1582,19 +1573,10 @@ class YaacliTextualApp(App[None]):
         content = data.decode("utf-8", errors="replace")
         if truncated:
             content += "\n\n[truncated after 64000 bytes]"
-        return (
-            f'<mentioned-file path="{self._xml_escape(path_text)}">\n'
-            f"{self._xml_escape(content)}\n"
-            "</mentioned-file>"
-        )
+        return f'<mentioned-file path="{self._xml_escape(path_text)}">\n{self._xml_escape(content)}\n</mentioned-file>'
 
     def _xml_escape(self, value: str) -> str:
-        return (
-            value.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-        )
+        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
     def _completion_text_for_command(self, cmd: Any) -> str:
         completion_text = getattr(cmd, "completion_text", None)
@@ -1920,9 +1902,7 @@ class YaacliTextualApp(App[None]):
             self._sink.show_breadcrumb("→ sessions are unavailable")
             return False
         path = (
-            Path(path_text).expanduser()
-            if path_text.strip()
-            else self._cwd / f"yaacli-session-{self._session_id}.md"
+            Path(path_text).expanduser() if path_text.strip() else self._cwd / f"yaacli-session-{self._session_id}.md"
         )
         if not path.is_absolute():
             path = (self._cwd / path).resolve()
@@ -2055,14 +2035,10 @@ class YaacliTextualApp(App[None]):
             self._search_matches = matches
             self._search_match_index = 0 if direction >= 0 else len(matches) - 1
         else:
-            self._search_match_index = (
-                self._search_match_index + (1 if direction >= 0 else -1)
-            ) % len(matches)
+            self._search_match_index = (self._search_match_index + (1 if direction >= 0 else -1)) % len(matches)
         entry_index = self._search_matches[self._search_match_index]
         self._pause_history_auto_scroll()
-        self._sink.show_breadcrumb(
-            f"→ search {self._search_match_index + 1}/{len(matches)}: {query}"
-        )
+        self._sink.show_breadcrumb(f"→ search {self._search_match_index + 1}/{len(matches)}: {query}")
         self._sink.scroll_to_entry(entry_index)
         self._pause_history_auto_scroll()
         return True
@@ -2198,10 +2174,12 @@ class YaacliTextualApp(App[None]):
         except Exception as exc:
             self._sink.end_text()
             self._sink.end_thinking()
-            self._sink.write_block(ErrorBlock(
-                title=type(exc).__name__,
-                body=str(exc) or repr(exc),
-            ))
+            self._sink.write_block(
+                ErrorBlock(
+                    title=type(exc).__name__,
+                    body=str(exc) or repr(exc),
+                )
+            )
             logger.exception("Textual turn failed")
         finally:
             # Ensure no dangling transient blocks.
@@ -2262,9 +2240,7 @@ class YaacliTextualApp(App[None]):
             tool_name = tool_call.tool_name
             if tool_name in self._approval_session_grants:
                 results.approvals[tool_call.tool_call_id] = True
-                self._sink.show_breadcrumb(
-                    f"→ auto-approved {tool_name} (granted earlier this session)"
-                )
+                self._sink.show_breadcrumb(f"→ auto-approved {tool_name} (granted earlier this session)")
                 continue
             try:
                 args_summary = json.dumps(tool_call.args, ensure_ascii=False, default=str)[:400]
@@ -2277,13 +2253,9 @@ class YaacliTextualApp(App[None]):
             elif decision == "approve_all":
                 self._approval_session_grants.add(tool_name)
                 results.approvals[tool_call.tool_call_id] = True
-                self._sink.show_breadcrumb(
-                    f"→ approved {tool_name} for the rest of this session"
-                )
+                self._sink.show_breadcrumb(f"→ approved {tool_name} for the rest of this session")
             else:
-                results.approvals[tool_call.tool_call_id] = ToolDenied(
-                    reason or "User rejected"
-                )
+                results.approvals[tool_call.tool_call_id] = ToolDenied(reason or "User rejected")
                 self._sink.show_breadcrumb(f"→ rejected {tool_name}")
         return results
 
@@ -2307,6 +2279,7 @@ class YaacliTextualApp(App[None]):
         if name == "help":
             self._record_recent_command(name)
             from yaacli.console.palette import DEFAULT_COMMANDS, GROUP_ORDER
+
             grid = Table.grid(padding=(0, 2))
             grid.add_column(style="console.accent.tool", no_wrap=True)
             grid.add_column(style="console.text.primary")
@@ -2398,9 +2371,7 @@ class YaacliTextualApp(App[None]):
             self._record_recent_command(name)
             self._mode = "PLAN"
             self._footer.mode = self._mode
-            self._sink.show_breadcrumb(
-                "→ switched to PLAN mode (no writes, no shell mutations)"
-            )
+            self._sink.show_breadcrumb("→ switched to PLAN mode (no writes, no shell mutations)")
             return True
 
         if name == "cost":
@@ -2435,9 +2406,7 @@ class YaacliTextualApp(App[None]):
             elif marker in {"error", "next-error", "errors"}:
                 self._jump_history_marker("error", 1)
             else:
-                self._sink.show_breadcrumb(
-                    "→ jump marker must be user, assistant, tool, or error"
-                )
+                self._sink.show_breadcrumb("→ jump marker must be user, assistant, tool, or error")
             return True
 
         if name == "model":
@@ -2584,14 +2553,12 @@ class YaacliTextualApp(App[None]):
                 name: config
                 for name, config in servers.items()
                 if self._matches_query(
-                    "\n".join(
-                        [
-                            name,
-                            config.description,
-                            config.transport,
-                            self._mcp_target(config),
-                        ]
-                    ),
+                    "\n".join([
+                        name,
+                        config.description,
+                        config.transport,
+                        self._mcp_target(config),
+                    ]),
                     query,
                 )
             }
@@ -2635,7 +2602,8 @@ class YaacliTextualApp(App[None]):
         skills = self._discover_skills()
         if query:
             skills = [
-                skill for skill in skills
+                skill
+                for skill in skills
                 if self._matches_query(
                     f"{skill.name}\n{skill.description}\n{skill.path}",
                     query,
@@ -2667,9 +2635,7 @@ class YaacliTextualApp(App[None]):
         name = name.strip()
         skill = self._find_skill(self._discover_skills(), name)
         if skill is None:
-            self._sink.show_breadcrumb(
-                "→ skill needs a valid name; use /skills to list available skills"
-            )
+            self._sink.show_breadcrumb("→ skill needs a valid name; use /skills to list available skills")
             return
 
         grid = Table.grid(padding=(0, 2))
@@ -2687,7 +2653,8 @@ class YaacliTextualApp(App[None]):
         subagents = self._discover_subagents()
         if query:
             subagents = [
-                subagent for subagent in subagents
+                subagent
+                for subagent in subagents
                 if self._matches_query(
                     f"{subagent.name}\n{subagent.description}\n{subagent.path}",
                     query,
@@ -2723,9 +2690,7 @@ class YaacliTextualApp(App[None]):
         name = name.strip()
         subagent = self._find_subagent(self._discover_subagents(), name)
         if subagent is None:
-            self._sink.show_breadcrumb(
-                "→ subagent needs a valid name; use /subagents to list configured subagents"
-            )
+            self._sink.show_breadcrumb("→ subagent needs a valid name; use /subagents to list configured subagents")
             return
 
         cfg = subagent.config
@@ -2751,25 +2716,19 @@ class YaacliTextualApp(App[None]):
 
         parts = args.split(maxsplit=1)
         if len(parts) < 2:
-            self._sink.show_breadcrumb(
-                f"→ usage: /{command_name} <subagent> <prompt>"
-            )
+            self._sink.show_breadcrumb(f"→ usage: /{command_name} <subagent> <prompt>")
             return
 
         subagent_name, prompt = parts[0], parts[1].strip()
         subagent = self._find_subagent(self._discover_subagents(), subagent_name)
         if subagent is None:
-            self._sink.show_breadcrumb(
-                f"→ unknown subagent: {subagent_name}; use /subagents"
-            )
+            self._sink.show_breadcrumb(f"→ unknown subagent: {subagent_name}; use /subagents")
             return
         if subagent.disabled:
             self._sink.show_breadcrumb(f"→ subagent is disabled: {subagent.name}")
             return
         if not prompt:
-            self._sink.show_breadcrumb(
-                f"→ usage: /{command_name} <subagent> <prompt>"
-            )
+            self._sink.show_breadcrumb(f"→ usage: /{command_name} <subagent> <prompt>")
             return
 
         tool_name = "spawn_delegate" if command_name == "spawn" else "delegate"
@@ -2928,9 +2887,7 @@ class YaacliTextualApp(App[None]):
         self._model_name = self._format_model_display_name(model_name, profile)
         self._refresh_header()
         self._footer.model_label = self._short_model_label()
-        self._sink.show_breadcrumb(
-            f"→ switched model to {model_name}: {getattr(profile, 'model', '')}"
-        )
+        self._sink.show_breadcrumb(f"→ switched model to {model_name}: {getattr(profile, 'model', '')}")
 
 
 # ---------------------------------------------------------------------------

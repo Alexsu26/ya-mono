@@ -435,10 +435,7 @@ class SlashMenu(Static):
             return True
         name = str(getattr(cmd, "name", "")).lower()
         description = str(getattr(cmd, "description", "")).lower()
-        params = " ".join(
-            str(getattr(param, "name", "")).lower()
-            for param in getattr(cmd, "params", ())
-        )
+        params = " ".join(str(getattr(param, "name", "")).lower() for param in getattr(cmd, "params", ()))
         deep_search = len(query) >= 2
         return (
             name.startswith(query)
@@ -952,9 +949,7 @@ class PromptArea(TextArea):
             show_line_numbers=False,
             tab_behavior="focus",
             compact=True,
-            placeholder=(
-                "Message… Enter sends · Shift+Enter newline · / commands · @ files"
-            ),
+            placeholder=("Message… Enter sends · Shift+Enter newline · / commands · @ files"),
         )
 
     def on_mount(self) -> None:

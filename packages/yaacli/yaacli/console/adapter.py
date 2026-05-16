@@ -51,9 +51,7 @@ from ya_agent_sdk.events import (
 
 from yaacli.events import ContextUpdateEvent
 
-HIDDEN_REASONING_NOTICE = (
-    "Reasoning was encrypted by the provider; no summary was returned."
-)
+HIDDEN_REASONING_NOTICE = "Reasoning was encrypted by the provider; no summary was returned."
 
 
 @runtime_checkable
@@ -70,9 +68,7 @@ class BlockSink(Protocol):
     def handle_thinking_delta(self, delta: str) -> None: ...
     def end_thinking(self) -> None: ...
     def handle_tool_call_start(self, tool_call_id: str, name: str, args: Any = None) -> None: ...
-    def handle_tool_call_complete(
-        self, tool_call_id: str, result: Any, *, error: bool = False
-    ) -> None: ...
+    def handle_tool_call_complete(self, tool_call_id: str, result: Any, *, error: bool = False) -> None: ...
 
     # Optional — sinks that can render a collapsed subagent progress line
     # should implement these. The default ConsoleApp sink falls back to
@@ -80,8 +76,12 @@ class BlockSink(Protocol):
     def handle_subagent_start(self, agent_id: str, name: str, prompt_preview: str = "") -> None: ...
     def handle_subagent_progress(self, agent_id: str, tool_name: str, tool_count: int) -> None: ...
     def handle_subagent_complete(
-        self, agent_id: str, *, success: bool = True,
-        result_preview: str = "", duration_seconds: float = 0.0,
+        self,
+        agent_id: str,
+        *,
+        success: bool = True,
+        result_preview: str = "",
+        duration_seconds: float = 0.0,
     ) -> None: ...
     def handle_context_update(self, total_tokens: int, context_window_size: int) -> None: ...
 
@@ -152,32 +152,30 @@ class ConsoleSession:
         # on the parent agent's stream).
         if isinstance(msg, SubagentStartEvent):
             sub_id = msg.agent_id
-            self._subagents[sub_id] = _SubagentState(
-                agent_id=sub_id, name=msg.agent_name or sub_id
-            )
+            self._subagents[sub_id] = _SubagentState(agent_id=sub_id, name=msg.agent_name or sub_id)
             if not _safe_call(
-                self.sink, "handle_subagent_start",
-                sub_id, msg.agent_name or sub_id, msg.prompt_preview,
+                self.sink,
+                "handle_subagent_start",
+                sub_id,
+                msg.agent_name or sub_id,
+                msg.prompt_preview,
             ):
-                self.sink.show_breadcrumb(
-                    f"→ subagent {msg.agent_name or sub_id} started"
-                )
+                self.sink.show_breadcrumb(f"→ subagent {msg.agent_name or sub_id} started")
             return
 
         if isinstance(msg, SubagentCompleteEvent):
             sub_id = msg.agent_id
             self._subagents.pop(sub_id, None)
             if not _safe_call(
-                self.sink, "handle_subagent_complete",
+                self.sink,
+                "handle_subagent_complete",
                 sub_id,
                 success=msg.success,
                 result_preview=msg.result_preview,
                 duration_seconds=msg.duration_seconds,
             ):
                 status = "✓" if msg.success else "✗"
-                self.sink.show_breadcrumb(
-                    f"→ subagent {sub_id} {status} ({msg.duration_seconds:.1f}s)"
-                )
+                self.sink.show_breadcrumb(f"→ subagent {sub_id} {status} ({msg.duration_seconds:.1f}s)")
             return
 
         # ---- All other events from non-main agents are collapsed to a
@@ -188,8 +186,11 @@ class ConsoleSession:
                 state.tool_count += 1
                 state.last_tool = msg.part.tool_name
                 _safe_call(
-                    self.sink, "handle_subagent_progress",
-                    agent_id, state.last_tool, state.tool_count,
+                    self.sink,
+                    "handle_subagent_progress",
+                    agent_id,
+                    state.last_tool,
+                    state.tool_count,
                 )
             # Everything else (text deltas, thinking, tool results) is
             # silently dropped — subagent's final answer flows through the

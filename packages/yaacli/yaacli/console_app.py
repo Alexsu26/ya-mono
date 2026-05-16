@@ -138,6 +138,7 @@ class ConsoleTUI:
         if name == "help":
             self.app.show_user_prompt(command)
             from yaacli.console.palette import DEFAULT_COMMANDS, GROUP_ORDER
+
             grid = Table.grid(padding=(0, 2))
             grid.add_column(style="bold cyan")
             grid.add_column()
@@ -166,9 +167,7 @@ class ConsoleTUI:
             self.app.show_user_prompt(command)
             self._mode = "PLAN"
             self.app.mode = "PLAN"
-            self.app.show_breadcrumb(
-                "→ switched to PLAN mode (no writes, no shell mutations)"
-            )
+            self.app.show_breadcrumb("→ switched to PLAN mode (no writes, no shell mutations)")
             return True
 
         if name == "cost":
@@ -194,9 +193,7 @@ class ConsoleTUI:
                 grid.add_row(marker, prof_name, getattr(prof, "model", ""))
             self.app.show_system("/model", grid)
             if args:
-                self.app.show_breadcrumb(
-                    f"→ switching model to {args} is not implemented in v2 yet"
-                )
+                self.app.show_breadcrumb(f"→ switching model to {args} is not implemented in v2 yet")
             return True
 
         return False
@@ -274,9 +271,7 @@ class ConsoleTUI:
             tool_name = tool_call.tool_name
             if tool_name in self._approval_session_grants:
                 results.approvals[tool_call.tool_call_id] = True
-                self.app.show_breadcrumb(
-                    f"→ auto-approved {tool_name} (granted earlier this session)"
-                )
+                self.app.show_breadcrumb(f"→ auto-approved {tool_name} (granted earlier this session)")
                 continue
 
             try:
@@ -292,13 +287,9 @@ class ConsoleTUI:
             elif decision == "approve_all":
                 self._approval_session_grants.add(tool_name)
                 results.approvals[tool_call.tool_call_id] = True
-                self.app.show_breadcrumb(
-                    f"→ approved {tool_name} for the rest of this session"
-                )
+                self.app.show_breadcrumb(f"→ approved {tool_name} for the rest of this session")
             else:
-                results.approvals[tool_call.tool_call_id] = ToolDenied(
-                    reason or "User rejected"
-                )
+                results.approvals[tool_call.tool_call_id] = ToolDenied(reason or "User rejected")
                 self.app.show_breadcrumb(f"→ rejected {tool_name}")
         return results
 

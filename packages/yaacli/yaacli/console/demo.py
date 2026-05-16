@@ -53,9 +53,7 @@ async def run_demo(*, fast: bool = False, with_prompt: bool = False) -> None:
         app.handle_tool_call_complete("t2", "exit code 1\n", error=False)
 
         # In-flight + interleaved thinking
-        app.handle_tool_call_start(
-            "t3", "Bash", {"command": ".venv/bin/python -c 'import asyncpg'"}
-        )
+        app.handle_tool_call_start("t3", "Bash", {"command": ".venv/bin/python -c 'import asyncpg'"})
         for chunk in (
             "嗯，前两个 shell 都返回了 1。",
             " 看来本机没有 psql 客户端，",
@@ -119,19 +117,17 @@ async def run_demo(*, fast: bool = False, with_prompt: bool = False) -> None:
                     "def authenticate(email: str, password: str):\n"
                     "    user = db.get_user(email)\n"
                     "    if not user:\n"
-                    "        raise AuthError(\"not found\")\n"
+                    '        raise AuthError("not found")\n'
                     "    return user\n",
                     "def authenticate(email: str, password: str):\n"
                     "    user = db.get_user_by_email(email)\n"
                     "    if not user:\n"
-                    "        raise AuthError(\"invalid credentials\")\n"
+                    '        raise AuthError("invalid credentials")\n'
                     "    return user\n",
                 ),
             ],
         )
-        for chunk in (
-            "已经把方法名改成 ", "`get_user_by_email` 并优化了报错文案。\n"
-        ):
+        for chunk in ("已经把方法名改成 ", "`get_user_by_email` 并优化了报错文案。\n"):
             app.handle_text_delta(chunk)
             await asyncio.sleep(delay / 3)
         app.end_text()
@@ -147,11 +143,19 @@ async def run_demo(*, fast: bool = False, with_prompt: bool = False) -> None:
         TodoItem("写文档", status="pending"),
     ])
 
-    app.show_task("审计 schema 中的 NULL 列", [
-        TaskChild("search_agent", "在 *.sql 中搜索 ALTER TABLE",
-                  status="done", summary="14 matches · 6 files", duration=1.3),
-        TaskChild("reasoning", "分析迁移顺序", status="done", summary="done", duration=2.1),
-    ])
+    app.show_task(
+        "审计 schema 中的 NULL 列",
+        [
+            TaskChild(
+                "search_agent",
+                "在 *.sql 中搜索 ALTER TABLE",
+                status="done",
+                summary="14 matches · 6 files",
+                duration=1.3,
+            ),
+            TaskChild("reasoning", "分析迁移顺序", status="done", summary="done", duration=2.1),
+        ],
+    )
 
     # Failure surface
     app.open_turn()
@@ -160,8 +164,7 @@ async def run_demo(*, fast: bool = False, with_prompt: bool = False) -> None:
         await asyncio.sleep(delay)
         app.handle_tool_call_complete(
             "t7",
-            "AssertionError: expected /workspace, got /tmp/workspace\n"
-            "  packages/ya-claw/tests/test_workspace.py:42\n",
+            "AssertionError: expected /workspace, got /tmp/workspace\n  packages/ya-claw/tests/test_workspace.py:42\n",
             error=True,
         )
         app.show_error(
@@ -169,9 +172,7 @@ async def run_demo(*, fast: bool = False, with_prompt: bool = False) -> None:
             "AssertionError: expected /workspace, got /tmp/workspace",
             detail="packages/ya-claw/tests/test_workspace.py:42",
         )
-        for chunk in (
-            "看起来是 ", "`DOCKER_HOST_WORKSPACE_DIR` ", "没设好，我修一下。\n"
-        ):
+        for chunk in ("看起来是 ", "`DOCKER_HOST_WORKSPACE_DIR` ", "没设好，我修一下。\n"):
             app.handle_text_delta(chunk)
             await asyncio.sleep(delay / 3)
         app.end_text()
@@ -180,6 +181,7 @@ async def run_demo(*, fast: bool = False, with_prompt: bool = False) -> None:
 
     # System block (mock /cost)
     from rich.table import Table
+
     table = Table.grid(padding=(0, 2))
     table.add_column("model", style="bold")
     table.add_column("input")
@@ -198,6 +200,7 @@ async def run_demo(*, fast: bool = False, with_prompt: bool = False) -> None:
 
     if with_prompt:
         from yaacli.console.prompt import ConsolePrompt
+
         prompt = ConsolePrompt()
         app.show_breadcrumb("(demo over — try typing /act, /cost, etc.)")
         try:
@@ -212,6 +215,7 @@ async def run_demo(*, fast: bool = False, with_prompt: bool = False) -> None:
 
 def main() -> None:
     import argparse
+
     parser = argparse.ArgumentParser(description="yaacli console v2 demo")
     parser.add_argument("--fast", action="store_true", help="skip delays")
     parser.add_argument(

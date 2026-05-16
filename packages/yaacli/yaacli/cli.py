@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 
 from yaacli import __version__  # pyright: ignore[reportAttributeAccessIssue]
 from yaacli.config import ConfigManager, WorktreeMetadata, YaacliConfig
+from yaacli.headless import HeadlessExecutionError
+from yaacli.headless import run_headless as _run_headless
 from yaacli.logging import LOG_FILE_NAME, configure_logging, get_logger
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -560,6 +562,13 @@ def _create_worktree(branch_name: str | None) -> tuple[Path, str, bool]:
 
 @click.command()
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "-P",
+    "--print",
+    "print_mode",
+    is_flag=True,
+    help="Run a prompt headlessly and print the final response.",
+)
 @click.option("-w", "--worktree", is_flag=True, default=False, help="Run in a git worktree.")
 @click.option(
     "-b",
@@ -569,8 +578,15 @@ def _create_worktree(branch_name: str | None) -> tuple[Path, str, bool]:
     metavar="BRANCH",
     help="Branch name for worktree (implies --worktree).",
 )
+@click.argument("prompt_parts", nargs=-1)
 @click.version_option(version=__version__, prog_name="yaacli")
-def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
+def cli(
+    verbose: bool,
+    print_mode: bool,
+    worktree: bool,
+    worktree_branch: str | None,
+    prompt_parts: tuple[str, ...],
+) -> None:
     """YAACLI - AI-powered coding assistant.
 
     Inside TUI, use slash commands:
@@ -588,6 +604,9 @@ def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
     configure_logging(verbose=verbose)
     logger.info("Starting yaacli v%s", __version__)
 
+    if prompt_parts and not print_mode:
+        raise click.UsageError("Prompt arguments require -P/--print.")
+
     load_package_env_files()
 
     # Load configuration
@@ -600,6 +619,11 @@ def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
 
     # Check if configuration exists
     if not config.is_configured:
+        if print_mode:
+            raise click.ClickException(
+                f"yaacli is not configured. Run `yaacli` once to set up, "
+                f"or create {config_manager.config_dir / 'config.toml'}."
+            )
         if not run_setup_wizard(config_manager):
             sys.exit(0)
         # Reload config after setup
@@ -614,14 +638,30 @@ def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
     if worktree or worktree_branch is not None:
         worktree_dir, actual_branch, is_resume = _create_worktree(worktree_branch)
         if is_resume:
-            click.echo(click.style("Resuming worktree:", fg="cyan", bold=True))
+            click.echo(click.style("Resuming worktree:", fg="cyan", bold=True), err=print_mode)
         else:
-            click.echo(click.style("Worktree created:", fg="cyan", bold=True))
-        click.echo(f"  Branch:    {actual_branch}")
-        click.echo(f"  Directory: {worktree_dir}")
-        click.echo()
+            click.echo(click.style("Worktree created:", fg="cyan", bold=True), err=print_mode)
+        click.echo(f"  Branch:    {actual_branch}", err=print_mode)
+        click.echo(f"  Directory: {worktree_dir}", err=print_mode)
+        click.echo(err=print_mode)
 
     working_dir = worktree_dir or Path.cwd()
+
+    if print_mode:
+        prompt = _read_headless_prompt(prompt_parts)
+        try:
+            output = asyncio.run(_run_headless(config, config_manager, prompt=prompt, working_dir=working_dir))
+        except KeyboardInterrupt:
+            click.echo("\nInterrupted.", err=True)
+            sys.exit(130)
+        except HeadlessExecutionError as e:
+            raise click.ClickException(str(e)) from e
+        except Exception as e:
+            logger.exception("Fatal headless error")
+            raise click.ClickException(str(e) or repr(e)) from e
+
+        click.echo(output)
+        sys.exit(0)
 
     # Run the TUI
     exit_code = 0
@@ -680,6 +720,21 @@ def cli(verbose: bool, worktree: bool, worktree_branch: str | None) -> None:
         click.echo(f"  git worktree remove {worktree_dir}")
 
     sys.exit(exit_code)
+
+
+def _read_headless_prompt(prompt_parts: tuple[str, ...]) -> str:
+    """Resolve the prompt for headless mode from argv or stdin."""
+    if prompt_parts:
+        prompt = " ".join(prompt_parts).strip()
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read().strip()
+    else:
+        prompt = ""
+
+    if not prompt:
+        raise click.UsageError("Headless mode requires a prompt argument or stdin input.")
+
+    return prompt
 
 
 async def _run_tui(

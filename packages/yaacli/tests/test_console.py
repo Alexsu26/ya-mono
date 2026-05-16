@@ -330,11 +330,13 @@ def test_edit_block_toggle_expands_collapsed_hunks(tmp_path: Path) -> None:
 
 
 def test_todo_block_uses_status_glyphs() -> None:
-    block = TodoBlock(items=[
-        TodoItem("a", status="completed"),
-        TodoItem("b", status="in_progress"),
-        TodoItem("c", status="pending"),
-    ])
+    block = TodoBlock(
+        items=[
+            TodoItem("a", status="completed"),
+            TodoItem("b", status="in_progress"),
+            TodoItem("c", status="pending"),
+        ]
+    )
     output = _render(block)
     assert "✓" in output
     assert "▶" in output
@@ -343,10 +345,13 @@ def test_todo_block_uses_status_glyphs() -> None:
 
 
 def test_task_block_renders_children() -> None:
-    block = TaskBlock(title="root", children=[
-        TaskChild("agent_a", "step 1", status="done", summary="ok", duration=0.5),
-        TaskChild("agent_b", "step 2", status="error", summary="boom", duration=1.0),
-    ])
+    block = TaskBlock(
+        title="root",
+        children=[
+            TaskChild("agent_a", "step 1", status="done", summary="ok", duration=0.5),
+            TaskChild("agent_b", "step 2", status="error", summary="boom", duration=1.0),
+        ],
+    )
     block.state.is_terminal = True
     output = _render(block)
     assert "root" in output

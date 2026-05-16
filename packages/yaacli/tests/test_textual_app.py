@@ -102,37 +102,39 @@ async def test_textualsink_streaming_never_shows_raw_markdown_markers() -> None:
 
         # Realistic chunked Markdown stream — final chunk closes the **bold.
         chunks = [
-            "# ", "Title\n\n",
-            "## ", "Section\n\n",
-            "Some ", "**bold ", "text**", " here.\n",
-            "- ", "first ", "item\n",
-            "- ", "second item with **emph**asis\n",
+            "# ",
+            "Title\n\n",
+            "## ",
+            "Section\n\n",
+            "Some ",
+            "**bold ",
+            "text**",
+            " here.\n",
+            "- ",
+            "first ",
+            "item\n",
+            "- ",
+            "second item with **emph**asis\n",
         ]
         bad_frames: list[tuple[str, str]] = []
         for chunk in chunks:
             sink.handle_text_delta(chunk)
             await pilot.pause(0.01)
-            content = "\n".join(
-                "".join(seg.text for seg in strip) for strip in log.lines
-            )
+            content = "\n".join("".join(seg.text for seg in strip) for strip in log.lines)
             for marker in ("# ", "## ", "**bold", "**emph"):
                 if marker in content:
                     bad_frames.append((chunk, marker))
 
         sink.end_text()
         await pilot.pause(0.02)
-        final = "\n".join(
-            "".join(seg.text for seg in strip) for strip in log.lines
-        )
+        final = "\n".join("".join(seg.text for seg in strip) for strip in log.lines)
         # After end, well-formed Markdown means no raw markers anywhere.
         assert "## " not in final, f"Final has raw heading marker: {final!r}"
         assert "**" not in final, f"Final has raw bold marker: {final!r}"
 
         if bad_frames:
             sample = "; ".join(f"after {c!r} saw {m!r}" for c, m in bad_frames[:3])
-            raise AssertionError(
-                f"{len(bad_frames)} streaming frames had raw markers: {sample}"
-            )
+            raise AssertionError(f"{len(bad_frames)} streaming frames had raw markers: {sample}")
 
 
 @pytest.mark.asyncio
@@ -214,8 +216,7 @@ async def test_textualsink_end_text_does_not_double_render_wrapped_lines() -> No
         # ~3-5 strips (paragraph + maybe a trailing blank). The bug would
         # produce ~6-10. We assert a tight upper bound to catch regression.
         assert len(log.lines) <= 6, (
-            f"end_text did not fully pop streamed plain text — got "
-            f"{len(log.lines)} strips, expected ≤6"
+            f"end_text did not fully pop streamed plain text — got {len(log.lines)} strips, expected ≤6"
         )
 
 
@@ -845,14 +846,8 @@ async def test_jump_previous_assistant_key_moves_viewport_off_bottom() -> None:
         app._sink.write_block(UserPromptBlock(text="user jump target"))
         app._sink.handle_text_delta("assistant jump target\n")
         app._sink.end_text()
-        assistant_entry = next(
-            entry for entry in app._sink._history_entries
-            if entry.kind == "assistant"
-        )
-        user_entry = next(
-            entry for entry in app._sink._history_entries
-            if entry.kind == "user"
-        )
+        assistant_entry = next(entry for entry in app._sink._history_entries if entry.kind == "assistant")
+        user_entry = next(entry for entry in app._sink._history_entries if entry.kind == "user")
         for i in range(30):
             app._sink.show_breadcrumb(f"after {i}")
         await pilot.pause()
@@ -903,14 +898,8 @@ async def test_jump_slash_command_keeps_target_visible() -> None:
         app._sink.write_block(UserPromptBlock(text="user slash target"))
         app._sink.handle_text_delta("assistant slash target\n")
         app._sink.end_text()
-        assistant_entry = next(
-            entry for entry in app._sink._history_entries
-            if entry.kind == "assistant"
-        )
-        user_entry = next(
-            entry for entry in app._sink._history_entries
-            if entry.kind == "user"
-        )
+        assistant_entry = next(entry for entry in app._sink._history_entries if entry.kind == "assistant")
+        user_entry = next(entry for entry in app._sink._history_entries if entry.kind == "user")
         for i in range(30):
             app._sink.show_breadcrumb(f"after {i}")
         await pilot.pause()
@@ -1108,23 +1097,27 @@ async def test_textual_app_sessions_fills_missing_name_from_transcript(
     config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
     session_dir = config_manager.get_sessions_dir() / "abc123def456"
     session_dir.mkdir(parents=True)
-    (session_dir / "metadata.json").write_text(json.dumps({
-        "session_id": "abc123def456",
-        "name": "",
-        "working_dir": str(tmp_path),
-        "created_at": "2026-05-14T00:00:00+00:00",
-        "updated_at": "2026-05-14T00:00:01+00:00",
-        "model": "opus-4.7",
-        "turns": [],
-        "tool_count": 0,
-        "error_count": 0,
-    }))
-    (session_dir / "transcript.json").write_text(json.dumps([
-        {"kind": "system", "text": "/sessions", "label": "/sessions"},
-        {"kind": "user", "text": "first restored prompt", "label": "user"},
-        {"kind": "assistant", "text": "restored assistant", "label": "assistant"},
-        {"kind": "user", "text": "latest restored prompt", "label": "user"},
-    ]))
+    (session_dir / "metadata.json").write_text(
+        json.dumps({
+            "session_id": "abc123def456",
+            "name": "",
+            "working_dir": str(tmp_path),
+            "created_at": "2026-05-14T00:00:00+00:00",
+            "updated_at": "2026-05-14T00:00:01+00:00",
+            "model": "opus-4.7",
+            "turns": [],
+            "tool_count": 0,
+            "error_count": 0,
+        })
+    )
+    (session_dir / "transcript.json").write_text(
+        json.dumps([
+            {"kind": "system", "text": "/sessions", "label": "/sessions"},
+            {"kind": "user", "text": "first restored prompt", "label": "user"},
+            {"kind": "assistant", "text": "restored assistant", "label": "assistant"},
+            {"kind": "user", "text": "latest restored prompt", "label": "user"},
+        ])
+    )
 
     app = YaacliTextualApp(
         config=config,
@@ -1161,21 +1154,25 @@ async def test_textual_app_resume_restores_saved_transcript(tmp_path: Path) -> N
     config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
     session_dir = config_manager.get_sessions_dir() / "abc123def456"
     session_dir.mkdir(parents=True)
-    (session_dir / "metadata.json").write_text(json.dumps({
-        "session_id": "abc123def456",
-        "name": "saved",
-        "working_dir": str(tmp_path),
-        "created_at": "2026-05-14T00:00:00+00:00",
-        "updated_at": "2026-05-14T00:00:01+00:00",
-        "model": "opus-4.7",
-        "turns": [],
-        "tool_count": 0,
-        "error_count": 0,
-    }))
-    (session_dir / "transcript.json").write_text(json.dumps([
-        {"kind": "user", "text": "restored user", "label": "user"},
-        {"kind": "assistant", "text": "restored assistant", "label": "assistant"},
-    ]))
+    (session_dir / "metadata.json").write_text(
+        json.dumps({
+            "session_id": "abc123def456",
+            "name": "saved",
+            "working_dir": str(tmp_path),
+            "created_at": "2026-05-14T00:00:00+00:00",
+            "updated_at": "2026-05-14T00:00:01+00:00",
+            "model": "opus-4.7",
+            "turns": [],
+            "tool_count": 0,
+            "error_count": 0,
+        })
+    )
+    (session_dir / "transcript.json").write_text(
+        json.dumps([
+            {"kind": "user", "text": "restored user", "label": "user"},
+            {"kind": "assistant", "text": "restored assistant", "label": "assistant"},
+        ])
+    )
     (session_dir / "message_history.json").write_text("[]")
 
     app = YaacliTextualApp(
@@ -1955,9 +1952,7 @@ async def test_model_slash_command_switches_active_runtime_profile() -> None:
     )
     config = YaacliConfig(
         models={
-            "opus-4.7": ModelProfileConfig(
-                model="gateway@anthropic:gcp-claude-opus-4-7"
-            ),
+            "opus-4.7": ModelProfileConfig(model="gateway@anthropic:gcp-claude-opus-4-7"),
             "gpt-5.4": gpt_profile,
         }
     )
@@ -1977,9 +1972,7 @@ async def test_model_slash_command_switches_active_runtime_profile() -> None:
         assert handled is True
         apply_profile.assert_called_once_with(app._runtime, gpt_profile)
         assert app._active_model_name == "gpt-5.4"
-        assert app._model_name == (
-            "gpt-5.4 (gateway@openai-responses:openrouter-openai-gpt-5.4)"
-        )
+        assert app._model_name == ("gpt-5.4 (gateway@openai-responses:openrouter-openai-gpt-5.4)")
         assert app._footer.model_label == "gpt-5.4"
 
         await app._handle_command("/model")
@@ -2033,9 +2026,7 @@ async def test_model_slash_command_rejects_switch_while_agent_is_running() -> No
 
     config = YaacliConfig(
         models={
-            "opus-4.7": ModelProfileConfig(
-                model="gateway@anthropic:gcp-claude-opus-4-7"
-            ),
+            "opus-4.7": ModelProfileConfig(model="gateway@anthropic:gcp-claude-opus-4-7"),
             "gpt-5.4": ModelProfileConfig(model="openai:gpt-5.4"),
         }
     )
@@ -2058,9 +2049,7 @@ async def test_model_slash_command_rejects_switch_while_agent_is_running() -> No
 
             apply_profile.assert_not_called()
             assert app._active_model_name == "opus-4.7"
-            assert app._model_name == (
-                "opus-4.7 (gateway@anthropic:gcp-claude-opus-4-7)"
-            )
+            assert app._model_name == ("opus-4.7 (gateway@anthropic:gcp-claude-opus-4-7)")
         finally:
             app._agent_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2619,14 +2608,10 @@ def test_console_session_handles_tool_call_part_start_before_result() -> None:
         def end_thinking(self) -> None:
             pass
 
-        def handle_tool_call_start(
-            self, tool_call_id: str, name: str, args: object = None
-        ) -> None:
+        def handle_tool_call_start(self, tool_call_id: str, name: str, args: object = None) -> None:
             self.started.append((tool_call_id, name, args))
 
-        def handle_tool_call_complete(
-            self, tool_call_id: str, result: object, *, error: bool = False
-        ) -> None:
+        def handle_tool_call_complete(self, tool_call_id: str, result: object, *, error: bool = False) -> None:
             raise AssertionError(tool_call_id)
 
     sink = Sink()
@@ -2642,7 +2627,7 @@ def test_console_session_handles_tool_call_part_start_before_result() -> None:
                     tool_name="Bash",
                     args={"command": "pwd"},
                 ),
-            )
+            ),
         )
     )
 
@@ -2673,14 +2658,10 @@ def test_console_session_routes_context_update_event_to_sink() -> None:
         def end_thinking(self) -> None:
             pass
 
-        def handle_tool_call_start(
-            self, tool_call_id: str, name: str, args: object = None
-        ) -> None:
+        def handle_tool_call_start(self, tool_call_id: str, name: str, args: object = None) -> None:
             raise AssertionError(tool_call_id)
 
-        def handle_tool_call_complete(
-            self, tool_call_id: str, result: object, *, error: bool = False
-        ) -> None:
+        def handle_tool_call_complete(self, tool_call_id: str, result: object, *, error: bool = False) -> None:
             raise AssertionError(tool_call_id)
 
         def handle_context_update(self, total_tokens: int, context_window_size: int) -> None:
@@ -2727,14 +2708,10 @@ def test_console_session_surfaces_encrypted_reasoning_without_summary() -> None:
         def end_thinking(self) -> None:
             pass
 
-        def handle_tool_call_start(
-            self, tool_call_id: str, name: str, args: object = None
-        ) -> None:
+        def handle_tool_call_start(self, tool_call_id: str, name: str, args: object = None) -> None:
             raise AssertionError(tool_call_id)
 
-        def handle_tool_call_complete(
-            self, tool_call_id: str, result: object, *, error: bool = False
-        ) -> None:
+        def handle_tool_call_complete(self, tool_call_id: str, result: object, *, error: bool = False) -> None:
             raise AssertionError(tool_call_id)
 
     sink = Sink()
@@ -2755,9 +2732,7 @@ def test_console_session_surfaces_encrypted_reasoning_without_summary() -> None:
         )
     )
 
-    assert sink.thinking == [
-        "Reasoning was encrypted by the provider; no summary was returned."
-    ]
+    assert sink.thinking == ["Reasoning was encrypted by the provider; no summary was returned."]
 
 
 @pytest.mark.asyncio
@@ -2794,17 +2769,42 @@ async def test_subagent_tool_calls_collapsed_into_single_block() -> None:
         baseline = len(log.lines)
 
         # Spawn a subagent + 5 tool calls inside it
-        session.handle(evt("main", SubagentStartEvent(
-            event_id="e1", agent_id="sub1",
-            agent_name="explorer", prompt_preview="explore",
-        )))
+        session.handle(
+            evt(
+                "main",
+                SubagentStartEvent(
+                    event_id="e1",
+                    agent_id="sub1",
+                    agent_name="explorer",
+                    prompt_preview="explore",
+                ),
+            )
+        )
         for i in range(5):
-            session.handle(evt("sub1", FunctionToolCallEvent(part=ToolCallPart(
-                tool_name="Read", args={"path": f"f{i}.py"}, tool_call_id=f"t{i}",
-            ))))
-            session.handle(evt("sub1", FunctionToolResultEvent(result=ToolReturnPart(
-                tool_name="Read", content="ok", tool_call_id=f"t{i}",
-            ))))
+            session.handle(
+                evt(
+                    "sub1",
+                    FunctionToolCallEvent(
+                        part=ToolCallPart(
+                            tool_name="Read",
+                            args={"path": f"f{i}.py"},
+                            tool_call_id=f"t{i}",
+                        )
+                    ),
+                )
+            )
+            session.handle(
+                evt(
+                    "sub1",
+                    FunctionToolResultEvent(
+                        result=ToolReturnPart(
+                            tool_name="Read",
+                            content="ok",
+                            tool_call_id=f"t{i}",
+                        )
+                    ),
+                )
+            )
         await pilot.pause(0.05)
 
         # During execution: progress stays in the transcript, not near the prompt.
@@ -2815,10 +2815,18 @@ async def test_subagent_tool_calls_collapsed_into_single_block() -> None:
         assert "5 tools" in running
 
         # Complete: ONE summary line in log, not 10 (5 tool calls + 5 results)
-        session.handle(evt("main", SubagentCompleteEvent(
-            event_id="e2", agent_id="sub1", agent_name="explorer",
-            success=True, duration_seconds=1.5,
-        )))
+        session.handle(
+            evt(
+                "main",
+                SubagentCompleteEvent(
+                    event_id="e2",
+                    agent_id="sub1",
+                    agent_name="explorer",
+                    success=True,
+                    duration_seconds=1.5,
+                ),
+            )
+        )
         await pilot.pause(0.05)
         new_lines = len(log.lines) - baseline
         assert new_lines == 1, f"expected 1 summary line, got {new_lines}"
@@ -2850,20 +2858,14 @@ async def test_streaming_renders_correctly_with_focus_on_input() -> None:
         log = app.query_one(RichLog)
         prompt.focus()  # critical: focus on input, not log
 
-        text = (
-            "## Heading\n\n"
-            "Para with **bold** and `code`.\n\n"
-            "- one\n- two\n- three\n"
-        )
+        text = "## Heading\n\nPara with **bold** and `code`.\n\n- one\n- two\n- three\n"
         for chunk in [text[i : i + 6] for i in range(0, len(text), 6)]:
             app._sink.handle_text_delta(chunk)
             await pilot.pause(0.01)
         app._sink.end_text()
         await pilot.pause(0.05)
 
-        rendered = "\n".join(
-            "".join(seg.text for seg in s) for s in log.lines
-        )
+        rendered = "\n".join("".join(seg.text for seg in s) for s in log.lines)
         # No raw markers in final output
         assert "## " not in rendered
         assert "**bold**" not in rendered

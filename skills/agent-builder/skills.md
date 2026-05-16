@@ -99,12 +99,12 @@ Skills are discovered from `skills/` subdirectory in each of FileOperator's `all
 # Typical setup with local environment
 allowed_paths:
   - /home/user/.agents            # Shared agent skills (cross-tool)
-  - /home/user/.xunocli            # Tool-specific config directory
+  - /home/user/.yaacli             # Tool-specific config directory
   - /home/user/project            # Project directory
 
 # Skills will be scanned from (lowest to highest priority):
 /home/user/.agents/skills/        # Shared user skills
-/home/user/.xunocli/skills/        # Tool-specific user skills
+/home/user/.yaacli/skills/         # Tool-specific user skills
 /home/user/project/.agents/skills/  # Shared project skills
 /home/user/project/skills/        # Tool-specific project skills
 ```
@@ -126,7 +126,7 @@ The `.agents/skills/` directory follows the [Agent Skills open standard](https:/
 | Scope                | Path                        | Description                                   |
 | -------------------- | --------------------------- | --------------------------------------------- |
 | USER (shared)        | `~/.agents/skills/`         | Personal skills shared across all agent tools |
-| USER (tool-specific) | `~/.xunocli/skills/`        | Skills specific to this tool                  |
+| USER (tool-specific) | `~/.yaacli/skills/`         | Skills specific to this tool                  |
 | REPO (shared)        | `<project>/.agents/skills/` | Project skills shared across all agent tools  |
 | REPO (tool-specific) | `<project>/skills/`         | Project skills specific to this tool          |
 
@@ -146,7 +146,7 @@ Priority chain (lowest to highest):
 
 ```mermaid
 flowchart LR
-    A["~/.agents/skills/"] -->|overridden by| B["~/.xunocli/skills/"]
+    A["~/.agents/skills/"] -->|overridden by| B["~/.yaacli/skills/"]
     B -->|overridden by| C["project/.agents/skills/"]
     C -->|overridden by| D["project/skills/"]
 ```
@@ -318,7 +318,7 @@ Skills metadata is injected into the system prompt in XML format:
 <available-skills>
 <skill name="code-review">
   <description>Review code for quality, security, and best practices.</description>
-  <path>/home/user/.xunocli/skills/code-review</path>
+  <path>/home/user/.yaacli/skills/code-review</path>
 </skill>
 <skill name="debugging">
   <description>Debug errors and test failures systematically.</description>

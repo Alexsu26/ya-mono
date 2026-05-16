@@ -169,10 +169,7 @@ class TranscriptStore:
             prompt = _session_name(text)
             if prompt and not prompt.lstrip().startswith("/"):
                 self._metadata["latest_user_prompt"] = prompt
-                if (
-                    not _session_name(self._metadata.get("name"))
-                    and self._metadata.get("name_source") != "explicit"
-                ):
+                if not _session_name(self._metadata.get("name")) and self._metadata.get("name_source") != "explicit":
                     self._metadata["name"] = prompt
                     self._metadata["name_source"] = "auto"
         self._metadata["updated_at"] = utc_now()
@@ -210,9 +207,7 @@ class TranscriptStore:
         self._save_metadata()
 
     def save_message_history(self, messages: list[Any], runtime: Any) -> None:
-        self.message_history_path.write_bytes(
-            ModelMessagesTypeAdapter.dump_json(messages, indent=2)
-        )
+        self.message_history_path.write_bytes(ModelMessagesTypeAdapter.dump_json(messages, indent=2))
         ctx = getattr(runtime, "ctx", None)
         export_state = getattr(ctx, "export_state", None)
         if callable(export_state):
@@ -285,20 +280,18 @@ class TranscriptStore:
             if not directory.is_dir():
                 continue
             metadata = _read_json(directory / "metadata.json", {})
-            first_user_prompt, latest_user_prompt = _transcript_user_prompts(
-                directory / "transcript.json"
+            first_user_prompt, latest_user_prompt = _transcript_user_prompts(directory / "transcript.json")
+            out.append(
+                SessionListing(
+                    session_id=directory.name,
+                    name=_session_name(metadata.get("name")) or first_user_prompt,
+                    latest_user_prompt=(_session_name(metadata.get("latest_user_prompt")) or latest_user_prompt),
+                    updated_at=str(metadata.get("updated_at") or ""),
+                    working_dir=str(metadata.get("working_dir") or ""),
+                    model=str(metadata.get("model") or ""),
+                    path=directory,
+                )
             )
-            out.append(SessionListing(
-                session_id=directory.name,
-                name=_session_name(metadata.get("name")) or first_user_prompt,
-                latest_user_prompt=(
-                    _session_name(metadata.get("latest_user_prompt")) or latest_user_prompt
-                ),
-                updated_at=str(metadata.get("updated_at") or ""),
-                working_dir=str(metadata.get("working_dir") or ""),
-                model=str(metadata.get("model") or ""),
-                path=directory,
-            ))
         out.sort(key=lambda item: item.updated_at or "", reverse=True)
         return out
 
@@ -337,5 +330,5 @@ class TranscriptStore:
 
     def _prune_old_sessions(self) -> None:
         listings = self.listings()
-        for item in listings[self.max_sessions:]:
+        for item in listings[self.max_sessions :]:
             shutil.rmtree(item.path, ignore_errors=True)

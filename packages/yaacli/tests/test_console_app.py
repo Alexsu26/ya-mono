@@ -19,6 +19,7 @@ from yaacli.console.theme import build_theme
 @dataclass
 class _FakeStreamEvent:
     """Mimics StreamEvent's outer shape: it has an .event attribute."""
+
     event: object
 
 
@@ -117,12 +118,16 @@ def test_session_handles_compact_breadcrumbs(console_app: ConsoleApp) -> None:
 
     session = ConsoleSession(sink=console_app)
     session.handle(_FakeStreamEvent(event=CompactStartEvent(event_id="evt1", message_count=10)))
-    session.handle(_FakeStreamEvent(event=CompactCompleteEvent(
-        event_id="evt2",
-        original_message_count=10,
-        compacted_message_count=4,
-        summary_markdown="ok",
-    )))
+    session.handle(
+        _FakeStreamEvent(
+            event=CompactCompleteEvent(
+                event_id="evt2",
+                original_message_count=10,
+                compacted_message_count=4,
+                summary_markdown="ok",
+            )
+        )
+    )
     out = console_app.console.file.getvalue()
     assert "compacting" in out
     assert "compacted" in out
