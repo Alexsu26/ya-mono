@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from ya_agent_environment import Environment
 from ya_claw.config import ClawSettings
 from ya_claw.db.engine import create_engine, create_session_factory
+from ya_claw.execution import coordinator as coordinator_module
 from ya_claw.execution.coordinator import (
     ExecutionBuffers,
     ExecutionSupervisor,
@@ -388,6 +389,79 @@ async def test_execution_supervisor_shutdown_cancels_tasks_after_timeout(
     assert cancelled is True
     assert task.cancelled() is True
     assert runtime_state.get_background_task("run-hanging") is None
+
+
+async def test_execution_supervisor_skips_claim_when_shutdown_races_with_db_load(
+    monkeypatch: pytest.MonkeyPatch,
+    db_session: AsyncSession,
+    db_engine: AsyncEngine,
+    settings: ClawSettings,
+    runtime_state: InMemoryRuntimeState,
+) -> None:
+    session_record = SessionRecord(
+        id="session-1",
+        profile_name="general",
+        session_metadata={},
+        head_run_id="run-1",
+        active_run_id="run-1",
+    )
+    run_record = RunRecord(
+        id="run-1",
+        session_id="session-1",
+        sequence_no=1,
+        restore_from_run_id=None,
+        status="queued",
+        trigger_type="api",
+        profile_name="general",
+        input_parts=[{"type": "text", "text": "hello"}],
+        run_metadata={},
+    )
+    db_session.add(session_record)
+    db_session.add(run_record)
+    await db_session.commit()
+
+    original_load_run_scope = coordinator_module._load_run_scope
+    scope_loaded = asyncio.Event()
+    release_scope = asyncio.Event()
+
+    async def blocking_load_run_scope(db_session_arg: AsyncSession, run_id: str) -> tuple[SessionRecord, RunRecord]:
+        result = await original_load_run_scope(db_session_arg, run_id)
+        scope_loaded.set()
+        await release_scope.wait()
+        return result
+
+    monkeypatch.setattr(coordinator_module, "_load_run_scope", blocking_load_run_scope)
+
+    supervisor = ExecutionSupervisor(
+        settings=settings,
+        session_factory=create_session_factory(db_engine),
+        runtime_state=runtime_state,
+        workspace_provider=StubWorkspaceProvider(settings.resolved_workspace_dir),
+        environment_factory=StubEnvironmentFactory(),
+        profile_resolver=StubProfileResolver(),
+        runtime_builder=StubRuntimeBuilder(),
+    )
+    claim_task = asyncio.create_task(supervisor._claim_run("run-1"))
+    await asyncio.wait_for(scope_loaded.wait(), timeout=1)
+
+    await supervisor.shutdown()
+    release_scope.set()
+    claimed = await asyncio.wait_for(claim_task, timeout=1)
+
+    refreshed_run = await db_session.get(RunRecord, "run-1")
+    refreshed_session = await db_session.get(SessionRecord, "session-1")
+    assert claimed is False
+    assert isinstance(refreshed_run, RunRecord)
+    assert isinstance(refreshed_session, SessionRecord)
+    await db_session.refresh(refreshed_run)
+    await db_session.refresh(refreshed_session)
+    assert refreshed_run.status == "queued"
+    assert refreshed_run.claimed_by is None
+    assert refreshed_run.claimed_at is None
+    assert refreshed_run.started_at is None
+    assert refreshed_session.head_run_id == "run-1"
+    assert refreshed_session.active_run_id == "run-1"
+    assert runtime_state.get_run_handle("run-1") is None
 
 
 async def test_execution_supervisor_claims_queued_run(
