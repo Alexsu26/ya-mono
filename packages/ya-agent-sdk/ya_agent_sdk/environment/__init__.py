@@ -13,6 +13,22 @@ from ya_agent_sdk.environment.local import (
     VirtualLocalFileOperator,
     VirtualMount,
 )
+from ya_agent_sdk.environment.shell_sandbox import (
+    SHELL_SANDBOX_MASKED_PATH_ALIASES,
+    SandboxedLocalShell,
+    ShellSandboxBackend,
+    ShellSandboxConfig,
+    ShellSandboxMaskedPathAlias,
+    ShellSandboxMountPolicy,
+    ShellSandboxNetwork,
+    ShellSandboxProfile,
+    ShellSandboxRawApproval,
+    ShellSandboxRuntimePolicy,
+    default_backend_for_platform,
+    resolve_masked_paths,
+    resolve_shell_sandbox_runtime_policy,
+    shell_sandbox_diagnostics,
+)
 
 # Sandbox environment is optional (requires docker package)
 try:
@@ -27,6 +43,7 @@ except ModuleNotFoundError:
     _DOCKER_AVAILABLE = False
 
 __all__ = [
+    "SHELL_SANDBOX_MASKED_PATH_ALIASES",
     "CompositeFileOperator",
     "LocalEnvironment",
     "LocalFileOperator",
@@ -34,8 +51,21 @@ __all__ = [
     "LocalShell",
     "Mount",
     "MountBackend",
+    "SandboxedLocalShell",
+    "ShellSandboxBackend",
+    "ShellSandboxConfig",
+    "ShellSandboxMaskedPathAlias",
+    "ShellSandboxMountPolicy",
+    "ShellSandboxNetwork",
+    "ShellSandboxProfile",
+    "ShellSandboxRawApproval",
+    "ShellSandboxRuntimePolicy",
     "VirtualLocalFileOperator",
     "VirtualMount",
+    "default_backend_for_platform",
+    "resolve_masked_paths",
+    "resolve_shell_sandbox_runtime_policy",
+    "shell_sandbox_diagnostics",
 ]
 
 # Add Sandbox exports if available

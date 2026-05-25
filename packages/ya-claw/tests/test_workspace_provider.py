@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
-from ya_agent_sdk.environment import SandboxEnvironment, VirtualLocalFileOperator, VirtualMount
+from ya_agent_sdk.environment import LocalShell, SandboxEnvironment, VirtualLocalFileOperator, VirtualMount
 from ya_agent_sdk.environment.sandbox import DockerShell
+from ya_agent_sdk.environment.virtual_path import normalize_virtual_path
 from ya_claw.workspace import (
     DockerEnvironmentFactory,
     DockerExtraMount,
@@ -14,7 +15,6 @@ from ya_claw.workspace import (
     MappedLocalEnvironment,
     ReusableSandboxEnvironment,
     WorkspaceGuidance,
-    WorkspaceLocalShell,
     build_workspace_container_ref,
     build_workspace_sandbox_metadata,
     format_workspace_guidance,
@@ -54,10 +54,10 @@ def test_local_workspace_provider_resolves_single_workspace(tmp_path: Path) -> N
 
     assert binding.host_path == workspace_dir.resolve()
     assert binding.host_path.exists()
-    assert binding.virtual_path == workspace_dir.resolve()
-    assert binding.cwd == workspace_dir.resolve()
-    assert binding.readable_paths == [workspace_dir.resolve()]
-    assert binding.writable_paths == [workspace_dir.resolve()]
+    assert binding.virtual_path == normalize_virtual_path("/workspace")
+    assert binding.cwd == normalize_virtual_path("/workspace")
+    assert binding.readable_paths == [normalize_virtual_path("/workspace")]
+    assert binding.writable_paths == [normalize_virtual_path("/workspace")]
     assert binding.metadata["source"] == "api"
     assert binding.metadata["provider"] == "local"
     assert binding.metadata["shell_backend"] == "local"
@@ -67,33 +67,41 @@ def test_local_workspace_provider_resolves_single_workspace(tmp_path: Path) -> N
 async def test_service_local_plus_local_shell_uses_real_paths_for_file_ops_and_shell(tmp_path: Path) -> None:
     provider = LocalWorkspaceProvider(tmp_path / "workspace")
     binding = provider.resolve()
-    factory = LocalEnvironmentFactory()
+    factory = LocalEnvironmentFactory(shell_sandbox_enabled=False)
     environment = factory.build(binding)
     assert isinstance(environment, MappedLocalEnvironment)
 
     async with environment as env:
         assert isinstance(env.file_operator, VirtualLocalFileOperator)
         assert env.shell is not None
+        assert str(env.file_operator._default_path) == "/workspace"
         await env.file_operator.write_file("notes.txt", "hello")
         content = await env.file_operator.read_file("notes.txt")
-        exit_code, stdout, stderr = await env.shell.execute("pwd && ls")
+        exit_code, stdout, stderr = await env.shell.execute(
+            'python -c "from pathlib import Path; print(Path.cwd().resolve().as_posix())" && ls'
+        )
 
     assert content == "hello"
     assert exit_code == 0
     assert stderr == ""
-    assert str(binding.host_path) in stdout
+    stdout_path = stdout.splitlines()[0]
+    if stdout_path.startswith("/") and len(stdout_path) > 2 and stdout_path[2] == "/":
+        stdout_path = PureWindowsPath(stdout_path[1] + ":/" + stdout_path[3:]).as_posix()
+    assert binding.host_path.as_posix() == stdout_path
     assert "notes.txt" in stdout
 
 
 async def test_local_environment_factory_passes_workspace_environment(tmp_path: Path) -> None:
     provider = LocalWorkspaceProvider(tmp_path / "workspace")
     binding = provider.resolve()
-    factory = LocalEnvironmentFactory(workspace_environment={"LARK_APP_ID": "cli_test"})
+    factory = LocalEnvironmentFactory(workspace_environment={"LARK_APP_ID": "cli_test"}, shell_sandbox_enabled=False)
     environment = factory.build(binding)
 
     async with environment as env:
-        assert isinstance(env.shell, WorkspaceLocalShell)
-        exit_code, stdout, stderr = await env.shell.execute("printf '%s' \"$LARK_APP_ID\"")
+        assert isinstance(env.shell, LocalShell)
+        exit_code, stdout, stderr = await env.shell.execute(
+            "python -c \"import os; print(os.environ.get('LARK_APP_ID', ''), end='')\""
+        )
 
     assert exit_code == 0
     assert stderr == ""
@@ -106,10 +114,12 @@ def test_docker_workspace_provider_defaults_docker_host_path_to_service_path(tmp
 
     binding = provider.resolve(metadata={"session_id": "session-1"})
 
+    assert str(binding.virtual_path) == "/workspace"
+    assert str(binding.cwd) == "/workspace"
     assert binding.host_path == workspace_dir.resolve()
     assert binding.docker_host_path == workspace_dir.resolve()
-    assert binding.virtual_path == Path("/workspace")
-    assert binding.cwd == Path("/workspace")
+    assert binding.virtual_path == normalize_virtual_path("/workspace")
+    assert binding.cwd == normalize_virtual_path("/workspace")
     assert binding.metadata["provider"] == "docker"
     assert binding.metadata["docker_image"] == "python:3.11"
     assert binding.metadata["host_mount"] == str(workspace_dir.resolve())
@@ -120,6 +130,23 @@ def test_docker_workspace_provider_defaults_docker_host_path_to_service_path(tmp
         "image": "python:3.11",
     }
     assert binding.backend_hint == "docker"
+
+
+def test_docker_workspace_provider_keeps_posix_virtual_paths_from_host_path_input(tmp_path: Path) -> None:
+    workspace_dir = tmp_path / "workspace"
+    provider = DockerWorkspaceProvider(
+        workspace_dir,
+        image="python:3.11",
+        virtual_workspace_path=Path("/workspace/../workspace"),
+    )
+
+    binding = provider.resolve(metadata={"session_id": "session-1"})
+    environment = DockerEnvironmentFactory(image="python:3.11").build(binding)
+
+    assert str(binding.virtual_path) == "/workspace"
+    assert str(binding.cwd) == "/workspace"
+    assert str(environment._work_dir) == "/workspace"
+    assert str(environment._mounts[0].virtual_path) == "/workspace"
 
 
 def test_docker_workspace_provider_supports_separate_service_and_daemon_paths(tmp_path: Path) -> None:
@@ -135,8 +162,8 @@ def test_docker_workspace_provider_supports_separate_service_and_daemon_paths(tm
 
     assert binding.host_path == service_workspace_dir.resolve()
     assert binding.docker_host_path == host_workspace_dir.resolve()
-    assert binding.virtual_path == Path("/workspace")
-    assert binding.cwd == Path("/workspace")
+    assert binding.virtual_path == normalize_virtual_path("/workspace")
+    assert binding.cwd == normalize_virtual_path("/workspace")
     assert binding.metadata["host_mount"] == str(host_workspace_dir.resolve())
     assert binding.metadata["service_mount"] == str(service_workspace_dir.resolve())
     assert binding.metadata["sandbox"] == {
@@ -158,8 +185,8 @@ def test_service_local_plus_docker_shell_uses_virtual_paths_for_file_ops_and_she
     assert isinstance(environment, ReusableSandboxEnvironment)
     assert binding.host_path == workspace_dir.resolve()
     assert binding.docker_host_path == workspace_dir.resolve()
-    assert binding.virtual_path == Path("/workspace")
-    assert binding.cwd == Path("/workspace")
+    assert binding.virtual_path == normalize_virtual_path("/workspace")
+    assert binding.cwd == normalize_virtual_path("/workspace")
     assert environment.container_ref == build_workspace_container_ref(image="python:3.11", workspace_dir=workspace_dir)
     assert binding.metadata["workspace_uid"] == 1234
     assert binding.metadata["workspace_gid"] == 2345
@@ -627,7 +654,7 @@ def test_load_workspace_guidance_reads_workspace_agents_file(tmp_path: Path) -> 
 
     assert guidance is not None
     assert guidance.host_path == agents_path.resolve()
-    assert guidance.virtual_path == (tmp_path / "workspace" / "AGENTS.md").resolve()
+    assert guidance.virtual_path == normalize_virtual_path("/workspace/AGENTS.md")
     assert guidance.content == "# Workspace\nUse pytest.\n"
 
 
@@ -649,7 +676,7 @@ def test_format_workspace_guidance_uses_virtual_path(tmp_path: Path) -> None:
     formatted = format_workspace_guidance(
         WorkspaceGuidance(
             host_path=workspace_dir / "AGENTS.md",
-            virtual_path=Path('/workspace/path-"quoted"/AGENTS.md'),
+            virtual_path=normalize_virtual_path('/workspace/path-"quoted"/AGENTS.md'),
             content="Use <safe> rules.",
         )
     )

@@ -2,14 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
-import posixpath
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from ya_agent_sdk.environment.virtual_path import (
+    VirtualPath,
+    VirtualPathLike,
+    is_virtual_path_relative_to,
+)
+from ya_agent_sdk.environment.virtual_path import (
+    normalize_virtual_path as normalize_agent_virtual_path,
+)
+from ya_agent_sdk.environment.virtual_path import (
+    relative_virtual_path as agent_relative_virtual_path,
+)
 
 WORKSPACE_METADATA_KEY = "workspace"
 WORKSPACE_SNAPSHOT_METADATA_KEY = "workspace_snapshot"
@@ -126,24 +137,43 @@ class SandboxState(BaseModel):
     last_used_at: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class WorkspaceMountBinding:
     id: str
     host_path: Path
-    virtual_path: Path
+    virtual_path: VirtualPath
     mode: WorkspaceMountMode = "rw"
     docker_host_path: Path | None = None
     name: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __init__(
+        self,
+        *,
+        id: str,  # noqa: A002
+        host_path: Path,
+        virtual_path: VirtualPathLike,
+        mode: WorkspaceMountMode = "rw",
+        docker_host_path: Path | None = None,
+        name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        object.__setattr__(self, "id", id)
+        object.__setattr__(self, "host_path", host_path)
+        object.__setattr__(self, "virtual_path", normalize_agent_virtual_path(virtual_path))
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "docker_host_path", docker_host_path)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "metadata", dict(metadata or {}))
 
-@dataclass(slots=True)
+
+@dataclass(slots=True, init=False)
 class WorkspaceBinding:
     host_path: Path
-    virtual_path: Path
-    cwd: Path
-    readable_paths: list[Path]
-    writable_paths: list[Path]
+    virtual_path: VirtualPath
+    cwd: VirtualPath
+    readable_paths: list[VirtualPath]
+    writable_paths: list[VirtualPath]
     mounts: list[WorkspaceMountBinding]
     fingerprint: str
     generation: int | None = None
@@ -152,6 +182,37 @@ class WorkspaceBinding:
     environment_overrides: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     backend_hint: str | None = None
+
+    def __init__(
+        self,
+        *,
+        host_path: Path,
+        virtual_path: VirtualPathLike,
+        cwd: VirtualPathLike,
+        readable_paths: Sequence[VirtualPathLike],
+        writable_paths: Sequence[VirtualPathLike],
+        mounts: list[WorkspaceMountBinding],
+        fingerprint: str,
+        generation: int | None = None,
+        sandbox_scope: SandboxScopeLiteral | None = None,
+        docker_host_path: Path | None = None,
+        environment_overrides: dict[str, str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        backend_hint: str | None = None,
+    ) -> None:
+        self.host_path = host_path
+        self.virtual_path = normalize_agent_virtual_path(virtual_path)
+        self.cwd = normalize_agent_virtual_path(cwd)
+        self.readable_paths = [normalize_agent_virtual_path(path) for path in readable_paths]
+        self.writable_paths = [normalize_agent_virtual_path(path) for path in writable_paths]
+        self.mounts = list(mounts)
+        self.fingerprint = fingerprint
+        self.generation = generation
+        self.sandbox_scope = sandbox_scope
+        self.docker_host_path = docker_host_path
+        self.environment_overrides = dict(environment_overrides or {})
+        self.metadata = dict(metadata or {})
+        self.backend_hint = backend_hint
 
     @property
     def default_mount(self) -> WorkspaceMountBinding:
@@ -215,30 +276,22 @@ def derive_mount_id(virtual_path: str) -> str:
 def normalize_virtual_path(value: str | None) -> str:
     if value is None or value.strip() == "":
         raise ValueError("virtual path must be a non-empty absolute path")
-    raw_value = value.strip()
-    if not raw_value.startswith("/"):
+    normalized = normalize_agent_virtual_path(value.strip())
+    if not normalized.is_absolute():
         raise ValueError("virtual path must be absolute")
-    normalized = posixpath.normpath(raw_value)
-    if normalized == ".":
-        normalized = "/"
-    if not normalized.startswith("/"):
-        normalized = f"/{normalized}"
-    return normalized
+    return normalized.as_posix()
 
 
-def virtual_path_contains(parent: str | Path, child: str | Path) -> bool:
-    parent_value = normalize_virtual_path(str(parent))
-    child_value = normalize_virtual_path(str(child))
-    return child_value == parent_value or child_value.startswith(f"{parent_value.rstrip('/')}/")
+def virtual_path_contains(parent: str | PurePath, child: str | PurePath) -> bool:
+    return is_virtual_path_relative_to(child, parent)
 
 
-def relative_virtual_path(parent: str | Path, child: str | Path) -> Path:
+def relative_virtual_path(parent: str | PurePath, child: str | PurePath) -> VirtualPath:
     parent_value = normalize_virtual_path(str(parent))
     child_value = normalize_virtual_path(str(child))
     if not virtual_path_contains(parent_value, child_value):
         raise ValueError(f"virtual path '{child_value}' is outside '{parent_value}'")
-    relative = child_value.removeprefix(parent_value).lstrip("/")
-    return Path(relative)
+    return agent_relative_virtual_path(child_value, parent_value)
 
 
 def workspace_fingerprint_payload(

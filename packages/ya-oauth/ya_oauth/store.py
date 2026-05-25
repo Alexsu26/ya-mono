@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import json
 import os
 import stat
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+
+if TYPE_CHECKING:
+    from types import TracebackType
 
 from ya_oauth.types import AuthFile, OAuthProviderRecord, TokenSnapshot
 
@@ -17,6 +19,62 @@ T = TypeVar("T")
 
 DEFAULT_AUTH_DIR = Path.home() / ".yaai"
 DEFAULT_AUTH_PATH = DEFAULT_AUTH_DIR / "auth.json"
+
+
+class FileLock:
+    """Cross-platform advisory file lock."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._file = None
+        self._msvcrt = None
+
+    def __enter__(self) -> None:
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._file = self.path.open("a+")
+        if os.name == "nt":
+            import msvcrt
+
+            self._msvcrt = msvcrt
+            if self._file.tell() == 0:
+                self._file.write("\0")
+                self._file.flush()
+            self._file.seek(0)
+            self._msvcrt.locking(self._file.fileno(), self._msvcrt.LK_LOCK, 1)
+        else:
+            _lock_posix_file(self._file.fileno())
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        if self._file is None:
+            return
+        try:
+            if os.name == "nt" and self._msvcrt is not None:
+                self._file.seek(0)
+                self._msvcrt.locking(self._file.fileno(), self._msvcrt.LK_UNLCK, 1)
+            else:
+                _unlock_posix_file(self._file.fileno())
+        finally:
+            self._file.close()
+            self._file = None
+
+
+def _lock_posix_file(fd: int) -> None:
+    import fcntl
+
+    fcntl_module = cast(Any, fcntl)
+    fcntl_module.flock(fd, fcntl_module.LOCK_EX)
+
+
+def _unlock_posix_file(fd: int) -> None:
+    import fcntl
+
+    fcntl_module = cast(Any, fcntl)
+    fcntl_module.flock(fd, fcntl_module.LOCK_UN)
 
 
 class OAuthStore:
@@ -68,15 +126,8 @@ class OAuthStore:
         with contextlib.suppress(PermissionError):
             os.chmod(self.path.parent, 0o700)
 
-    @contextlib.contextmanager
-    def _locked(self):  # type: ignore[no-untyped-def]
-        self.lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with self.lock_path.open("a+") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    def _locked(self) -> FileLock:
+        return FileLock(self.lock_path)
 
     def _load_unlocked(self) -> AuthFile:
         if not self.path.exists():

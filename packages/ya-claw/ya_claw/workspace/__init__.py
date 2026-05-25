@@ -23,13 +23,13 @@ from ya_claw.workspace.provider import (
     LocalWorkspaceProvider,
     MappedLocalEnvironment,
     ReusableSandboxEnvironment,
-    WorkspaceLocalShell,
     WorkspaceProvider,
     build_workspace_container_ref,
     build_workspace_sandbox_metadata,
     extract_workspace_sandbox_metadata,
     remove_workspace_sandbox_metadata,
 )
+from ya_claw.workspace.shell_sandbox import WorkspaceShellSandboxDefaults, resolve_workspace_shell_sandbox_policy
 
 __all__ = [
     "HEARTBEAT_GUIDANCE_FILENAME",
@@ -49,10 +49,10 @@ __all__ = [
     "WorkspaceBinding",
     "WorkspaceBindingSpec",
     "WorkspaceGuidance",
-    "WorkspaceLocalShell",
     "WorkspaceMountBinding",
     "WorkspaceMountSpec",
     "WorkspaceProvider",
+    "WorkspaceShellSandboxDefaults",
     "build_workspace_container_ref",
     "build_workspace_sandbox_metadata",
     "extract_workspace_sandbox_metadata",
@@ -61,4 +61,5 @@ __all__ = [
     "load_heartbeat_guidance",
     "load_workspace_guidance",
     "remove_workspace_sandbox_metadata",
+    "resolve_workspace_shell_sandbox_policy",
 ]

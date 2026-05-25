@@ -7,10 +7,11 @@ import json
 import tempfile
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from loguru import logger
 from ya_agent_environment import (
@@ -25,10 +26,19 @@ from ya_agent_environment import (
 from ya_agent_sdk.environment import (
     LocalShell,
     SandboxEnvironment,
+    ShellSandboxBackend,
+    ShellSandboxNetwork,
+    ShellSandboxRuntimePolicy,
     VirtualLocalFileOperator,
     VirtualMount,
 )
 from ya_agent_sdk.environment.sandbox import DockerShell
+from ya_agent_sdk.environment.virtual_path import (
+    VirtualPath,
+)
+from ya_agent_sdk.environment.virtual_path import (
+    normalize_virtual_path as normalize_agent_virtual_path,
+)
 
 from ya_claw.workspace.models import (
     SANDBOX_METADATA_KEY,
@@ -45,13 +55,20 @@ from ya_claw.workspace.models import (
     virtual_path_contains,
     workspace_fingerprint_payload,
 )
+from ya_claw.workspace.shell_sandbox import (
+    WorkspaceShellSandboxDefaults,
+    resolve_workspace_shell_sandbox_policy,
+)
+
+if TYPE_CHECKING:
+    from ya_claw.execution.profile import ResolvedProfile
 
 _DOCKER_SANDBOX_METADATA_KEY = SANDBOX_METADATA_KEY
 _DOCKER_SANDBOX_PROVIDER = "docker"
 _DOCKER_WORKSPACE_NAME_PREFIX = "ya-claw-workspace"
 _DOCKER_CONTAINER_CACHE_SCHEMA_VERSION = 1
 _DOCKER_CONTAINER_LOCKS: dict[str, asyncio.Lock] = {}
-_DEFAULT_VIRTUAL_WORKSPACE_PATH = Path("/workspace")
+_DEFAULT_VIRTUAL_WORKSPACE_PATH = normalize_agent_virtual_path("/workspace")
 _DEFAULT_CONTAINER_CACHE_FILE = "workspace.json"
 _DEFAULT_DOCKER_WORKSPACE_HOME = "/home/claw"
 _DEFAULT_DOCKER_WORKSPACE_USER = "claw"
@@ -62,14 +79,16 @@ _ROOT_DOCKER_EXEC_USER = "root"
 @dataclass(frozen=True, slots=True)
 class DockerExtraMount:
     host_path: Path
-    container_path: Path
+    container_path: Path | VirtualPath
     mode: str = "rw"
 
     def __post_init__(self) -> None:
         if self.mode not in {"rw", "ro"}:
             raise ValueError("Docker extra mount mode must be 'rw' or 'ro'")
-        if not self.container_path.is_absolute():
+        container_path = normalize_agent_virtual_path(self.container_path)
+        if not container_path.is_absolute():
             raise ValueError("Docker extra mount container_path must be absolute")
+        object.__setattr__(self, "container_path", container_path)
 
 
 class WorkspaceProvider(ABC):
@@ -83,8 +102,8 @@ class PolicyVirtualLocalFileOperator(VirtualLocalFileOperator):
         self,
         *,
         mounts: list[VirtualMount],
-        default_virtual_path: Path | None = None,
-        read_only_virtual_paths: list[Path] | None = None,
+        default_virtual_path: Path | VirtualPath | None = None,
+        read_only_virtual_paths: Sequence[Path | VirtualPath] | None = None,
         instructions_skip_dirs: frozenset[str] | None = None,
         instructions_max_depth: int = 3,
         tmp_dir: Path | None = None,
@@ -98,7 +117,7 @@ class PolicyVirtualLocalFileOperator(VirtualLocalFileOperator):
             tmp_dir=tmp_dir,
             tmp_file_operator=tmp_file_operator,
         )
-        self._read_only_virtual_paths = [Path(path) for path in read_only_virtual_paths or []]
+        self._read_only_virtual_paths = [normalize_agent_virtual_path(path) for path in read_only_virtual_paths or []]
 
     def _assert_writable(self, path: str) -> None:
         virtual = self._resolve_virtual(path)
@@ -141,11 +160,12 @@ class MappedLocalEnvironment(Environment):
         shell_timeout: float = 30.0,
         tmp_base_dir: Path | None = None,
         enable_tmp_dir: bool = True,
-        read_only_virtual_paths: list[Path] | None = None,
+        read_only_virtual_paths: Sequence[Path | VirtualPath] | None = None,
         resource_state: ResourceRegistryState | None = None,
         resource_factories: dict[str, ResourceFactory] | None = None,
         include_os_env: bool = True,
         environment_overrides: dict[str, str] | None = None,
+        shell_sandbox_policy: ShellSandboxRuntimePolicy | None = None,
     ) -> None:
         super().__init__(resource_state=resource_state, resource_factories=resource_factories)
         self._mounts = mounts
@@ -155,7 +175,8 @@ class MappedLocalEnvironment(Environment):
         self._enable_tmp_dir = enable_tmp_dir
         self._include_os_env = include_os_env
         self._environment_overrides = dict(environment_overrides or {})
-        self._read_only_virtual_paths = [Path(path) for path in read_only_virtual_paths or []]
+        self._shell_sandbox_policy = shell_sandbox_policy
+        self._read_only_virtual_paths = [normalize_agent_virtual_path(path) for path in read_only_virtual_paths or []]
         self._tmp_dir_obj: tempfile.TemporaryDirectory[str] | None = None
 
     async def _setup(self) -> None:
@@ -182,43 +203,19 @@ class MappedLocalEnvironment(Environment):
         )
         if tmp_dir_path is not None:
             allowed_paths.append(tmp_dir_path.resolve())
-        self._shell = WorkspaceLocalShell(
+        self._shell = LocalShell(
             default_cwd=self._host_cwd,
             allowed_paths=allowed_paths,
             default_timeout=self._shell_timeout,
             include_os_env=self._include_os_env,
             environment_overrides=self._environment_overrides,
+            sandbox_policy=self._shell_sandbox_policy,
         )
 
     async def _teardown(self) -> None:
         if self._tmp_dir_obj is not None:
             self._tmp_dir_obj.cleanup()
             self._tmp_dir_obj = None
-
-
-class WorkspaceLocalShell(LocalShell):
-    def __init__(
-        self,
-        *,
-        environment_overrides: dict[str, str],
-        default_cwd: Path | None = None,
-        allowed_paths: list[Path] | None = None,
-        default_timeout: float = 30.0,
-        include_os_env: bool = True,
-    ) -> None:
-        super().__init__(
-            default_cwd=default_cwd,
-            allowed_paths=allowed_paths,
-            default_timeout=default_timeout,
-            include_os_env=include_os_env,
-        )
-        self._environment_overrides = dict(environment_overrides)
-
-    def _build_effective_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
-        merged_env = {**self._environment_overrides, **dict(env or {})}
-        if not merged_env:
-            return super()._build_effective_env(env)
-        return super()._build_effective_env(merged_env)
 
 
 class DockerWorkspaceDeferredShell(DeferredShell):
@@ -266,7 +263,7 @@ class ReusableSandboxEnvironment(SandboxEnvironment):
         container_cache_path: Path | None = None,
         docker_host_paths: list[Path] | None = None,
         docker_mount_modes: list[str] | None = None,
-        read_only_virtual_paths: list[Path] | None = None,
+        read_only_virtual_paths: Sequence[Path | VirtualPath] | None = None,
         sandbox_metadata: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
@@ -293,7 +290,7 @@ class ReusableSandboxEnvironment(SandboxEnvironment):
             [path.expanduser() for path in docker_host_paths] if docker_host_paths is not None else []
         )
         self._docker_mount_modes = list(docker_mount_modes or [])
-        self._read_only_virtual_paths = [Path(path) for path in read_only_virtual_paths or []]
+        self._read_only_virtual_paths = [normalize_agent_virtual_path(path) for path in read_only_virtual_paths or []]
         self._sandbox_metadata = dict(sandbox_metadata or {})
 
     @property
@@ -675,7 +672,7 @@ class ReusableSandboxEnvironment(SandboxEnvironment):
 
 class EnvironmentFactory(ABC):
     @abstractmethod
-    def build(self, binding: WorkspaceBinding) -> Environment:
+    def build(self, binding: WorkspaceBinding, *, profile: ResolvedProfile | None = None) -> Environment:
         raise NotImplementedError
 
 
@@ -686,12 +683,22 @@ class LocalEnvironmentFactory(EnvironmentFactory):
         shell_timeout: float = 30.0,
         tmp_base_dir: Path | None = None,
         workspace_environment: dict[str, str] | None = None,
+        shell_sandbox_enabled: bool = True,
+        shell_sandbox_backend: ShellSandboxBackend = "auto",
+        shell_sandbox_network: ShellSandboxNetwork = "full",
+        shell_sandbox_allow_raw_host: bool = False,
     ) -> None:
         self._shell_timeout = shell_timeout
         self._tmp_base_dir = tmp_base_dir
         self._workspace_environment = dict(workspace_environment or {})
+        self._shell_sandbox_defaults = WorkspaceShellSandboxDefaults(
+            enabled=shell_sandbox_enabled,
+            backend=shell_sandbox_backend,
+            network=shell_sandbox_network,
+            allow_raw_host=shell_sandbox_allow_raw_host,
+        )
 
-    def build(self, binding: WorkspaceBinding) -> Environment:
+    def build(self, binding: WorkspaceBinding, *, profile: ResolvedProfile | None = None) -> Environment:
         logger.debug(
             "Building local environment provider={} host_path={} cwd={} readable={} writable={}",
             binding.metadata.get("provider"),
@@ -700,6 +707,12 @@ class LocalEnvironmentFactory(EnvironmentFactory):
             binding.readable_paths,
             binding.writable_paths,
         )
+        shell_sandbox_policy = resolve_workspace_shell_sandbox_policy(
+            binding=binding,
+            defaults=self._shell_sandbox_defaults,
+            profile=profile,
+        )
+        binding.metadata["shell_sandbox"] = shell_sandbox_policy.to_metadata()
         return MappedLocalEnvironment(
             mounts=_virtual_mounts_from_binding(binding),
             host_cwd=_host_cwd_from_binding(binding),
@@ -707,6 +720,7 @@ class LocalEnvironmentFactory(EnvironmentFactory):
             tmp_base_dir=self._tmp_base_dir,
             read_only_virtual_paths=_read_only_paths_from_binding(binding),
             environment_overrides={**self._workspace_environment, **binding.environment_overrides},
+            shell_sandbox_policy=shell_sandbox_policy,
         )
 
 
@@ -740,7 +754,7 @@ class DockerEnvironmentFactory(EnvironmentFactory):
         self._retention_policy = retention_policy
         self._idle_ttl_seconds = idle_ttl_seconds
 
-    def build(self, binding: WorkspaceBinding) -> Environment:
+    def build(self, binding: WorkspaceBinding, *, profile: ResolvedProfile | None = None) -> Environment:
         sandbox_metadata = extract_workspace_sandbox_metadata(binding.metadata) or {}
         sandbox_metadata = {
             **sandbox_metadata,
@@ -839,11 +853,19 @@ class DefaultEnvironmentFactory(EnvironmentFactory):
         docker_exec_default_env: dict[str, str] | None = None,
         docker_retention_policy: str = "stop_on_idle",
         docker_idle_ttl_seconds: int = 3600,
+        shell_sandbox_enabled: bool = True,
+        shell_sandbox_backend: ShellSandboxBackend = "auto",
+        shell_sandbox_network: ShellSandboxNetwork = "full",
+        shell_sandbox_allow_raw_host: bool = False,
     ) -> None:
         self._local_factory = LocalEnvironmentFactory(
             shell_timeout=shell_timeout,
             tmp_base_dir=tmp_base_dir,
             workspace_environment=workspace_environment,
+            shell_sandbox_enabled=shell_sandbox_enabled,
+            shell_sandbox_backend=shell_sandbox_backend,
+            shell_sandbox_network=shell_sandbox_network,
+            shell_sandbox_allow_raw_host=shell_sandbox_allow_raw_host,
         )
         self._docker_factory = DockerEnvironmentFactory(
             image=docker_image,
@@ -860,7 +882,7 @@ class DefaultEnvironmentFactory(EnvironmentFactory):
             idle_ttl_seconds=docker_idle_ttl_seconds,
         )
 
-    def build(self, binding: WorkspaceBinding) -> Environment:
+    def build(self, binding: WorkspaceBinding, *, profile: ResolvedProfile | None = None) -> Environment:
         backend = (binding.backend_hint or "local").strip().lower()
         logger.debug(
             "Default environment factory selected backend={} provider={}",
@@ -868,8 +890,8 @@ class DefaultEnvironmentFactory(EnvironmentFactory):
             binding.metadata.get("provider"),
         )
         if backend == "docker":
-            return self._docker_factory.build(binding)
-        return self._local_factory.build(binding)
+            return self._docker_factory.build(binding, profile=profile)
+        return self._local_factory.build(binding, profile=profile)
 
 
 class LocalWorkspaceProvider(WorkspaceProvider):
@@ -877,10 +899,12 @@ class LocalWorkspaceProvider(WorkspaceProvider):
         self,
         workspace_dir: Path,
         *,
-        virtual_workspace_path: Path | None = None,
+        virtual_workspace_path: Path | VirtualPath | None = None,
     ) -> None:
         self._workspace_dir = workspace_dir.expanduser().resolve()
-        self._virtual_workspace_path = virtual_workspace_path or self._workspace_dir
+        self._virtual_workspace_path = normalize_agent_virtual_path(
+            virtual_workspace_path or _DEFAULT_VIRTUAL_WORKSPACE_PATH
+        )
 
     def resolve(self, metadata: dict[str, Any] | None = None) -> WorkspaceBinding:
         logger.debug(
@@ -909,7 +933,7 @@ class DockerWorkspaceProvider(WorkspaceProvider):
         *,
         image: str,
         docker_host_workspace_dir: Path | None = None,
-        virtual_workspace_path: Path = _DEFAULT_VIRTUAL_WORKSPACE_PATH,
+        virtual_workspace_path: Path | VirtualPath = _DEFAULT_VIRTUAL_WORKSPACE_PATH,
         extra_mounts: list[DockerExtraMount] | None = None,
         workspace_uid: int | None = None,
         workspace_gid: int | None = None,
@@ -921,7 +945,7 @@ class DockerWorkspaceProvider(WorkspaceProvider):
             else self._workspace_dir
         )
         self._image = image
-        self._virtual_workspace_path = virtual_workspace_path
+        self._virtual_workspace_path = normalize_agent_virtual_path(virtual_workspace_path)
         self._extra_mounts = list(extra_mounts or [])
         self._workspace_uid = workspace_uid
         self._workspace_gid = workspace_gid
@@ -983,7 +1007,7 @@ class DockerWorkspaceProvider(WorkspaceProvider):
 def _build_workspace_binding(
     *,
     workspace_dir: Path,
-    virtual_workspace_path: Path,
+    virtual_workspace_path: Path | VirtualPath,
     metadata: dict[str, Any],
     docker_host_workspace_dir: Path | None = None,
     provider: str,
@@ -1007,7 +1031,7 @@ def _build_workspace_binding(
         mount.host_path.mkdir(parents=True, exist_ok=True)
 
     default_mount = next(mount for mount in mounts if mount.id == workspace_spec.default_mount_id)
-    cwd = Path(workspace_spec.cwd or str(default_mount.virtual_path))
+    cwd = normalize_agent_virtual_path(workspace_spec.cwd or str(default_mount.virtual_path))
     readable_paths = [mount.virtual_path for mount in mounts]
     writable_paths = [mount.virtual_path for mount in mounts if mount.mode == "rw"]
     fingerprint_payload = workspace_fingerprint_payload(
@@ -1064,7 +1088,7 @@ def _workspace_spec_from_metadata_or_default(
     *,
     metadata: dict[str, Any],
     workspace_dir: Path,
-    virtual_workspace_path: Path,
+    virtual_workspace_path: Path | VirtualPath,
     docker_host_workspace_dir: Path | None,
 ) -> WorkspaceBindingSpec:
     workspace_payload = extract_workspace_metadata(metadata)
@@ -1098,7 +1122,7 @@ def _mount_bindings_from_spec(spec: WorkspaceBindingSpec) -> list[WorkspaceMount
                 docker_host_path=Path(mount.docker_host_path).expanduser().resolve()
                 if mount.docker_host_path is not None
                 else None,
-                virtual_path=Path(mount.virtual_path),
+                virtual_path=normalize_agent_virtual_path(mount.virtual_path),
                 mode=mount.mode,
                 metadata=dict(mount.metadata),
             )
@@ -1168,7 +1192,7 @@ def _docker_mount_modes_from_binding(binding: WorkspaceBinding) -> list[str]:
     return [mount.mode for mount in binding.mounts]
 
 
-def _read_only_paths_from_binding(binding: WorkspaceBinding) -> list[Path]:
+def _read_only_paths_from_binding(binding: WorkspaceBinding) -> list[VirtualPath]:
     return [mount.virtual_path for mount in binding.mounts if mount.mode == "ro"]
 
 
@@ -1179,7 +1203,7 @@ def _host_cwd_from_binding(binding: WorkspaceBinding) -> Path:
     raise ValueError(f"workspace cwd '{binding.cwd}' is outside declared mounts")
 
 
-def _virtual_path_for_host_cwd(mounts: list[VirtualMount], host_cwd: Path) -> Path:
+def _virtual_path_for_host_cwd(mounts: list[VirtualMount], host_cwd: Path) -> VirtualPath:
     resolved_host_cwd = host_cwd.expanduser().resolve()
     best_mount: VirtualMount | None = None
     best_depth = -1
@@ -1191,11 +1215,13 @@ def _virtual_path_for_host_cwd(mounts: list[VirtualMount], host_cwd: Path) -> Pa
             continue
         depth = len(mount_host.parts)
         if depth > best_depth:
-            best_mount = VirtualMount(mount.host_path, mount.virtual_path / relative_path)
+            best_mount = VirtualMount(
+                mount.host_path, normalize_agent_virtual_path(mount.virtual_path / relative_path.as_posix())
+            )
             best_depth = depth
     if best_mount is None:
         raise ValueError(f"workspace cwd host path '{host_cwd}' is outside declared mounts")
-    return best_mount.virtual_path
+    return normalize_agent_virtual_path(best_mount.virtual_path)
 
 
 def _resolve_docker_mount_host_path(mounts: list[VirtualMount], docker_host_paths: list[Path], index: int) -> Path:
