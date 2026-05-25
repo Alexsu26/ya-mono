@@ -9,18 +9,20 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Container
 from contextlib import AbstractAsyncContextManager, nullcontext
+from dataclasses import replace
 from inspect import isawaitable
 from typing import Annotated, Any, cast
 from uuid import uuid4
 
 from pydantic import Field
 from pydantic_ai import Agent, AgentRunResult, RunContext, UsageLimits
+from pydantic_ai.messages import BaseToolCallPart, ModelMessage, ModelResponse
 from pydantic_ai.models import Model
 
 from ya_agent_sdk.context import AgentContext, ModelConfig
-from ya_agent_sdk.events import SubagentCompleteEvent, SubagentStartEvent
+from ya_agent_sdk.events import SubagentCompleteEvent, SubagentStartEvent, UsageSnapshotEvent
 from ya_agent_sdk.toolsets.core.base import BaseTool
-from ya_agent_sdk.usage import InternalUsage
+from ya_agent_sdk.usage import coerce_run_usage
 
 # Type alias for instruction functions
 InstructionFunc = Callable[[RunContext[AgentContext]], str | None]
@@ -30,6 +32,7 @@ AvailabilityCheckFunc = Callable[[RunContext[AgentContext]], bool]
 
 # Type alias for BaseTool.call compatible function
 SubagentCallFunc = Callable[..., Awaitable[str]]
+InitialMessageHistoryFactory = Callable[[RunContext[AgentContext], str], list[ModelMessage] | None]
 
 
 def create_subagent_tool(
@@ -100,7 +103,7 @@ def create_subagent_tool(
                 return instruction(ctx)
             return instruction
 
-        async def call(self, ctx: RunContext[AgentContext], /, **kwargs: Any) -> str:
+        async def call(self, ctx: RunContext[AgentContext], /, **kwargs: object) -> str:
             # Placeholder - will be replaced by actual call_func
             raise NotImplementedError  # pragma: no cover
 
@@ -127,9 +130,14 @@ def _to_pascal_case(name: str) -> str:
 
 async def _run_subagent_iter(
     agent: Agent[AgentContext, Any],
+    parent_ctx: AgentContext,
     sub_ctx: AgentContext,
     prompt: str,
     message_history: list[Any] | None,
+    *,
+    model_id: str,
+    agent_name: str,
+    usage_id: str | None = None,
 ) -> AgentRunResult:
     """Run subagent iteration and stream events to subagent's queue.
 
@@ -145,6 +153,7 @@ async def _run_subagent_iter(
     Returns:
         AgentRunResult from the subagent execution.
     """
+    model_request_index = 0
     async with agent.iter(
         prompt,
         deps=sub_ctx,
@@ -159,6 +168,28 @@ async def _run_subagent_iter(
                 async with node.stream(run.ctx) as request_stream:
                     async for event in request_stream:
                         await sub_ctx.emit_event(event)
+                if Agent.is_model_request_node(node):
+                    parent_ctx.update_usage_snapshot_entry(
+                        ledger_key=sub_ctx.agent_id,
+                        agent_id=sub_ctx.agent_id,
+                        agent_name=agent_name,
+                        model_id=model_id,
+                        usage=coerce_run_usage(run.usage),
+                        usage_id=usage_id,
+                        source="subagent_model_request",
+                    )
+                    snapshot = parent_ctx.build_usage_snapshot()
+                    await parent_ctx.emit_event(
+                        UsageSnapshotEvent(
+                            event_id=(
+                                f"{snapshot.run_id}:usage_snapshot:{sub_ctx.agent_id}:"
+                                f"model_request_complete:{model_request_index}"
+                            ),
+                            snapshot=snapshot,
+                            source="model_request_complete",
+                        )
+                    )
+                    model_request_index += 1
 
     return cast(AgentRunResult, run.result)
 
@@ -188,6 +219,213 @@ def generate_unique_id(existing: Container[str], *, max_retries: int = 10) -> st
     raise RuntimeError(f"Failed to generate unique agent_id after {max_retries} retries")
 
 
+def _history_without_active_tool_call(
+    history: list[ModelMessage],
+    *,
+    tool_call_id: str | None,
+) -> list[ModelMessage]:
+    """Return history with the currently executing tool call removed.
+
+    Self forks start from the parent conversation state and append their own
+    prompt. When called from a tool execution, the active delegate tool call has
+    no returned result yet. Removing that one tool-call part keeps the fork
+    history valid and avoids showing the fork its own invocation.
+    """
+    if tool_call_id is None:
+        return list(history)
+
+    cleaned: list[ModelMessage] = []
+    for message in history:
+        if not isinstance(message, ModelResponse):
+            cleaned.append(message)
+            continue
+
+        parts = [
+            part
+            for part in message.parts
+            if not (isinstance(part, BaseToolCallPart) and part.tool_call_id == tool_call_id)
+        ]
+        if parts:
+            cleaned.append(replace(message, parts=parts))
+
+    return cleaned
+
+
+def _get_self_fork_history(ctx: RunContext[AgentContext], agent_id: str) -> list[ModelMessage] | None:
+    resumed_history = ctx.deps.subagent_history.get(agent_id)
+    if resumed_history is not None:
+        return resumed_history
+    return _history_without_active_tool_call(list(ctx.messages), tool_call_id=ctx.tool_call_id)
+
+
+def create_self_fork_call_func(
+    *,
+    model_cfg: ModelConfig | None = None,
+) -> SubagentCallFunc:
+    """Create a call function for delegate(subagent_name="self")."""
+    agent_name = "self"
+
+    async def call_func(
+        self: BaseTool,
+        ctx: RunContext[AgentContext],
+        prompt: Annotated[str, Field(description="The prompt to send to the fork")],
+        agent_id: Annotated[str | None, Field(description="Optional agent ID to resume")] = None,
+    ) -> str:
+        deps = ctx.deps
+        agent = deps.self_fork_agent
+        if agent is None:
+            return "Error: Self fork is not available in this runtime."
+        return await _call_agent_as_subagent(
+            agent,
+            agent_name,
+            self,
+            ctx,
+            prompt,
+            agent_id,
+            model_cfg=model_cfg,
+            initial_message_history_factory=_get_self_fork_history,
+        )
+
+    return call_func  # type: ignore[return-value]
+
+
+async def _call_agent_as_subagent(
+    agent: Agent[AgentContext, Any],
+    agent_name: str,
+    self: BaseTool,
+    ctx: RunContext[AgentContext],
+    prompt: str,
+    agent_id: str | None,
+    *,
+    model_cfg: ModelConfig | None = None,
+    initial_message_history_factory: InitialMessageHistoryFactory | None = None,
+) -> str:
+    """Execute an agent using the common subagent lifecycle and history model."""
+    deps = ctx.deps
+
+    # Generate stable agent_id if not provided
+    if not agent_id:
+        short_id = generate_unique_id(deps.subagent_history)
+        agent_id = f"{agent_name}-{short_id}"
+
+    # Track whether this is a new agent (not a resume) for cleanup on failure
+    is_new_agent = agent_id not in deps.agent_registry
+
+    # Create subagent context (handles registration in agent_registry)
+    override_kwargs: dict[str, Any] = {}
+    if model_cfg is not None:
+        override_kwargs["model_cfg"] = model_cfg
+
+    error_msg = ""
+    success = True
+    result_output = ""
+    request_count = 0
+
+    async with deps.create_subagent_context(agent_name, agent_id=agent_id, **override_kwargs) as sub_ctx:
+        # Set the subagent's initial prompt for compact
+        sub_ctx.user_prompts = prompt
+
+        # Emit start event to subagent's queue (inside context so sub_ctx.start_at is set)
+        prompt_preview = prompt[:100] + "..." if len(prompt) > 100 else prompt
+        await sub_ctx.emit_event(
+            SubagentStartEvent(
+                event_id=agent_id,  # Use agent_id as event_id to correlate Start/Complete
+                agent_id=agent_id,
+                agent_name=agent_name,
+                prompt_preview=prompt_preview,
+            )
+        )
+
+        # Wrap subagent execution with observability wrapper
+        subagent_ctx: AbstractAsyncContextManager[None] = nullcontext()
+        if deps.subagent_wrapper is not None:
+            wrapper_metadata = deps.get_wrapper_metadata()
+            subagent_ctx = deps.subagent_wrapper(agent_name, agent_id, wrapper_metadata)
+
+        # Save original model before entering wrapper so cleanup always works,
+        # even if subagent_wrapper.__aenter__ raises.
+        original_model = agent.model
+
+        try:
+            async with subagent_ctx:
+                # Apply model wrapper if configured
+                if deps.model_wrapper is not None:
+                    wrapper_metadata = deps.get_wrapper_metadata()
+                    wrapped = deps.model_wrapper(cast(Model, original_model), agent_name, wrapper_metadata)
+                    agent.model = await wrapped if isawaitable(wrapped) else wrapped
+
+                model_id = cast(Model, agent.model).model_name
+                usage_id = ctx.tool_call_id or uuid4().hex
+                message_history = (
+                    initial_message_history_factory(ctx, agent_id)
+                    if initial_message_history_factory is not None
+                    else deps.subagent_history.get(agent_id)
+                )
+                result = await _run_subagent_iter(
+                    agent,
+                    deps,
+                    sub_ctx,
+                    prompt,
+                    message_history,
+                    model_id=model_id,
+                    agent_name=agent_name,
+                    usage_id=usage_id,
+                )
+                result_output = result.output
+                result_usage = coerce_run_usage(result.usage)
+                request_count = result_usage.requests
+
+                # Store message history for future resume
+                deps.subagent_history[agent_id] = result.all_messages()
+
+                # Ensure final provider usage is reflected in the unified ledger.
+                deps.update_usage_snapshot_entry(
+                    ledger_key=agent_id,
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    model_id=model_id,
+                    usage=result_usage,
+                    usage_id=usage_id,
+                    source="subagent",
+                )
+
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            # Clean up agent_registry for new agents that failed before
+            # producing any history, to avoid ghost entries that show up
+            # in known-subagents and SubagentInfoTool with no history.
+            if is_new_agent and agent_id not in deps.subagent_history:
+                deps.agent_registry.pop(agent_id, None)
+            raise
+
+        finally:
+            # Restore original model to avoid side effects on shared agent
+            agent.model = original_model
+
+            # Emit complete event to subagent's queue (use sub_ctx.elapsed_time for duration)
+            elapsed = sub_ctx.elapsed_time
+            duration = elapsed.total_seconds() if elapsed else 0.0
+            result_preview = result_output[:500] + "..." if len(result_output) > 500 else result_output
+            await sub_ctx.emit_event(
+                SubagentCompleteEvent(
+                    event_id=agent_id,  # Same event_id as Start for correlation
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    success=success,
+                    request_count=request_count,
+                    result_preview=result_preview,
+                    error=error_msg,
+                    duration_seconds=duration,
+                )
+            )
+
+    # Return formatted result
+    return f"""<id>{agent_id}</id>
+<response>{result.output}</response>
+"""
+
+
 def create_subagent_call_func(
     agent: Agent[AgentContext, Any],
     *,
@@ -200,28 +438,8 @@ def create_subagent_call_func(
     - Generates stable agent_id in format {agent.name}-{short_id}
     - Registers the agent in parent's agent_registry
     - Manages subagent_history for conversation continuity
-    - Records usage in extra_usages
+    - Records usage in the unified usage ledger
     - Streams events to parent context
-
-    Args:
-        agent: A pydantic-ai Agent with AgentContext as deps type.
-        model_cfg: Optional ModelConfig to override in subagent context.
-                   If None, subagent inherits parent's model_cfg.
-
-    Returns:
-        A function compatible with BaseTool.call signature.
-
-    Example::
-
-        from pydantic_ai import Agent
-
-        search_agent: Agent[AgentContext, str] = Agent(...)
-
-        # Create the call function
-        search_call = create_subagent_call_func(search_agent)
-
-        # Pass to create_subagent_tool
-        SearchTool = create_subagent_tool("search", "Search the web", search_call)
     """
     agent_name = agent.name or "subagent"
 
@@ -231,110 +449,6 @@ def create_subagent_call_func(
         prompt: Annotated[str, Field(description="The prompt to send to the subagent")],
         agent_id: Annotated[str | None, Field(description="Optional agent ID to resume")] = None,
     ) -> str:
-        """Execute the agent with the given prompt."""
-        deps = ctx.deps
-
-        # Generate stable agent_id if not provided
-        if not agent_id:
-            short_id = generate_unique_id(deps.subagent_history)
-            agent_id = f"{agent_name}-{short_id}"
-
-        # Track whether this is a new agent (not a resume) for cleanup on failure
-        is_new_agent = agent_id not in deps.agent_registry
-
-        # Create subagent context (handles registration in agent_registry)
-        override_kwargs: dict[str, Any] = {}
-        if model_cfg is not None:
-            override_kwargs["model_cfg"] = model_cfg
-
-        error_msg = ""
-        success = True
-        result_output = ""
-        request_count = 0
-
-        async with deps.create_subagent_context(agent_name, agent_id=agent_id, **override_kwargs) as sub_ctx:
-            # Set the subagent's initial prompt for compact
-            sub_ctx.user_prompts = prompt
-
-            # Emit start event to subagent's queue (inside context so sub_ctx.start_at is set)
-            prompt_preview = prompt[:100] + "..." if len(prompt) > 100 else prompt
-            await sub_ctx.emit_event(
-                SubagentStartEvent(
-                    event_id=agent_id,  # Use agent_id as event_id to correlate Start/Complete
-                    agent_id=agent_id,
-                    agent_name=agent_name,
-                    prompt_preview=prompt_preview,
-                )
-            )
-
-            # Wrap subagent execution with observability wrapper
-            subagent_ctx: AbstractAsyncContextManager[None] = nullcontext()
-            if deps.subagent_wrapper is not None:
-                wrapper_metadata = deps.get_wrapper_metadata()
-                subagent_ctx = deps.subagent_wrapper(agent_name, agent_id, wrapper_metadata)
-
-            # Save original model before entering wrapper so cleanup always works,
-            # even if subagent_wrapper.__aenter__ raises.
-            original_model = agent.model
-
-            try:
-                async with subagent_ctx:
-                    # Apply model wrapper if configured
-                    if deps.model_wrapper is not None:
-                        wrapper_metadata = deps.get_wrapper_metadata()
-                        wrapped = deps.model_wrapper(cast(Model, original_model), agent_name, wrapper_metadata)
-                        agent.model = await wrapped if isawaitable(wrapped) else wrapped
-
-                    result = await _run_subagent_iter(agent, sub_ctx, prompt, deps.subagent_history.get(agent_id))
-                    result_output = result.output
-                    request_count = result.usage().requests
-
-                    # Store message history for future resume
-                    deps.subagent_history[agent_id] = result.all_messages()
-
-                    # Record usage in extra_usages
-                    if ctx.tool_call_id:
-                        model_id = cast(Model, agent.model).model_name
-                        deps.add_extra_usage(
-                            agent=agent_id,
-                            internal_usage=InternalUsage(model_id=model_id, usage=result.usage()),
-                            uuid=ctx.tool_call_id,
-                        )
-
-            except Exception as e:
-                success = False
-                error_msg = str(e)
-                # Clean up agent_registry for new agents that failed before
-                # producing any history, to avoid ghost entries that show up
-                # in known-subagents and SubagentInfoTool with no history.
-                if is_new_agent and agent_id not in deps.subagent_history:
-                    deps.agent_registry.pop(agent_id, None)
-                raise
-
-            finally:
-                # Restore original model to avoid side effects on shared agent
-                agent.model = original_model
-
-                # Emit complete event to subagent's queue (use sub_ctx.elapsed_time for duration)
-                elapsed = sub_ctx.elapsed_time
-                duration = elapsed.total_seconds() if elapsed else 0.0
-                result_preview = result_output[:500] + "..." if len(result_output) > 500 else result_output
-                await sub_ctx.emit_event(
-                    SubagentCompleteEvent(
-                        event_id=agent_id,  # Same event_id as Start for correlation
-                        agent_id=agent_id,
-                        agent_name=agent_name,
-                        success=success,
-                        request_count=request_count,
-                        result_preview=result_preview,
-                        error=error_msg,
-                        duration_seconds=duration,
-                    )
-                )
-
-        # Return formatted result
-        return f"""<id>{agent_id}</id>
-<response>{result.output}</response>
-"""
+        return await _call_agent_as_subagent(agent, agent_name, self, ctx, prompt, agent_id, model_cfg=model_cfg)
 
     return call_func  # type: ignore[return-value]
