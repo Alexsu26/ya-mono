@@ -166,18 +166,6 @@ async def test_local_tmp_file_operator_stat(tmp_path: Path) -> None:
     assert stat["mtime"] > 0
 
 
-async def test_local_tmp_file_operator_glob(tmp_path: Path) -> None:
-    """LocalTmpFileOperator should support glob patterns."""
-    op = LocalTmpFileOperator(tmp_path)
-
-    await op.write_file("a.txt", "a")
-    await op.write_file("b.txt", "b")
-    await op.write_file("c.py", "c")
-
-    txt_files = await op.glob("*.txt")
-    assert sorted(txt_files) == ["a.txt", "b.txt"]
-
-
 async def test_local_tmp_file_operator_truncate_to_tmp(tmp_path: Path) -> None:
     """LocalTmpFileOperator should truncate large content and save to tmp."""
     op = LocalTmpFileOperator(tmp_path)
@@ -386,6 +374,25 @@ async def test_local_tmp_operator_stream_default_chunk_size(tmp_path: Path) -> N
 # --- Cross-boundary streaming tests ---
 
 
+async def test_file_operator_read_bytes_stream_routes_tmp_without_awaiting_generator(tmp_path: Path) -> None:
+    """FileOperator should return tmp async streams without awaiting async generators."""
+    main_dir = tmp_path / "main"
+    tmp_dir = tmp_path / "tmp"
+    main_dir.mkdir()
+    tmp_dir.mkdir()
+    op = LocalFileOperator(main_dir, tmp_dir, default_chunk_size=4)
+    content = b"streamed tmp content"
+    await op._tmp_file_operator.write_file("source.bin", content)
+
+    stream = await op.read_bytes_stream(str(tmp_dir / "source.bin"), chunk_size=4)
+    chunks: list[bytes] = []
+    async for chunk in stream:
+        chunks.append(chunk)
+
+    assert b"".join(chunks) == content
+    assert len(chunks) > 1
+
+
 class LocalFileOperator(FileOperator):
     """A local filesystem FileOperator for testing cross-boundary operations."""
 
@@ -503,16 +510,6 @@ class LocalFileOperator(FileOperator):
             is_file=await anyio.Path(resolved).is_file(),
             is_dir=await anyio.Path(resolved).is_dir(),
         )
-
-    async def _glob_impl(self, pattern: str) -> list[str]:
-        matches = []
-        for p in self._default_path.glob(pattern):
-            try:
-                rel = p.relative_to(self._default_path)
-                matches.append(str(rel))
-            except ValueError:
-                matches.append(str(p))
-        return sorted(matches)
 
     # Override streaming for true streaming behavior
     async def _read_bytes_stream_impl(
@@ -743,9 +740,6 @@ class TmpOnlyFileOperator(FileOperator):
         raise RuntimeError("Should not be called in tmp-only mode")
 
     async def _stat_impl(self, path: str) -> FileStat:
-        raise RuntimeError("Should not be called in tmp-only mode")
-
-    async def _glob_impl(self, pattern: str) -> list[str]:
         raise RuntimeError("Should not be called in tmp-only mode")
 
 
