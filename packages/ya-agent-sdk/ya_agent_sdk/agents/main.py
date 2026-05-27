@@ -332,6 +332,13 @@ def _load_system_prompt(
     return jinja_template.render(**(template_vars or {}))
 
 
+def _agent_retry_kwargs(*, retries: int, output_retries: int) -> dict[str, Any]:
+    """Return Agent retry kwargs across pydantic-ai 1.x retry API variants."""
+    if "output_retries" in inspect.signature(Agent).parameters:
+        return {"retries": retries, "output_retries": output_retries}
+    return {"retries": {"tools": retries, "output": output_retries}}
+
+
 # =============================================================================
 # Agent Factory
 # =============================================================================
@@ -676,8 +683,7 @@ def create_agent(
                 *all_capabilities,
                 ProcessHistory(create_system_prompt_filter(system_prompt=effective_system_prompt)),
             ],
-            retries=retries,
-            output_retries=output_retries,
+            **_agent_retry_kwargs(retries=retries, output_retries=output_retries),
             defer_model_check=defer_model_check,
             end_strategy=end_strategy,  # type: ignore[arg-type]
             name=agent_name,

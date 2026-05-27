@@ -6,8 +6,8 @@ Layout:
                                           writes IN PLACE here so the response
                                           grows from the bottom of scrollback
     SteeringList           dock=bottom — hidden when empty
-    PromptArea             dock=bottom — multiline, grows up to 10 rows
-    FooterHint             dock=bottom
+    Input chrome           dock=bottom — StatusBar + multiline PromptArea +
+                                          FooterHint laid out as one stack
     ScrollIndicator        floating overlay — "↓ N new lines" pill that
                                               appears when the user scrolls up
                                               while history is arriving
@@ -961,6 +961,7 @@ class TextualSink:
             (i, entry)
             for i, entry in enumerate(self._history_entries)
             if i != skip_entry_index
+            and not (kind == "user" and entry.text.lstrip().startswith("/"))
             and (
                 entry.kind == kind or (kind == "error" and isinstance(entry.block, ToolCallBlock) and entry.block.error)
             )
@@ -1134,6 +1135,15 @@ class YaacliTextualApp(App[None]):
         overflow-y: auto;
         scrollbar-size-vertical: 1;
     }
+    #input_chrome {
+        dock: bottom;
+        height: auto;
+    }
+    #input_chrome > StatusBar,
+    #input_chrome > PromptArea,
+    #input_chrome > FooterHint {
+        dock: none;
+    }
     """
 
     BINDINGS: ClassVar = [
@@ -1277,13 +1287,14 @@ class YaacliTextualApp(App[None]):
         yield self._log
         yield self._tool_details
         yield self._scroll_indicator
-        yield self._footer
-        yield self._input
         yield self._mention_menu
         yield self._slash_menu
         yield self._steering
         yield self._live
-        yield self._status
+        with Vertical(id="input_chrome"):
+            yield self._status
+            yield self._input
+            yield self._footer
 
     def on_mount(self) -> None:
         # Apply chosen theme. Available themes were registered by Textual core.
@@ -1318,6 +1329,7 @@ class YaacliTextualApp(App[None]):
         # Only react to changes from our PromptArea, not e.g. a future
         # editor widget elsewhere.
         if event.text_area is self._input:
+            self._input.normalize_terminal_input()
             self._sync_completion_menu_offsets()
             token = self._active_path_mention_token()
             if token is not None:
@@ -1331,11 +1343,11 @@ class YaacliTextualApp(App[None]):
         self._sync_completion_menu_offsets()
 
     def _sync_completion_menu_offsets(self) -> None:
-        prompt_height = max(
-            3,
-            getattr(self._input.region, "height", 0) or self._input.size.height or 0,
-        )
-        offset = (0, -prompt_height)
+        prompt_height = getattr(self._input.region, "height", 0) or self._input.size.height or 0
+        status_height = getattr(self._status.region, "height", 0) or self._status.size.height or 0
+        footer_height = getattr(self._footer.region, "height", 0) or self._footer.size.height or 0
+        chrome_height = max(3, prompt_height) + max(1, status_height) + max(1, footer_height)
+        offset = (0, -chrome_height)
         self._mention_menu.styles.offset = offset
         self._slash_menu.styles.offset = offset
 

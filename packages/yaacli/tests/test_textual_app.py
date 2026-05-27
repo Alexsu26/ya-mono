@@ -2583,6 +2583,139 @@ async def test_status_bar_is_always_visible() -> None:
         assert status.size.width > 0
 
 
+@pytest.mark.asyncio
+async def test_multiline_prompt_expands_without_overlapping_status_or_footer() -> None:
+    """Regression: bottom dock widgets used to overlap the prompt's last row,
+    so the third and later input lines appeared swallowed by the footer/status.
+    """
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import FooterHint, PromptArea, StatusBar
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        prompt = app.query_one(PromptArea)
+        status = app.query_one(StatusBar)
+        footer = app.query_one(FooterHint)
+        prompt.focus()
+
+        for key in (
+            "o",
+            "n",
+            "e",
+            "shift+enter",
+            "t",
+            "w",
+            "o",
+            "shift+enter",
+            "t",
+            "h",
+            "r",
+            "e",
+            "e",
+            "shift+enter",
+            "f",
+            "o",
+            "u",
+            "r",
+            "shift+enter",
+            "f",
+            "i",
+            "v",
+            "e",
+        ):
+            await pilot.press(key)
+        await pilot.pause()
+
+        assert prompt.text == "one\ntwo\nthree\nfour\nfive"
+        assert prompt.region.height >= 5
+        assert status.region.y + status.region.height <= prompt.region.y
+        assert prompt.region.y + prompt.region.height <= footer.region.y
+
+
+@pytest.mark.asyncio
+async def test_prompt_area_decodes_terminal_associated_text_sequences() -> None:
+    """Regression: some terminals send IME commits as CSI-u associated text."""
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import PromptArea
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        prompt = app.query_one(PromptArea)
+        prompt.focus()
+
+        for character in "[32;;20013:25991u":
+            prompt.insert(character)
+            await pilot.pause()
+
+        assert prompt.text == "中文"
+
+
+@pytest.mark.asyncio
+async def test_prompt_area_buffers_terminal_associated_text_keys_before_insert() -> None:
+    """Raw CSI-u fragments must not become visible while the sequence arrives."""
+    from textual.events import Key
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import PromptArea
+
+    def key_for(character: str) -> Key:
+        key_names = {"^": "circumflex_accent", "[": "left_square_bracket", ";": "semicolon", ":": "colon"}
+        return Key(key_names.get(character, character), character)
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        prompt = app.query_one(PromptArea)
+        prompt.focus()
+
+        for character in "^[32;;20013:25991u":
+            await prompt._on_key(key_for(character))
+            assert "[32;;" not in prompt.text
+            assert "^" not in prompt.text
+
+        assert prompt.text == "中文"
+
+
+@pytest.mark.asyncio
+async def test_prompt_area_flushes_literal_terminal_sequence_prefixes() -> None:
+    from textual.events import Key
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import PromptArea
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        prompt = app.query_one(PromptArea)
+        prompt.focus()
+
+        await prompt._on_key(Key("left_square_bracket", "["))
+        assert prompt.text == ""
+        await pilot.pause(0.2)
+
+        assert prompt.text == "["
+
+
 def test_console_session_handles_tool_call_part_start_before_result() -> None:
     """Some SDK/model streams expose a ToolCallPart start before the result event."""
     from pydantic_ai.messages import PartStartEvent, ToolCallPart

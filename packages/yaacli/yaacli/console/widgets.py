@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -34,6 +35,64 @@ _IGNORED_PATH_NAMES = {
 }
 
 
+_TERMINAL_ASSOCIATED_TEXT_RE = re.compile(r"(?:\^)?(?:\x1b)?\[\d+;;((?:\d+:)*\d+)u")
+_TERMINAL_ASSOCIATED_TEXT_EXACT_RE = re.compile(r"^(?:\^)?(?:\x1b)?\[\d+;;((?:\d+:)*\d+)u$")
+_TERMINAL_ASSOCIATED_TEXT_FLUSH_DELAY = 0.12
+
+
+def decode_terminal_associated_text(text: str) -> str:
+    """Decode terminal CSI-u associated text payloads into Unicode text."""
+
+    def replace_match(match: re.Match[str]) -> str:
+        chars: list[str] = []
+        for raw_codepoint in match.group(1).split(":"):
+            try:
+                codepoint = int(raw_codepoint, 10)
+            except ValueError:
+                return match.group(0)
+            if not 0 <= codepoint <= 0x10FFFF:
+                return match.group(0)
+            chars.append(chr(codepoint))
+        return "".join(chars)
+
+    return _TERMINAL_ASSOCIATED_TEXT_RE.sub(replace_match, text)
+
+
+def _is_terminal_associated_text_prefix(text: str) -> bool:
+    if text == "^":
+        return True
+    if text.startswith("^"):
+        text = text[1:]
+    if not text.startswith("["):
+        return False
+    body = text[1:]
+    if not body:
+        return True
+
+    digit_count = 0
+    while digit_count < len(body) and body[digit_count].isdigit():
+        digit_count += 1
+    if digit_count == 0:
+        return False
+    rest = body[digit_count:]
+    if not rest:
+        return True
+    if rest == ";":
+        return True
+    if not rest.startswith(";;"):
+        return False
+
+    payload = rest[2:]
+    if not payload:
+        return True
+    if payload.endswith("u"):
+        return _TERMINAL_ASSOCIATED_TEXT_EXACT_RE.fullmatch(f"[0;;{payload}") is not None
+    if "u" in payload:
+        return False
+    parts = payload.split(":")
+    return all(part.isdigit() for part in parts[:-1]) and (parts[-1] == "" or parts[-1].isdigit())
+
+
 @dataclass(frozen=True)
 class PathMentionItem:
     """One file or directory candidate for ``@path`` completion."""
@@ -56,7 +115,7 @@ class SlashArgumentItem:
     completion_only: bool = True
 
 
-def _render_themed(renderable: object, *, width: int = 200) -> Segments:
+def _render_themed(renderable: RenderableType, *, width: int = 200) -> Segments:
     """Resolve theme styles by rendering through a private Rich Console.
 
     Textual's ``Static.update()`` parses style names as colors, which breaks
@@ -951,16 +1010,78 @@ class PromptArea(TextArea):
             compact=True,
             placeholder=("Message… Enter sends · Shift+Enter newline · / commands · @ files"),
         )
+        self._terminal_associated_text_buffer = ""
 
     def on_mount(self) -> None:
         # No placeholder API on TextArea, so we leave it blank;
         # ``HeaderBar`` already gives the user a visible greeting.
         self.show_vertical_scrollbar = False
 
+    def normalize_terminal_input(self) -> bool:
+        """Return True when raw terminal protocol text was normalized."""
+        normalized = decode_terminal_associated_text(self.text)
+        if normalized == self.text:
+            return False
+        self.text = normalized
+        lines = normalized.split("\n")
+        self.move_cursor((len(lines) - 1, len(lines[-1])), select=False)
+        return True
+
+    def _arm_terminal_associated_text_flush(self) -> None:
+        expected = self._terminal_associated_text_buffer
+        self.set_timer(
+            _TERMINAL_ASSOCIATED_TEXT_FLUSH_DELAY,
+            lambda: self._flush_terminal_associated_text_buffer(expected),
+        )
+
+    def _flush_terminal_associated_text_buffer(self, expected: str | None = None) -> None:
+        if expected is not None and self._terminal_associated_text_buffer != expected:
+            return
+        buffered = self._terminal_associated_text_buffer
+        self._terminal_associated_text_buffer = ""
+        if buffered:
+            self.insert(buffered)
+
+    def _consume_terminal_associated_text_key(self, event: Any) -> bool:
+        character = getattr(event, "character", None)
+        if not isinstance(character, str) or len(character) != 1:
+            self._flush_terminal_associated_text_buffer()
+            return False
+
+        if self._terminal_associated_text_buffer:
+            candidate = self._terminal_associated_text_buffer + character
+            if _is_terminal_associated_text_prefix(candidate):
+                event.stop()
+                event.prevent_default()
+                self._terminal_associated_text_buffer = candidate
+                if _TERMINAL_ASSOCIATED_TEXT_EXACT_RE.fullmatch(candidate):
+                    self._terminal_associated_text_buffer = ""
+                    self.insert(decode_terminal_associated_text(candidate))
+                else:
+                    self._arm_terminal_associated_text_flush()
+                return True
+
+            buffered = self._terminal_associated_text_buffer
+            self._terminal_associated_text_buffer = ""
+            self.insert(buffered + character)
+            event.stop()
+            event.prevent_default()
+            return True
+
+        if character in {"[", "^"}:
+            event.stop()
+            event.prevent_default()
+            self._terminal_associated_text_buffer = character
+            self._arm_terminal_associated_text_flush()
+            return True
+        return False
+
     def action_newline(self) -> None:
         self.insert("\n")
 
     async def _on_key(self, event: Any) -> None:  # type: ignore[override]
+        if self._consume_terminal_associated_text_key(event):
+            return
         # Intercept plain Enter as submit; TextArea normally inserts newline.
         if event.key == "enter":
             value = self.text

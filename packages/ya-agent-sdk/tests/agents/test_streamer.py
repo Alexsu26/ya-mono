@@ -24,6 +24,39 @@ def test_has_tool_call_parts_matches_tool_call_parts() -> None:
     assert _has_tool_call_parts(builtin_tool_response.parts) is True
 
 
+def test_agent_retry_kwargs_uses_legacy_output_retries_when_supported(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ya_agent_sdk.agents import main
+
+    class LegacyAgent:
+        def __init__(self, *, retries: int = 1, output_retries: int | None = None) -> None:
+            pass
+
+    monkeypatch.setattr(main, "Agent", LegacyAgent)
+
+    assert main._agent_retry_kwargs(retries=2, output_retries=5) == {
+        "retries": 2,
+        "output_retries": 5,
+    }
+
+
+def test_agent_retry_kwargs_uses_split_retry_budget_when_output_retries_is_deprecated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import Any
+
+    from ya_agent_sdk.agents import main
+
+    class SplitRetryAgent:
+        def __init__(self, *, retries: Any = None, **_deprecated_kwargs: Any) -> None:
+            pass
+
+    monkeypatch.setattr(main, "Agent", SplitRetryAgent)
+
+    assert main._agent_retry_kwargs(retries=2, output_retries=5) == {
+        "retries": {"tools": 2, "output": 5},
+    }
+
+
 def _make_streamer(
     events: list[StreamEvent] | None = None,
     main_task_exc: BaseException | None = None,

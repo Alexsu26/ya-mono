@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 from pydantic_ai import DeferredToolRequests
-
 from yaacli.cli import cli
 from yaacli.config import GeneralConfig, YaacliConfig
 
