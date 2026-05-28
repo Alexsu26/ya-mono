@@ -1866,12 +1866,12 @@ class AgentContext(BaseModel):
     def extra_usages(self) -> list[ExtraUsageRecord]:
         """Backward-compatible view over the unified usage ledger."""
         return [
-                ExtraUsageRecord(
-                    uuid=entry.usage_id or key,
-                    agent=entry.agent_id,
-                    model_id=entry.model_id,
-                    usage=entry.usage,
-                )
+            ExtraUsageRecord(
+                uuid=entry.usage_id or key,
+                agent=entry.agent_id,
+                model_id=entry.model_id,
+                usage=entry.usage,
+            )
             for key, entry in self.usage_snapshot_entries.items()
         ]
 

@@ -109,6 +109,7 @@ ignore = [
 "packages/ya-agent-sdk/tests/*" = ["S101", "S603", "S607", "SIM117", "RUF059", "TRY400", "B904"]
 "packages/ya-oauth/tests/*" = ["S101", "S603", "S607", "SIM117", "RUF059", "TRY400", "B904"]
 "packages/ya-oauth-provider/tests/*" = ["S101", "S603", "S607", "SIM117", "RUF059", "TRY400", "B904"]
+"packages/ya-ripgrep-core/tests/*" = ["S101", "S603", "S607", "SIM117", "RUF059", "TRY400", "B904"]
 "packages/ya-claw/tests/*" = ["S101", "SIM117", "RUF059", "TRY400", "B904"]
 "packages/yaacli/yaacli/skills/**/*.py" = ["E402"]
 "skills/examples/*" = ["S101", "SIM117", "RUF059", "TRY400", "B904", "E402"]
