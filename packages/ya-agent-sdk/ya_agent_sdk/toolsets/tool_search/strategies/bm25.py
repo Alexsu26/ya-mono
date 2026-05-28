@@ -6,6 +6,7 @@ Uses rank-bm25 to rank tool metadata with a lightweight lexical retrieval model.
 from __future__ import annotations
 
 import re
+from importlib import import_module
 from typing import Any
 
 from ya_agent_sdk._logger import get_logger
@@ -65,11 +66,11 @@ class BM25SearchStrategy:
     def _import_bm25() -> Any:
         """Import rank-bm25 with an actionable error message."""
         try:
-            from rank_bm25 import BM25Okapi
+            module = import_module("rank_bm25")
         except ImportError:
             msg = "rank-bm25 is required for BM25SearchStrategy. Install it with: pip install ya-agent-sdk[tool-search]"
             raise ImportError(msg) from None
-        return BM25Okapi
+        return module.BM25Okapi
 
     async def build_index(self, tools: list[ToolMetadata]) -> None:
         """Build a BM25 index from tool metadata."""
