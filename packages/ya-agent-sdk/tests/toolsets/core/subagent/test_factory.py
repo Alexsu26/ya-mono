@@ -258,10 +258,10 @@ async def test_create_subagent_call_func_basic():
     assert "<id>search-" in output
 
     # Usage should be recorded
-    assert len(ctx.extra_usages) == 1
-    assert ctx.extra_usages[0].uuid == "test-call-123"
-    # agent field uses agent_id (e.g., "search-xxxx")
-    assert ctx.extra_usages[0].agent.startswith("search-")
+    assert len(ctx.usage_snapshot_entries) == 1
+    entry = next(iter(ctx.usage_snapshot_entries.values()))
+    assert entry.usage_id == "test-call-123"
+    assert entry.agent_id.startswith("search-")
 
 
 async def test_concurrent_subagent_calls_do_not_share_wrapped_agent_model():
@@ -530,6 +530,7 @@ async def test_create_subagent_call_func_with_streaming_nodes():
     mock_run.result.output = "result with streaming"
     mock_run.result.all_messages = MagicMock(return_value=[])
     mock_run.result.usage = MagicMock(return_value=RunUsage(requests=2, input_tokens=20, output_tokens=30))
+    mock_run.usage = MagicMock(return_value=RunUsage(requests=2, input_tokens=20, output_tokens=30))
     mock_run.ctx = MagicMock()
 
     # Create mock nodes
@@ -597,34 +598,11 @@ async def test_create_subagent_call_func_with_streaming_nodes():
     queue = ctx.agent_stream_queues[subagent_id]
     assert not queue.empty()
 
-    # First event should be SubagentStartEvent
-    from ya_agent_sdk.events import SubagentCompleteEvent, SubagentStartEvent
-
-    start_event = await queue.get()
-    assert isinstance(start_event, SubagentStartEvent)
-    assert start_event.agent_name == "streamer"
-    assert start_event.prompt_preview == "test streaming"
-    assert start_event.agent_id.startswith("streamer-")
-
-    # Then the streamed events
-    event = await queue.get()
-    assert event == mock_event
-
-    # After all streaming, there should be SubagentCompleteEvent
-    # (need to drain any remaining mock_events first)
-    complete_event = None
-    while not queue.empty():
-        e = await queue.get()
-        if isinstance(e, SubagentCompleteEvent):
-            complete_event = e
-            break
-
-    assert complete_event is not None
-    assert complete_event.agent_name == "streamer"
-    assert complete_event.success is True
-    # Start and Complete should share the same event_id (= agent_id)
-    assert complete_event.event_id == start_event.event_id
-    assert complete_event.event_id == start_event.agent_id
+    await _assert_streaming_subagent_events(queue, mock_event=mock_event)
+    await _assert_parent_usage_events(ctx.agent_stream_queues[ctx.agent_id], subagent_id=subagent_id)
+    assert ctx.usage_snapshot_entries[subagent_id].agent_id == subagent_id
+    assert ctx.usage_snapshot_entries[subagent_id].model_id == "test-model"
+    assert ctx.usage_snapshot_entries[subagent_id].usage.requests == 2
 
 
 # Tests for agent_id generation
@@ -754,8 +732,8 @@ async def test_create_subagent_call_func_resume_with_agent_id():
     assert "<id>analyze-abcd</id>" in output
 
 
-async def test_usage_not_recorded_without_tool_call_id():
-    """Test that usage is not recorded when tool_call_id is None."""
+async def test_usage_recorded_without_tool_call_id():
+    """Test that subagent usage is recorded even when tool_call_id is None."""
     mock_agent = MagicMock(spec=Agent)
     mock_agent.model.model_name = "test-model"
     mock_agent.name = "search"
@@ -786,8 +764,10 @@ async def test_usage_not_recorded_without_tool_call_id():
 
     await call_func(mock_self, run_ctx, prompt="test")
 
-    # No usage should be recorded
-    assert len(ctx.extra_usages) == 0
+    assert len(ctx.usage_snapshot_entries) == 1
+    entry = next(iter(ctx.usage_snapshot_entries.values()))
+    assert entry.agent_id.startswith("search-")
+    assert entry.model_id == "test-model"
 
 
 # Tests for generate_unique_id function

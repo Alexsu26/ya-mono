@@ -24,12 +24,16 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ToolCallPart,
-    ToolSearchCallPart,
 )
 from pydantic_ai.tools import RunContext
 
 from ya_agent_sdk._logger import logger
 from ya_agent_sdk.context import AgentContext
+
+try:
+    from pydantic_ai.messages import ToolSearchCallPart
+except ImportError:  # pragma: no cover - depends on pydantic-ai version
+    from pydantic_ai.messages import BuiltinToolCallPart as ToolSearchCallPart
 
 
 async def fix_truncated_tool_args(

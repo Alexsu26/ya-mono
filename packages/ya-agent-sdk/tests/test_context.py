@@ -1248,12 +1248,12 @@ def test_tool_id_wrapper_wrap_event_function_tool_result() -> None:
 
     wrapper = ToolIdWrapper()
     result_part = ToolReturnPart(tool_name="test_tool", tool_call_id="original-id", content="result")
-    event = FunctionToolResultEvent(part=result_part)
+    event = FunctionToolResultEvent(result=result_part)
 
     result = wrapper.wrap_event(event)
 
     assert result.tool_call_id.startswith("ya-")
-    assert result.part.tool_call_id.startswith("ya-")
+    assert result.result.tool_call_id.startswith("ya-")
 
 
 def test_tool_id_wrapper_wrap_event_part_start() -> None:
@@ -1412,7 +1412,7 @@ def test_tool_id_wrapper_consistency_across_methods() -> None:
 
     # Wrap via result event - should use same normalized ID
     result_part = ToolReturnPart(tool_name="test", tool_call_id=original_id, content="done")
-    result_event = FunctionToolResultEvent(part=result_part)
+    result_event = FunctionToolResultEvent(result=result_part)
     wrapper.wrap_event(result_event)
 
     # Wrap via messages - should use same normalized ID
@@ -1421,7 +1421,7 @@ def test_tool_id_wrapper_consistency_across_methods() -> None:
     wrapper.wrap_messages(mock_ctx, messages)
 
     # All should have same normalized ID
-    assert call_event.part.tool_call_id == result_event.part.tool_call_id
+    assert call_event.part.tool_call_id == result_event.result.tool_call_id
     assert call_event.part.tool_call_id == messages[0].parts[0].tool_call_id
 
 

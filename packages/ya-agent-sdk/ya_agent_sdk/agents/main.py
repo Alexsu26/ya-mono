@@ -667,7 +667,7 @@ def create_agent(
                     *cast(list[AbstractCapability[Any]], all_capabilities),
                     ProcessHistory(create_system_prompt_filter(system_prompt=effective_system_prompt)),
                 ],
-                tool_retries=retries,
+                retries=retries,
                 output_retries=output_retries,
                 defer_model_check=defer_model_check,
                 end_strategy=end_strategy,  # type: ignore[arg-type]
@@ -691,7 +691,7 @@ def create_agent(
                 *all_capabilities,
                 ProcessHistory(create_system_prompt_filter(system_prompt=effective_system_prompt)),
             ],
-            tool_retries=retries,
+            retries=retries,
             output_retries=output_retries,
             defer_model_check=defer_model_check,
             end_strategy=end_strategy,  # type: ignore[arg-type]
