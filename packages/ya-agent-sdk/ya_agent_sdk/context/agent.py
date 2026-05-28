@@ -103,11 +103,18 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from ya_agent_environment import Environment, FileOperator, ResourceRegistry, Shell
+from y_agent_environment import Environment, FileOperator, ResourceRegistry, Shell
 
 from ya_agent_sdk.agents.lifecycle import LifecycleExtension
 from ya_agent_sdk.events import AgentEvent, UsageSnapshotEvent
-from ya_agent_sdk.usage import UsageAgentTotal, UsageSnapshot, UsageSnapshotEntry, coerce_run_usage
+from ya_agent_sdk.usage import (
+    ExtraUsageRecord,
+    InternalUsage,
+    UsageAgentTotal,
+    UsageSnapshot,
+    UsageSnapshotEntry,
+    coerce_run_usage,
+)
 from ya_agent_sdk.utils import get_latest_request_usage
 
 from .bus import BusMessage, MessageBus
@@ -1851,6 +1858,31 @@ class AgentContext(BaseModel):
                 snapshot=snapshot,
                 source=source,
             )
+        )
+
+    @property
+    def extra_usages(self) -> list[ExtraUsageRecord]:
+        """Backward-compatible view over the unified usage ledger."""
+        return [
+            ExtraUsageRecord(
+                uuid=entry.usage_id or key,
+                agent=entry.agent_name,
+                model_id=entry.model_id,
+                usage=entry.usage,
+            )
+            for key, entry in self.usage_snapshot_entries.items()
+        ]
+
+    def add_extra_usage(self, *, agent: str, internal_usage: InternalUsage, uuid: str) -> None:
+        """Backward-compatible helper that writes into the unified usage ledger."""
+        self.update_usage_snapshot_entry(
+            ledger_key=uuid,
+            agent_id=agent,
+            agent_name=agent,
+            model_id=internal_usage.model_id,
+            usage=internal_usage.usage,
+            usage_id=uuid,
+            source=agent,
         )
 
     async def emit_usage_snapshot(

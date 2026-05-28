@@ -90,3 +90,19 @@ class UsageSnapshot(BaseModel):
 
     model_usages: dict[str, RunUsage] = Field(default_factory=dict)
     """Cumulative usage grouped by model identifier."""
+
+
+class InternalUsage(BaseModel):
+    """Backward-compatible usage record for internal model calls."""
+
+    model_id: str
+    usage: RunUsage
+
+
+class ExtraUsageRecord(BaseModel):
+    """Backward-compatible projection of a usage ledger entry."""
+
+    uuid: str
+    agent: str
+    model_id: str
+    usage: RunUsage

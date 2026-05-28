@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from pydantic_ai import DeferredToolResults
     from pydantic_ai.messages import UserContent
 
+    from ya_agent_sdk.usage import UsageSnapshot
+
 
 @dataclass
 class AgentEvent:
@@ -170,6 +172,19 @@ class SubagentCompleteEvent(AgentEvent):
     result_preview: str = ""
     error: str = ""
     duration_seconds: float = 0.0
+
+
+# =============================================================================
+# Usage Events
+# =============================================================================
+
+
+@dataclass
+class UsageSnapshotEvent(AgentEvent):
+    """Emitted after model requests when cumulative run usage is available."""
+
+    snapshot: UsageSnapshot | None = None
+    source: str = "model_request_complete"
 
 
 # =============================================================================
