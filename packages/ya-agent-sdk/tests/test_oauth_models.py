@@ -6,6 +6,7 @@ import types
 import pytest
 from ya_agent_sdk.agents.main import create_agent
 from ya_agent_sdk.agents.models import infer_model
+from ya_agent_sdk.agents.models import utils as model_utils
 from ya_agent_sdk.context import AgentContext, ModelConfig
 
 
@@ -78,3 +79,15 @@ def test_create_agent_passes_codex_headers_only_to_oauth_codex(
 def test_infer_oauth_model_rejects_invalid_string() -> None:
     with pytest.raises(ValueError, match="oauth@provider:model"):
         infer_model("oauth@codex")
+
+
+async def test_model_http_client_uses_httpx_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+
+    def fail_if_custom_retry_transport_is_used(*args: object, **kwargs: object) -> None:
+        raise AssertionError("proxy environments should use httpx default transport")
+
+    monkeypatch.setattr(model_utils, "AsyncTenacityTransport", fail_if_custom_retry_transport_is_used)
+
+    client = model_utils.create_async_http_client()
+    await client.aclose()

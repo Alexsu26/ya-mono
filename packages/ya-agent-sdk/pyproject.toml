@@ -28,6 +28,7 @@ dependencies = [
     "pydantic-ai-slim>=1.88",
     "pydantic-settings>=2.0.0",
     "pyyaml>=6.0.0",
+    "socksio>=1.0.0",
     "tenacity>=9.0.0",
     "typing-extensions>=4.15.0",
 ]

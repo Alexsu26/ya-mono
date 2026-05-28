@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -15,6 +16,8 @@ from ya_oauth.codex import CODEX_BASE_URL, create_codex_token_source
 from ya_oauth.types import OAuthTokenSource
 
 from ya_oauth_provider.http import OAuthBearerAuth
+
+_PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 
 
 def infer_oauth_model(provider_name: str, model_name: str, *, extra_headers: dict[str, str] | None = None) -> Model:
@@ -38,19 +41,21 @@ def build_codex_model(
     from tenacity import retry_if_exception_type, stop_after_attempt, wait_exponential
 
     source = token_source or create_codex_token_source()
-    http_client = httpx.AsyncClient(
-        auth=OAuthBearerAuth(source, provider_name="codex", extra_headers=extra_headers),
-        headers={"User-Agent": get_user_agent()},
-        timeout=httpx.Timeout(timeout=900, connect=5, read=300),
-        transport=AsyncTenacityTransport(
+    client_kwargs: dict[str, Any] = {
+        "auth": OAuthBearerAuth(source, provider_name="codex", extra_headers=extra_headers),
+        "headers": {"User-Agent": get_user_agent()},
+        "timeout": httpx.Timeout(timeout=900, connect=5, read=300),
+    }
+    if not _has_proxy_env():
+        client_kwargs["transport"] = AsyncTenacityTransport(
             config=RetryConfig(
                 retry=retry_if_exception_type((httpx.HTTPError, httpx.StreamError)),
                 wait=wait_exponential(multiplier=1, max=10),
                 stop=stop_after_attempt(10),
                 reraise=True,
             )
-        ),
-    )
+        )
+    http_client = httpx.AsyncClient(**client_kwargs)
     provider = OpenAIProvider(api_key="oauth-managed", base_url=base_url, http_client=http_client)
     return CodexResponsesModel(model_name, provider=provider, profile=_codex_profile())
 
@@ -105,3 +110,7 @@ def build_session_headers(session_id: str | None, thread_id: str | None) -> dict
         headers["thread-id"] = thread_id
         headers["x-client-request-id"] = thread_id
     return headers
+
+
+def _has_proxy_env() -> bool:
+    return any(os.environ.get(name) for name in _PROXY_ENV_VARS)

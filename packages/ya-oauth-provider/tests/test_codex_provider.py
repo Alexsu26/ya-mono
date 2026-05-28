@@ -4,6 +4,7 @@ import json
 
 import anyio
 import httpx
+import pydantic_ai.retries
 import pytest
 from pydantic_ai.exceptions import UserError
 from ya_oauth.types import OAuthAccount, TokenSnapshot
@@ -78,6 +79,17 @@ def test_build_codex_model_requires_streaming_for_non_stream_request() -> None:
     assert isinstance(model, CodexResponsesModel)
     with pytest.raises(UserError, match="requires streaming"):
         anyio.run(model.request, [], None, None)  # type: ignore[arg-type]
+
+
+def test_build_codex_model_uses_httpx_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+
+    def fail_if_custom_retry_transport_is_used(*args: object, **kwargs: object) -> None:
+        raise AssertionError("proxy environments should use httpx default transport")
+
+    monkeypatch.setattr(pydantic_ai.retries, "AsyncTenacityTransport", fail_if_custom_retry_transport_is_used)
+
+    assert isinstance(build_codex_model("gpt-5.5", token_source=FakeTokenSource()), CodexResponsesModel)
 
 
 @pytest.mark.asyncio
