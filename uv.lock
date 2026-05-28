@@ -20,6 +20,7 @@ members = [
     "ya-mono",
     "ya-oauth",
     "ya-oauth-provider",
+    "ya-ripgrep-core",
     "yaacli",
 ]
 
@@ -4408,6 +4409,12 @@ examples = [
 oauth = [
     { name = "ya-oauth-provider" },
 ]
+ripgrep = [
+    { name = "ya-ripgrep-core" },
+]
+rs = [
+    { name = "ya-ripgrep-core" },
+]
 s3 = [
     { name = "boto3" },
 ]
@@ -4486,8 +4493,10 @@ requires-dist = [
     { name = "y-agent-environment", specifier = "==0.9.0" },
     { name = "ya-oauth-provider", marker = "extra == 'all'", editable = "packages/ya-oauth-provider" },
     { name = "ya-oauth-provider", marker = "extra == 'oauth'", editable = "packages/ya-oauth-provider" },
+    { name = "ya-ripgrep-core", marker = "extra == 'ripgrep'", editable = "packages/ya-ripgrep-core" },
+    { name = "ya-ripgrep-core", marker = "extra == 'rs'", editable = "packages/ya-ripgrep-core" },
 ]
-provides-extras = ["all", "docker", "document", "examples", "oauth", "s3", "tool-search", "web"]
+provides-extras = ["all", "docker", "document", "examples", "oauth", "ripgrep", "rs", "s3", "tool-search", "web"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -4652,6 +4661,20 @@ dev = [
 ]
 
 [[package]]
+name = "ya-ripgrep-core"
+source = { editable = "packages/ya-ripgrep-core" }
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=7.2.0" }]
+
+[[package]]
 name = "yaacli"
 source = { editable = "packages/yaacli" }
 dependencies = [
@@ -4669,6 +4692,11 @@ dependencies = [
     { name = "ya-oauth-provider" },
 ]
 
+[package.optional-dependencies]
+rs = [
+    { name = "ya-agent-sdk", extra = ["all", "rs"] },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.0" },
@@ -4681,9 +4709,11 @@ requires-dist = [
     { name = "textual", specifier = ">=0.87" },
     { name = "y-agent-environment", specifier = ">=0.1.0" },
     { name = "ya-agent-sdk", extras = ["all"], editable = "packages/ya-agent-sdk" },
+    { name = "ya-agent-sdk", extras = ["all", "rs"], marker = "extra == 'rs'", editable = "packages/ya-agent-sdk" },
     { name = "ya-oauth", editable = "packages/ya-oauth" },
     { name = "ya-oauth-provider", editable = "packages/ya-oauth-provider" },
 ]
+provides-extras = ["rs"]
 
 [[package]]
 name = "yarl"
