@@ -19,7 +19,9 @@ Example::
 """
 
 import json
+from typing import Any
 
+import pydantic_ai.messages as pydantic_messages
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -30,10 +32,11 @@ from pydantic_ai.tools import RunContext
 from ya_agent_sdk._logger import logger
 from ya_agent_sdk.context import AgentContext
 
-try:
-    from pydantic_ai.messages import ToolSearchCallPart
-except ImportError:  # pragma: no cover - depends on pydantic-ai version
-    from pydantic_ai.messages import BuiltinToolCallPart as ToolSearchCallPart
+ToolSearchCallPart: type[Any] = getattr(
+    pydantic_messages,
+    "ToolSearchCallPart",
+    pydantic_messages.BuiltinToolCallPart,
+)
 
 
 async def fix_truncated_tool_args(

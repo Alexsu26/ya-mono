@@ -37,12 +37,14 @@ def create_async_http_client(
     if extra_headers:
         headers.update(extra_headers)
 
-    client_kwargs: dict[str, object] = {
-        "timeout": httpx.Timeout(timeout=timeout, connect=connect, read=read),
-        "headers": headers,
-    }
-    if not _has_proxy_env():
-        client_kwargs["transport"] = AsyncTenacityTransport(
+    timeout_config = httpx.Timeout(timeout=timeout, connect=connect, read=read)
+    if _has_proxy_env():
+        return httpx.AsyncClient(timeout=timeout_config, headers=headers)
+
+    return httpx.AsyncClient(
+        timeout=timeout_config,
+        headers=headers,
+        transport=AsyncTenacityTransport(
             config=RetryConfig(
                 retry=retry_if_exception_type((
                     httpx.HTTPError,
@@ -52,8 +54,8 @@ def create_async_http_client(
                 stop=stop_after_attempt(10),
                 reraise=True,
             )
-        )
-    return httpx.AsyncClient(**client_kwargs)
+        ),
+    )
 
 
 def _has_proxy_env() -> bool:
