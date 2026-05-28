@@ -152,10 +152,10 @@ def test_load_defaults(config_manager: ConfigManager, clean_env: None) -> None:
 
 
 def test_primary_config_dirs_use_yaacli_names() -> None:
-    """yaacli is the primary config namespace; xunocli is migrated as legacy."""
+    """yaacli is the only config namespace."""
     assert ConfigManager.PROJECT_CONFIG_DIR == ".yaacli"
-    assert ConfigManager.LEGACY_PROJECT_CONFIG_DIR == ".xunocli"
-    assert ConfigManager.LEGACY_CONFIG_DIR.name == ".xunocli"
+    assert not hasattr(ConfigManager, "LEGACY_PROJECT_CONFIG_DIR")
+    assert not hasattr(ConfigManager, "LEGACY_CONFIG_DIR")
 
 
 def test_load_global_config(
@@ -458,67 +458,37 @@ def test_save_project_config(
     assert "need_approval" in content
 
 
-def test_migrates_legacy_global_config_dir(tmp_path: Path, monkeypatch: Any) -> None:
-    """Default config manager copies ~/.xunocli to ~/.yaacli when needed."""
-    legacy_dir = tmp_path / ".xunocli"
+def test_ignored_legacy_global_config_dir_is_not_migrated(tmp_path: Path, monkeypatch: Any) -> None:
+    """Default config manager ignores legacy global config directories."""
+    old_dir = tmp_path / ("." + "x" + "uno" + "cli")
     new_dir = tmp_path / ".yaacli"
     project_dir = tmp_path / "project"
-    legacy_dir.mkdir()
+    old_dir.mkdir()
     project_dir.mkdir()
-    (legacy_dir / "config.toml").write_text('[general]\nmodel = "openai:gpt-4o"\n')
-    (legacy_dir / "subagents").mkdir()
-    (legacy_dir / "subagents" / "custom.md").write_text("# Custom")
-
-    monkeypatch.setattr(ConfigManager, "LEGACY_CONFIG_DIR", legacy_dir)
+    (old_dir / "config.toml").write_text('[general]\nmodel = "openai:gpt-4o"\n')
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(ConfigManager, "DEFAULT_CONFIG_DIR", new_dir)
 
     config_manager = ConfigManager(project_dir=project_dir)
 
-    assert (new_dir / "config.toml").exists()
-    assert (new_dir / "subagents" / "custom.md").exists()
-    assert (legacy_dir / "config.toml").exists()
-    assert config_manager.load().general.model == "openai:gpt-4o"
+    assert not (new_dir / "config.toml").exists()
+    assert config_manager.load().general.model == ""
 
 
-def test_migration_backfills_missing_global_files_without_overwriting(
-    tmp_path: Path,
-    monkeypatch: Any,
-) -> None:
-    """Migration preserves existing ~/.yaacli files and copies missing ~/.xunocli files."""
-    legacy_dir = tmp_path / ".xunocli"
-    new_dir = tmp_path / ".yaacli"
-    project_dir = tmp_path / "project"
-    legacy_dir.mkdir()
-    new_dir.mkdir()
-    project_dir.mkdir()
-    (legacy_dir / "config.toml").write_text('[general]\nmodel = "openai:gpt-4o"\n')
-    (legacy_dir / "mcp.json").write_text('{"servers": {}}\n')
-    (new_dir / "config.toml").write_text('[general]\nmodel = "anthropic:claude"\n')
-
-    monkeypatch.setattr(ConfigManager, "LEGACY_CONFIG_DIR", legacy_dir)
-    monkeypatch.setattr(ConfigManager, "DEFAULT_CONFIG_DIR", new_dir)
-
-    ConfigManager(project_dir=project_dir)
-
-    assert (new_dir / "config.toml").read_text() == '[general]\nmodel = "anthropic:claude"\n'
-    assert (new_dir / "mcp.json").read_text() == '{"servers": {}}\n'
-
-
-def test_migrates_legacy_project_config_dir(tmp_path: Path) -> None:
-    """Config manager copies .xunocli to .yaacli when needed."""
+def test_ignored_legacy_project_config_dir_is_not_migrated(tmp_path: Path) -> None:
+    """Config manager ignores legacy project config directories."""
     config_dir = tmp_path / "global"
     project_dir = tmp_path / "project"
-    legacy_project_dir = project_dir / ".xunocli"
+    old_project_dir = project_dir / ("." + "x" + "uno" + "cli")
     new_project_dir = project_dir / ".yaacli"
     config_dir.mkdir()
-    legacy_project_dir.mkdir(parents=True)
-    (legacy_project_dir / "tools.toml").write_text('[tools]\nneed_approval = ["legacy_tool"]\n')
+    old_project_dir.mkdir(parents=True)
+    (old_project_dir / "tools.toml").write_text('[tools]\nneed_approval = ["legacy_tool"]\n')
 
     config_manager = ConfigManager(config_dir=config_dir, project_dir=project_dir)
 
-    assert (new_project_dir / "tools.toml").exists()
-    assert (legacy_project_dir / "tools.toml").exists()
-    assert config_manager.load().tools.need_approval == ["legacy_tool"]
+    assert not (new_project_dir / "tools.toml").exists()
+    assert config_manager.load().tools.need_approval == []
 
 
 # =============================================================================

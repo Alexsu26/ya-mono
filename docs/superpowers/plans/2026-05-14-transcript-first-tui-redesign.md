@@ -89,4 +89,4 @@ ______________________________________________________________________
 - `uv run --with ruff ruff check packages/yaacli/yaacli/console packages/yaacli/tests/test_console.py packages/yaacli/tests/test_textual_app.py`
 - `uv run --package yaacli --with pytest --with pytest-asyncio pytest packages/yaacli/tests/test_console.py packages/yaacli/tests/test_textual_app.py -q`
 - `uv run --package yaacli --with pytest --with pytest-asyncio --with pytest-xdist --with inline-snapshot pytest packages/yaacli/tests -q --inline-snapshot=disable`
-- `YAACLI_TUI=v2 uv run --package yaacli xunocli` with `/sessions`, `/help`, `/export`, `/resume latest`, and visual inspection through PTY.
+- `YAACLI_TUI=v2 uv run --package yaacli yaacli` with `/sessions`, `/help`, `/export`, `/resume latest`, and visual inspection through PTY.

@@ -22,7 +22,6 @@ Repository = "https://github.com/wh1isper/ya-mono"
 
 [project.scripts]
 yaacli = "yaacli.cli:cli"
-xunocli = "yaacli.cli:cli"
 
 [build-system]
 requires = ["hatchling", "uv-dynamic-versioning>=0.7.0"]

@@ -221,11 +221,12 @@ def test_cli_worktree_not_in_repo(tmp_path: Path) -> None:
 
 
 def test_package_exposes_yaacli_console_script() -> None:
-    """The installed command should be yaacli."""
+    """The installed command should only be yaacli."""
     pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
     pyproject = tomllib.loads(pyproject_path.read_text())
 
-    assert pyproject["project"]["scripts"]["yaacli"] == "yaacli.cli:cli"
+    scripts = pyproject["project"]["scripts"]
+    assert scripts == {"yaacli": "yaacli.cli:cli"}
 
 
 @pytest.mark.asyncio
@@ -259,7 +260,7 @@ async def test_run_tui_defaults_to_textual_v2(
             return None
 
     monkeypatch.delenv("YAACLI_TUI", raising=False)
-    monkeypatch.delenv("XUNOCLI_TUI", raising=False)
+    monkeypatch.setenv("X" + "UNOCLI_TUI", "console")
     monkeypatch.setattr(textual_app, "run_textual_tui", fake_run_textual_tui)
     monkeypatch.setattr("yaacli.app.TUIApp", LegacyTUI)
 

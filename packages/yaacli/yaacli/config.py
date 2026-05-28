@@ -23,7 +23,6 @@ Configuration files are loaded with project-level priority (no merging):
 
 from __future__ import annotations
 
-import shutil
 import tomllib
 from importlib import resources
 from pathlib import Path
@@ -432,9 +431,7 @@ class ConfigManager:
     """Manages configuration loading from global, project, and environment sources."""
 
     DEFAULT_CONFIG_DIR = Path.home() / ".yaacli"
-    LEGACY_CONFIG_DIR = Path.home() / ".xunocli"
     PROJECT_CONFIG_DIR = ".yaacli"
-    LEGACY_PROJECT_CONFIG_DIR = ".xunocli"
 
     def __init__(
         self,
@@ -445,9 +442,6 @@ class ConfigManager:
         self._project_dir = project_dir or Path.cwd()
         self._config: YaacliConfig | None = None
         self._loaded_sources: list[str] = []
-        if config_dir is None:
-            self._migrate_legacy_global_config()
-        self._migrate_legacy_project_config()
 
     @property
     def config(self) -> YaacliConfig:
@@ -706,16 +700,6 @@ class ConfigManager:
         """
         return self._config_dir / "sessions"
 
-    def _migrate_legacy_global_config(self) -> None:
-        """Copy ~/.xunocli to ~/.yaacli without overwriting existing files."""
-        _copy_legacy_config_dir(self.LEGACY_CONFIG_DIR, self._config_dir)
-
-    def _migrate_legacy_project_config(self) -> None:
-        """Copy .xunocli to .yaacli without overwriting existing files."""
-        legacy_project_dir = self._project_dir / self.LEGACY_PROJECT_CONFIG_DIR
-        project_dir = self._project_dir / self.PROJECT_CONFIG_DIR
-        _copy_legacy_config_dir(legacy_project_dir, project_dir)
-
 
 # =============================================================================
 # Worktree Metadata
@@ -755,24 +739,6 @@ def _load_template(name: str) -> str:
     """Load a template file."""
     template_files = resources.files("yaacli").joinpath("templates")
     return template_files.joinpath(name).read_text(encoding="utf-8")
-
-
-def _copy_legacy_config_dir(source: Path, target: Path) -> None:
-    """Copy a legacy config directory to the new location without overwriting."""
-    if not source.exists() or not source.is_dir():
-        return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        shutil.copytree(source, target)
-        return
-    for item in source.iterdir():
-        destination = target / item.name
-        if destination.exists():
-            continue
-        if item.is_dir():
-            shutil.copytree(item, destination)
-        else:
-            shutil.copy2(item, destination)
 
 
 # =============================================================================

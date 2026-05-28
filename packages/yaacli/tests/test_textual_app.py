@@ -600,8 +600,8 @@ async def test_textual_launcher_disables_terminal_mouse_reporting(
     config = _make_stub_config()
     config.browser = SimpleNamespace()
     config_manager = SimpleNamespace(
-        config_dir=tmp_path / ".xunocli",
-        get_sessions_dir=lambda: tmp_path / ".xunocli" / "sessions",
+        config_dir=tmp_path / ".yaacli",
+        get_sessions_dir=lambda: tmp_path / ".yaacli" / "sessions",
         load_mcp_config=lambda: {},
     )
 
@@ -967,7 +967,7 @@ async def test_textual_app_persists_renames_and_exports_session(
         auto_restore=False,
         session_dir="",
     )
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     app = YaacliTextualApp(
         config=config,
         config_manager=config_manager,
@@ -1015,7 +1015,7 @@ async def test_textual_app_auto_names_session_from_first_user_prompt(
         auto_restore=False,
         session_dir="",
     )
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     app = YaacliTextualApp(
         config=config,
         config_manager=config_manager,
@@ -1057,7 +1057,7 @@ async def test_textual_app_rename_takes_precedence_over_auto_session_name(
         auto_restore=False,
         session_dir="",
     )
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     app = YaacliTextualApp(
         config=config,
         config_manager=config_manager,
@@ -1094,7 +1094,7 @@ async def test_textual_app_sessions_fills_missing_name_from_transcript(
         auto_restore=False,
         session_dir="",
     )
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     session_dir = config_manager.get_sessions_dir() / "abc123def456"
     session_dir.mkdir(parents=True)
     (session_dir / "metadata.json").write_text(
@@ -1152,7 +1152,7 @@ async def test_textual_app_resume_restores_saved_transcript(tmp_path: Path) -> N
         auto_restore=False,
         session_dir="",
     )
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     session_dir = config_manager.get_sessions_dir() / "abc123def456"
     session_dir.mkdir(parents=True)
     (session_dir / "metadata.json").write_text(
@@ -1220,7 +1220,7 @@ async def test_textual_app_load_replaces_stale_message_history_and_context(tmp_p
     )
     runtime = _make_stub_runtime()
     runtime.ctx.steering_messages = ["old steering"]
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     app = YaacliTextualApp(
         config=config,
         config_manager=config_manager,
@@ -1437,7 +1437,7 @@ async def test_clear_command_removes_persisted_history_and_context(tmp_path: Pat
     )
     runtime = _make_stub_runtime()
     runtime.ctx.steering_messages = ["old steering"]
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     app = YaacliTextualApp(
         config=config,
         config_manager=config_manager,
@@ -1877,7 +1877,7 @@ description: Map repository structure before changing code.
     )
     config = _make_stub_config()
     config.session = SimpleNamespace(auto_save_history=False, session_dir="")
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     app = YaacliTextualApp(
         config=config,
         config_manager=config_manager,
@@ -1904,7 +1904,7 @@ async def test_subagent_slash_commands_list_and_show_details(tmp_path: Path) -> 
     from yaacli.config import ConfigManager, SubagentOverride, SubagentsConfig
     from yaacli.console.textual_app import YaacliTextualApp
 
-    subagents_dir = tmp_path / ".xunocli" / "subagents"
+    subagents_dir = tmp_path / ".yaacli" / "subagents"
     subagents_dir.mkdir(parents=True)
     (subagents_dir / "explorer.md").write_text(
         """---
@@ -1931,7 +1931,7 @@ Inspect code without editing it.
             )
         }
     )
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     app = YaacliTextualApp(
         config=config,
         config_manager=config_manager,
@@ -2020,7 +2020,7 @@ async def test_delegate_and_spawn_slash_commands_trigger_agent_prompts(
     from yaacli.config import ConfigManager
     from yaacli.console.textual_app import YaacliTextualApp
 
-    subagents_dir = tmp_path / ".xunocli" / "subagents"
+    subagents_dir = tmp_path / ".yaacli" / "subagents"
     subagents_dir.mkdir(parents=True)
     (subagents_dir / "explorer.md").write_text(
         """---
@@ -2034,7 +2034,7 @@ Inspect code without editing it.
     )
     config = _make_stub_config()
     config.session = SimpleNamespace(auto_save_history=False, session_dir="")
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     app = YaacliTextualApp(
         config=config,
         config_manager=config_manager,
@@ -2074,7 +2074,7 @@ async def test_spawn_slash_menu_completes_subagent_name(tmp_path: Path) -> None:
     from yaacli.console.textual_app import YaacliTextualApp
     from yaacli.console.widgets import PromptArea, SlashMenu
 
-    subagents_dir = tmp_path / ".xunocli" / "subagents"
+    subagents_dir = tmp_path / ".yaacli" / "subagents"
     subagents_dir.mkdir(parents=True)
     (subagents_dir / "explorer.md").write_text(
         """---
@@ -2088,7 +2088,7 @@ Inspect code without editing it.
     )
     config = _make_stub_config()
     config.session = SimpleNamespace(auto_save_history=False, session_dir="")
-    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
     app = YaacliTextualApp(
         config=config,
         config_manager=config_manager,

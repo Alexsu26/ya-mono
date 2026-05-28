@@ -754,15 +754,7 @@ async def _run_tui(
     Returns:
         Session ID if the session has saved data, None otherwise.
     """
-    tui_flavor = (
-        (
-            os.environ.get("YAACLI_TUI")
-            or os.environ.get("XUNOCLI_TUI")  # compatibility with the short-lived fork name
-            or "v2"
-        )
-        .strip()
-        .lower()
-    )
+    tui_flavor = (os.environ.get("YAACLI_TUI") or "v2").strip().lower()
     if tui_flavor in {"", "v2", "textual"}:
         from yaacli.console.textual_app import run_textual_tui
 

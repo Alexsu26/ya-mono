@@ -39,8 +39,6 @@ python -m yaacli
 ## Configuration
 
 YAACLI stores global configuration under `~/.yaacli/` and project-level configuration under `.yaacli/`.
-On first use, existing `~/.xunocli/` or project `.xunocli/` directories are copied into the YAACLI location without overwriting existing files.
-The `xunocli` command remains available as a compatibility alias.
 
 ## Built-in Skills
 

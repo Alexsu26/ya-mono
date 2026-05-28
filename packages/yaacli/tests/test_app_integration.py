@@ -90,7 +90,7 @@ class MockConfigManager:
 
     global_config_dir: Any = field(default_factory=lambda: MagicMock())
     project_config_dir: Any = field(default_factory=lambda: MagicMock())
-    config_dir: Path = field(default_factory=lambda: Path.cwd() / ".xunocli-test-config")
+    config_dir: Path = field(default_factory=lambda: Path.cwd() / ".yaacli-test-config")
 
     def get_sessions_dir(self) -> Any:
         return MagicMock(exists=lambda: False)
