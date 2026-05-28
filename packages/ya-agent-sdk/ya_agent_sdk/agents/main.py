@@ -71,6 +71,7 @@ from ya_agent_sdk.filters.environment_instructions import create_environment_ins
 from ya_agent_sdk.filters.runtime_instructions import inject_runtime_instructions
 from ya_agent_sdk.filters.system_prompt import create_system_prompt_filter
 from ya_agent_sdk.toolsets.core.base import BaseTool, GlobalHooks, Toolset
+from ya_agent_sdk.usage import coerce_run_usage
 from ya_agent_sdk.utils import AgentDepsT, EnvT, add_toolset_instructions
 
 from .capabilities import is_process_history_for
@@ -100,6 +101,14 @@ class AgentInterrupted(Exception):
 
 def _has_tool_call_parts(parts: Sequence[object]) -> bool:
     return any(isinstance(part, BaseToolCallPart) for part in parts)
+
+
+def _agent_retry_kwargs(*, retries: int, output_retries: int) -> dict[str, Any]:
+    signature = inspect.signature(Agent.__init__)
+    output_param = signature.parameters.get("output_retries")
+    if output_param is not None and output_param.kind is not inspect.Parameter.VAR_KEYWORD:
+        return {"retries": retries, "output_retries": output_retries}
+    return {"retries": {"tools": retries, "output": output_retries}}
 
 
 def _suspend_current_task_cancellation() -> tuple[asyncio.Task[Any] | None, int]:
@@ -667,8 +676,7 @@ def create_agent(
                     *cast(list[AbstractCapability[Any]], all_capabilities),
                     ProcessHistory(create_system_prompt_filter(system_prompt=effective_system_prompt)),
                 ],
-                retries=retries,
-                output_retries=output_retries,
+                **_agent_retry_kwargs(retries=retries, output_retries=output_retries),
                 defer_model_check=defer_model_check,
                 end_strategy=end_strategy,  # type: ignore[arg-type]
                 name="self",
@@ -691,8 +699,7 @@ def create_agent(
                 *all_capabilities,
                 ProcessHistory(create_system_prompt_filter(system_prompt=effective_system_prompt)),
             ],
-            retries=retries,
-            output_retries=output_retries,
+            **_agent_retry_kwargs(retries=retries, output_retries=output_retries),
             defer_model_check=defer_model_check,
             end_strategy=end_strategy,  # type: ignore[arg-type]
             name=agent_name,
@@ -1219,7 +1226,7 @@ async def stream_agent(  # noqa: C901
             agent_id=main_agent_info.agent_id,
             agent_name=main_agent_info.agent_name,
             model_id=base_model.model_name,
-            usage=run.usage,
+            usage=coerce_run_usage(run.usage),
             source="main_model_request",
         )
 

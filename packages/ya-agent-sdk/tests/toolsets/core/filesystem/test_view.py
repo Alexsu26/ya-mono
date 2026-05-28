@@ -18,6 +18,7 @@ from ya_agent_sdk.toolsets.core.filesystem.view import (
     VIDEO_EXTENSIONS,
     ViewTool,
 )
+from ya_agent_sdk.usage import InternalUsage
 
 
 async def test_view_tool_attributes(agent_context: AgentContext) -> None:
@@ -446,7 +447,7 @@ async def test_view_video_fallback_passes_model_wrapper(tmp_path: Path) -> None:
 
     async def mock_get_video_description(**kwargs: Any):
         captured_kwargs.update(kwargs)
-        return "This video shows a test scene.", "test-model", RunUsage()
+        return "This video shows a test scene.", InternalUsage(model_id="test-model", usage=RunUsage())
 
     def model_wrapper(model: Model, agent_name: str, metadata: dict[str, Any]) -> Model:
         return model

@@ -3,7 +3,10 @@
 from uuid import uuid4
 
 import httpx
+import pytest
 from ya_agent_sdk.sandbox.browser.docker_ import DockerBrowserSandbox, get_port
+
+pytestmark = pytest.mark.usefixtures("docker_client")
 
 
 async def test_browser_sandbox_context_manager():

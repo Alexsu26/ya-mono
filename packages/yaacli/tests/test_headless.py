@@ -40,7 +40,7 @@ class EmptyStream:
 
 
 def configured() -> YaacliConfig:
-    return YaacliConfig(general=GeneralConfig(model="openai:gpt-4"))
+    return YaacliConfig(general=GeneralConfig(model="openai-chat:gpt-4"))
 
 
 def test_cli_headless_option_exists() -> None:

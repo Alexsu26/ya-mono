@@ -1954,7 +1954,7 @@ Inspect code without editing it.
     assert "openai_responses_high" in rendered
     assert "Read, Grep" in rendered
     assert "Bash" in rendered
-    assert "subagents/explorer.md" in rendered
+    assert "explorer.md" in rendered
 
 
 @pytest.mark.asyncio
@@ -2179,7 +2179,7 @@ async def test_model_slash_command_shows_error_when_profile_apply_fails() -> Non
     config = YaacliConfig(
         models={
             "opus-4.7": ModelProfileConfig(model="gateway@anthropic:gcp-claude-opus-4-7"),
-            "gpt-5.4": ModelProfileConfig(model="openai:gpt-5.4"),
+            "gpt-5.4": ModelProfileConfig(model="openai-chat:gpt-5.4"),
         }
     )
     app = YaacliTextualApp(
@@ -2248,7 +2248,7 @@ async def test_model_slash_command_rejects_switch_while_agent_is_running() -> No
     config = YaacliConfig(
         models={
             "opus-4.7": ModelProfileConfig(model="gateway@anthropic:gcp-claude-opus-4-7"),
-            "gpt-5.4": ModelProfileConfig(model="openai:gpt-5.4"),
+            "gpt-5.4": ModelProfileConfig(model="openai-chat:gpt-5.4"),
         }
     )
     app = YaacliTextualApp(

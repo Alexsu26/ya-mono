@@ -86,6 +86,7 @@ from ya_agent_sdk.events import (
     TaskEvent,
     ToolCallsStartEvent,
 )
+from ya_agent_sdk.usage import coerce_run_usage
 from ya_agent_sdk.utils import get_latest_request_usage
 
 # Import state management from app.state (re-export TUIMode, TUIState for backward compatibility)
@@ -1732,7 +1733,7 @@ class TUIApp:
                 if stream.run:
                     self._message_history = list(stream.run.all_messages())
                     # Update context usage from run
-                    usage = stream.run.usage
+                    usage = coerce_run_usage(stream.run.usage)
                     latest_usage = get_latest_request_usage(self._message_history)
                     self._current_context_tokens = latest_usage.total_tokens if latest_usage else usage.total_tokens
 

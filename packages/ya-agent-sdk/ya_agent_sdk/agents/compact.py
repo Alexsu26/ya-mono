@@ -70,6 +70,7 @@ from ya_agent_sdk.filters._builders import (
     build_original_request_parts,
     build_steering_parts,
 )
+from ya_agent_sdk.usage import coerce_run_usage
 from ya_agent_sdk.utils import get_latest_request_usage
 
 # =============================================================================
@@ -599,7 +600,7 @@ def create_cache_friendly_compact_filter(
                     usage_limits=UsageLimits(request_limit=1),
                 ) as result:
                     summary_markdown = str(await result.get_output())
-                    usage = result.usage
+                    usage = coerce_run_usage(result.usage)
 
                 model = ctx.model
                 model_id = model.model_name if model is not None else "unknown"
@@ -791,7 +792,7 @@ def create_compact_filter(
                     agent_id=AGENT_NAME,
                     agent_name=AGENT_NAME,
                     model_id=model_id,
-                    usage=result.usage,
+                    usage=coerce_run_usage(result.usage),
                     source="compact",
                     usage_id=usage_id,
                     ledger_key=usage_id,
@@ -825,7 +826,7 @@ def create_compact_filter(
                     trimmed_messages=trimmed_result.messages,
                     handoff_messages=compacted,
                     summary_markdown=condense_markdown,
-                    usage=result.usage,
+                    usage=coerce_run_usage(result.usage),
                     metadata={"trim": trimmed_result},
                     compacted_messages=compacted,
                     condense_result=condense_result,
