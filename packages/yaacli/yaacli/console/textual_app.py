@@ -1434,6 +1434,11 @@ class YaacliTextualApp(App[None]):
                 event.prevent_default()
                 return
 
+        if event.key == "escape" and self._cancel_agent_task():
+            event.stop()
+            event.prevent_default()
+            return
+
         if self.focused is self._input and event.key in {"up", "down"}:
             if self._scroll_log_for_empty_prompt(event.key):
                 event.stop()
@@ -1713,12 +1718,17 @@ class YaacliTextualApp(App[None]):
 
     # ---------------- Ctrl+C ----------------
 
+    def _cancel_agent_task(self) -> bool:
+        if self._agent_task is None or self._agent_task.done():
+            return False
+        self._agent_task.cancel()
+        self._sink.show_breadcrumb("→ cancelling…")
+        self._ctrl_c_at = 0.0
+        return True
+
     def action_interrupt(self) -> None:
         # If an agent task is running: cancel it
-        if self._agent_task is not None and not self._agent_task.done():
-            self._agent_task.cancel()
-            self._sink.show_breadcrumb("→ cancelling…")
-            self._ctrl_c_at = time.monotonic()
+        if self._cancel_agent_task():
             return
         # Idle: double-press within 2s exits
         now = time.monotonic()
@@ -1862,13 +1872,16 @@ class YaacliTextualApp(App[None]):
             return False
         self._session_id = target
         self._transcript.switch(target)
+        rebuilt_context = False
         try:
-            self._message_history = self._transcript.load_message_history()
-            self._transcript.restore_context_state(self._runtime)
+            self._message_history, rebuilt_context = self._transcript.load_message_history_or_transcript()
+            if not self._transcript.restore_context_state(self._runtime):
+                self._transcript.reset_context_state(self._runtime)
         except Exception:
             logger.debug("Could not restore textual session state", exc_info=True)
         self._render_transcript_entries(self._transcript.transcript())
-        self._sink.show_breadcrumb(f"→ resumed session {target}")
+        suffix = " (rebuilt model context from transcript)" if rebuilt_context else ""
+        self._sink.show_breadcrumb(f"→ resumed session {target}{suffix}")
         return True
 
     def _list_sessions(self) -> None:
@@ -2310,6 +2323,7 @@ class YaacliTextualApp(App[None]):
             self._sink.clear_history_metadata()
             if self._transcript is not None:
                 self._transcript.clear_transcript()
+                self._transcript.reset_context_state(self._runtime)
             self._search_query = ""
             self._search_matches = []
             self._search_match_index = -1
@@ -2367,9 +2381,12 @@ class YaacliTextualApp(App[None]):
                 self._sink.show_breadcrumb(f"→ not a directory: {folder}")
                 return True
             self._transcript.load_from_folder(folder)
-            self._message_history = self._transcript.load_message_history()
+            self._message_history, rebuilt_context = self._transcript.load_message_history_or_transcript()
+            if not self._transcript.restore_context_state(self._runtime):
+                self._transcript.reset_context_state(self._runtime)
             self._render_transcript_entries(self._transcript.transcript())
-            self._sink.show_breadcrumb(f"→ loaded session from {folder}")
+            suffix = " (rebuilt model context from transcript)" if rebuilt_context else ""
+            self._sink.show_breadcrumb(f"→ loaded session from {folder}{suffix}")
             return True
 
         if name == "act":
@@ -2889,8 +2906,7 @@ class YaacliTextualApp(App[None]):
             self._sink.write_block(
                 ErrorBlock(
                     title="model switch failed",
-                    message=str(exc),
-                    traceback=None,
+                    body=str(exc),
                 )
             )
             return

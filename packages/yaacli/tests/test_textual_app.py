@@ -1142,6 +1142,7 @@ async def test_textual_app_sessions_fills_missing_name_from_transcript(
 
 @pytest.mark.asyncio
 async def test_textual_app_resume_restores_saved_transcript(tmp_path: Path) -> None:
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
     from yaacli.config import ConfigManager
     from yaacli.console.textual_app import YaacliTextualApp
 
@@ -1191,6 +1192,93 @@ async def test_textual_app_resume_restores_saved_transcript(tmp_path: Path) -> N
         text = _log_text(app.query_one(RichLog))
         assert "restored user" in text
         assert "restored assistant" in text
+        assert len(app._message_history) == 2
+        restored_request = app._message_history[0]
+        restored_response = app._message_history[1]
+        assert isinstance(restored_request, ModelRequest)
+        assert any(
+            isinstance(part, UserPromptPart) and part.content == "restored user" for part in restored_request.parts
+        )
+        assert isinstance(restored_response, ModelResponse)
+        assert any(
+            isinstance(part, TextPart) and part.content == "restored assistant" for part in restored_response.parts
+        )
+
+
+@pytest.mark.asyncio
+async def test_textual_app_load_replaces_stale_message_history_and_context(tmp_path: Path) -> None:
+    from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, ModelResponse, TextPart, UserPromptPart
+    from ya_agent_sdk.context import ResumableState
+    from yaacli.config import ConfigManager
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    config = _make_stub_config()
+    config.session = SimpleNamespace(
+        auto_save_history=True,
+        auto_restore=False,
+        session_dir="",
+    )
+    runtime = _make_stub_runtime()
+    runtime.ctx.steering_messages = ["old steering"]
+    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    app = YaacliTextualApp(
+        config=config,
+        config_manager=config_manager,
+        runtime=runtime,
+        cwd=tmp_path,
+        model_name="opus-4.7",
+    )
+    load_dir = tmp_path / "dump"
+    load_dir.mkdir()
+    (load_dir / "metadata.json").write_text(
+        json.dumps({
+            "session_id": "dumped123",
+            "name": "dumped",
+            "working_dir": str(tmp_path),
+            "created_at": "2026-05-14T00:00:00+00:00",
+            "updated_at": "2026-05-14T00:00:01+00:00",
+            "model": "opus-4.7",
+            "turns": [],
+            "tool_count": 0,
+            "error_count": 0,
+        })
+    )
+    (load_dir / "transcript.json").write_text(
+        json.dumps([
+            {"kind": "user", "text": "loaded user", "label": "user"},
+            {"kind": "assistant", "text": "loaded assistant", "label": "assistant"},
+        ])
+    )
+
+    async with app.run_test(size=(100, 20)) as pilot:
+        await pilot.pause()
+        assert app._transcript is not None
+        stale_messages = [ModelRequest(parts=[UserPromptPart(content="stale user")])]
+        app._transcript.message_history_path.write_bytes(ModelMessagesTypeAdapter.dump_json(stale_messages, indent=2))
+        app._transcript.context_state_path.write_text(
+            ResumableState(steering_messages=["old steering"]).model_dump_json(indent=2)
+        )
+
+        assert await app._handle_command(f"/load {load_dir}")
+        await pilot.pause(0.05)
+
+        assert not app._transcript.message_history_path.exists()
+        assert not app._transcript.context_state_path.exists()
+        assert runtime.ctx.steering_messages == []
+        assert len(app._message_history) == 2
+        restored_request = app._message_history[0]
+        restored_response = app._message_history[1]
+        assert isinstance(restored_request, ModelRequest)
+        assert any(
+            isinstance(part, UserPromptPart) and part.content == "loaded user" for part in restored_request.parts
+        )
+        assert isinstance(restored_response, ModelResponse)
+        assert any(
+            isinstance(part, TextPart) and part.content == "loaded assistant" for part in restored_response.parts
+        )
+        rendered = _log_text(app.query_one(RichLog))
+        assert "loaded user" in rendered
+        assert "stale user" not in rendered
 
 
 @pytest.mark.asyncio
@@ -1335,6 +1423,51 @@ async def test_clear_command_empties_the_log() -> None:
 
 
 @pytest.mark.asyncio
+async def test_clear_command_removes_persisted_history_and_context(tmp_path: Path) -> None:
+    from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
+    from ya_agent_sdk.context import ResumableState
+    from yaacli.config import ConfigManager
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    config = _make_stub_config()
+    config.session = SimpleNamespace(
+        auto_save_history=True,
+        auto_restore=False,
+        session_dir="",
+    )
+    runtime = _make_stub_runtime()
+    runtime.ctx.steering_messages = ["old steering"]
+    config_manager = ConfigManager(config_dir=tmp_path / ".xunocli", project_dir=tmp_path)
+    app = YaacliTextualApp(
+        config=config,
+        config_manager=config_manager,
+        runtime=runtime,
+        cwd=tmp_path,
+        model_name="opus-4.7",
+    )
+
+    async with app.run_test(size=(100, 20)) as pilot:
+        await pilot.pause()
+        assert app._transcript is not None
+        app._message_history = [ModelRequest(parts=[UserPromptPart(content="old user")])]
+        app._transcript.message_history_path.write_bytes(
+            ModelMessagesTypeAdapter.dump_json(app._message_history, indent=2)
+        )
+        app._transcript.context_state_path.write_text(
+            ResumableState(steering_messages=["old steering"]).model_dump_json(indent=2)
+        )
+
+        assert await app._handle_command("/clear")
+        await pilot.pause(0.05)
+
+        assert app._message_history == []
+        assert not app._transcript.message_history_path.exists()
+        assert not app._transcript.context_state_path.exists()
+        assert runtime.ctx.steering_messages == []
+        assert app.has_session_data is False
+
+
+@pytest.mark.asyncio
 async def test_act_plan_toggle_updates_footer() -> None:
     from yaacli.console.textual_app import YaacliTextualApp
     from yaacli.console.widgets import FooterHint, PromptArea
@@ -1451,6 +1584,62 @@ async def test_ctrl_c_during_run_cancels_task() -> None:
 
         assert app._agent_task.cancelled() or app._agent_task.done()
         assert app.is_running
+
+
+@pytest.mark.asyncio
+async def test_escape_during_run_cancels_task() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        async def _sleep_forever() -> None:
+            await asyncio.sleep(60)
+
+        app._agent_task = asyncio.create_task(_sleep_forever())
+        await pilot.pause()
+
+        await pilot.press("escape")
+        await pilot.pause(0.1)
+
+        assert app._agent_task.cancelled() or app._agent_task.done()
+        assert app.is_running
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_after_cancelling_run_does_not_immediately_exit() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        async def _sleep_forever() -> None:
+            await asyncio.sleep(60)
+
+        app._agent_task = asyncio.create_task(_sleep_forever())
+        await pilot.pause()
+
+        await pilot.press("ctrl+c")
+        await pilot.pause(0.1)
+        assert app._agent_task.cancelled() or app._agent_task.done()
+
+        await pilot.press("ctrl+c")
+        await pilot.pause(0.05)
+
+        assert app.is_running
+        assert "→ press Ctrl+C again to exit" in _log_text(app.query_one(RichLog))
 
 
 @pytest.mark.asyncio
@@ -1983,6 +2172,38 @@ async def test_model_slash_command_switches_active_runtime_profile() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_slash_command_shows_error_when_profile_apply_fails() -> None:
+    from yaacli.config import ModelProfileConfig, YaacliConfig
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    config = YaacliConfig(
+        models={
+            "opus-4.7": ModelProfileConfig(model="gateway@anthropic:gcp-claude-opus-4-7"),
+            "gpt-5.4": ModelProfileConfig(model="openai:gpt-5.4"),
+        }
+    )
+    app = YaacliTextualApp(
+        config=config,
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7 (gateway@anthropic:gcp-claude-opus-4-7)",
+    )
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        with patch("yaacli.console.textual_app.apply_model_profile", side_effect=RuntimeError("boom")):
+            handled = await app._handle_command("/model gpt-5.4")
+        await pilot.pause()
+
+        assert handled is True
+        assert app._active_model_name == "opus-4.7"
+        assert app._model_name == "opus-4.7 (gateway@anthropic:gcp-claude-opus-4-7)"
+        rendered = _log_text(app.query_one(RichLog))
+        assert "model switch failed" in rendered
+        assert "boom" in rendered
+
+
+@pytest.mark.asyncio
 async def test_model_current_uses_configured_profile_when_display_uses_label() -> None:
     from yaacli.config import GeneralConfig, ModelProfileConfig, YaacliConfig
     from yaacli.console.textual_app import YaacliTextualApp
@@ -2115,6 +2336,37 @@ async def test_slash_menu_keeps_stable_order_after_recent_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_slash_menu_resets_selection_when_filter_changes() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import PromptArea, SlashMenu
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        prompt = app.query_one(PromptArea)
+        menu = app.query_one(SlashMenu)
+        prompt.focus()
+
+        await pilot.press("slash")
+        await pilot.pause()
+        for _ in range(4):
+            await pilot.press("down")
+        await pilot.pause()
+        assert menu.selected_index == 4
+
+        await pilot.press("s")
+        await pilot.pause()
+
+        assert menu.selected_index == 0
+        assert menu.selected_command.name == "session"
+
+
+@pytest.mark.asyncio
 async def test_slash_menu_keeps_keyboard_selection_inside_rendered_window() -> None:
     """Long slash palettes should not let the selection move off-screen."""
     from yaacli.console.textual_app import YaacliTextualApp
@@ -2186,6 +2438,42 @@ async def test_path_mention_menu_filters_workspace_paths(tmp_path: Path) -> None
         assert menu.is_open
         labels = [item.display for item in menu.visible_items]
         assert "packages/yaacli/" in labels
+
+
+@pytest.mark.asyncio
+async def test_path_mention_menu_resets_selection_when_filter_changes(tmp_path: Path) -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import PathMentionMenu, PromptArea
+
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / "beta").mkdir()
+    (tmp_path / "bravo").mkdir()
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=tmp_path,
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        prompt = app.query_one(PromptArea)
+        menu = app.query_one(PathMentionMenu)
+        prompt.focus()
+
+        await pilot.press("at")
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.pause()
+        assert menu.selected_index == 2
+
+        await pilot.press("b")
+        await pilot.pause()
+
+        assert menu.selected_index == 0
+        assert menu.selected_item is not None
+        assert menu.selected_item.display == "beta/"
 
 
 @pytest.mark.asyncio

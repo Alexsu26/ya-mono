@@ -398,7 +398,7 @@ class SlashMenu(Static):
                 self._hide()
                 return
             self.visible_commands = argument_items
-            self.selected_index = min(self.selected_index, len(argument_items) - 1)
+            self.selected_index = 0
             self.add_class("has-items")
             self._repaint()
             return
@@ -418,7 +418,7 @@ class SlashMenu(Static):
             self._hide()
             return
         self.visible_commands = matches
-        self.selected_index = min(self.selected_index, len(matches) - 1)
+        self.selected_index = 0
         self.add_class("has-items")
         self._repaint()
 
@@ -663,7 +663,7 @@ class PathMentionMenu(Static):
         if not self.visible_items:
             self._hide()
             return
-        self.selected_index = min(self.selected_index, len(self.visible_items) - 1)
+        self.selected_index = 0
         self.add_class("has-items")
         self._repaint()
 

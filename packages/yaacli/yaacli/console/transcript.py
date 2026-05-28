@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic_ai.messages import ModelMessagesTypeAdapter
+from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, ModelResponse, TextPart, UserPromptPart
 from ya_agent_sdk.context import ResumableState
 
 
@@ -61,6 +61,43 @@ def _transcript_user_prompts(path: Path) -> tuple[str, str]:
             first = prompt
         latest = prompt
     return first, latest
+
+
+def _message_history_from_transcript(entries: list[dict[str, Any]]) -> list[Any]:
+    messages: list[Any] = []
+    assistant_chunks: list[str] = []
+
+    def flush_assistant() -> None:
+        if not assistant_chunks:
+            return
+        messages.append(ModelResponse(parts=[TextPart(content="\n\n".join(assistant_chunks))]))
+        assistant_chunks.clear()
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind") or "")
+        text = str(entry.get("text") or "")
+        label = str(entry.get("label") or kind or "entry")
+        if kind == "user":
+            if not text or text.lstrip().startswith("/"):
+                continue
+            flush_assistant()
+            messages.append(ModelRequest(parts=[UserPromptPart(content=text)]))
+        elif kind == "assistant":
+            if text:
+                assistant_chunks.append(text)
+        elif kind == "tool":
+            tool_text = f"[tool:{label}]\n{text}".strip()
+            if tool_text:
+                assistant_chunks.append(tool_text)
+        elif kind == "error":
+            error_text = f"[error:{label}]\n{text}".strip()
+            if error_text:
+                assistant_chunks.append(error_text)
+
+    flush_assistant()
+    return messages
 
 
 @dataclass(frozen=True)
@@ -130,6 +167,7 @@ class TranscriptStore:
                 "error_count": 0,
             }
         else:
+            self._metadata["session_id"] = self.session_id
             self._metadata["updated_at"] = now
             self._metadata["model"] = self.model
         self._transcript = list(_read_json(self.transcript_path, []))
@@ -176,6 +214,11 @@ class TranscriptStore:
         _write_json(self.transcript_path, self._transcript)
         self._save_metadata()
 
+    def clear_state_snapshot(self) -> None:
+        for path in (self.message_history_path, self.context_state_path):
+            with suppress(FileNotFoundError):
+                path.unlink()
+
     def clear_transcript(self) -> None:
         self._transcript = []
         self._metadata["latest_user_prompt"] = ""
@@ -184,6 +227,7 @@ class TranscriptStore:
             self._metadata["name_source"] = ""
         self._metadata["updated_at"] = utc_now()
         _write_json(self.transcript_path, self._transcript)
+        self.clear_state_snapshot()
         self._save_metadata()
 
     def record_turn(
@@ -216,8 +260,12 @@ class TranscriptStore:
             except TypeError:
                 state = None
             if state is not None:
+                model_dump_json = getattr(state, "model_dump_json", None)
                 with suppress(Exception):
-                    self.context_state_path.write_text(state.model_dump_json(indent=2))
+                    if callable(model_dump_json):
+                        state_json = model_dump_json(indent=2)
+                        if isinstance(state_json, str):
+                            self.context_state_path.write_text(state_json)
         self._metadata["updated_at"] = utc_now()
         self._save_metadata()
 
@@ -226,14 +274,29 @@ class TranscriptStore:
             return []
         return list(ModelMessagesTypeAdapter.validate_json(self.message_history_path.read_bytes()))
 
-    def restore_context_state(self, runtime: Any) -> None:
+    def load_message_history_or_transcript(self) -> tuple[list[Any], bool]:
+        with suppress(Exception):
+            messages = self.load_message_history()
+            if messages:
+                return messages, False
+        rebuilt = _message_history_from_transcript(self.transcript())
+        return rebuilt, bool(rebuilt)
+
+    def restore_context_state(self, runtime: Any) -> bool:
         if not self.context_state_path.exists():
-            return
+            return False
+        ctx = getattr(runtime, "ctx", None)
+        if ctx is None:
+            return False
+        state = ResumableState.model_validate_json(self.context_state_path.read_text())
+        state.restore(ctx)
+        return True
+
+    def reset_context_state(self, runtime: Any) -> None:
         ctx = getattr(runtime, "ctx", None)
         if ctx is None:
             return
-        state = ResumableState.model_validate_json(self.context_state_path.read_text())
-        state.restore(ctx)
+        ResumableState().restore(ctx)
 
     def transcript(self) -> list[dict[str, Any]]:
         return list(self._transcript)
@@ -321,8 +384,12 @@ class TranscriptStore:
     def load_from_folder(self, folder: Path) -> None:
         for name in ("metadata.json", "transcript.json", "message_history.json", "context_state.json"):
             source = folder / name
+            target = self.session_dir / name
             if source.exists():
-                shutil.copy(source, self.session_dir / name)
+                shutil.copy(source, target)
+            else:
+                with suppress(FileNotFoundError):
+                    target.unlink()
         self.start()
 
     def _save_metadata(self) -> None:
