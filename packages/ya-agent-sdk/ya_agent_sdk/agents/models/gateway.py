@@ -20,6 +20,14 @@ _OPENAI_PROVIDER_ERROR = (
 _OPENAI_PROVIDER_ALIASES: tuple[str, ...] = ("openai", "chat", "responses")
 
 
+def normalize_legacy_provider_alias(model: str) -> str:
+    """Normalize Google provider aliases to Pydantic AI v2 provider names."""
+    provider_name, sep, model_name = model.partition(":")
+    if not sep or provider_name == "google" or not provider_name.startswith("google-"):
+        return model
+    return f"google-cloud:{model_name}"
+
+
 def _supports_required_tool_choice(model_name: str) -> bool:
     """Return whether an OpenAI-compatible model supports tool_choice=required."""
     lower = model_name.lower()
@@ -146,8 +154,6 @@ def _build_gateway_http_client(
     needs_extra_headers_patch = provider_name in (
         "google-cloud",
         "google",
-        "google-vertex",
-        "google-gla",
         "bedrock",
         "converse",
     )
@@ -192,7 +198,11 @@ def _build_gateway_provider(
             base_url=base_url,
             region_name=gateway_name,  # Fake region name to avoid NoRegionError
         )
-    if provider_name in ("google-cloud", "google", "google-vertex", "google-gla"):
+    if provider_name == "google":
+        from pydantic_ai.providers.google import GoogleProvider
+
+        return GoogleProvider(api_key=api_key, base_url=base_url, http_client=http_client)
+    if provider_name == "google-cloud":
         from pydantic_ai.providers.google_cloud import GoogleCloudProvider
 
         return GoogleCloudProvider(api_key=api_key, base_url=base_url, http_client=http_client)
@@ -258,6 +268,7 @@ def infer_model(gateway_name: str, model: str, extra_headers: dict[str, str] | N
         ``OpenAIModelProfile``. This preserves reasoning round-tripping for
         tool-call turns.
     """
+    model = normalize_legacy_provider_alias(model)
     provider_factory = make_gateway_provider(gateway_name, extra_headers)
 
     provider_prefix, model_name = _split_provider_and_model(model)
