@@ -35,15 +35,16 @@ import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from y_agent_environment import BaseResource
+from ya_agent_environment import BaseResource
+from ya_agent_sdk.context.bus import BusMessage, MessageBus
+from ya_agent_sdk.usage import UsageSnapshot
 
 from yaacli.logging import get_logger
 
 if TYPE_CHECKING:
-    from y_agent_environment.shell import Shell
-    from ya_agent_sdk.context.bus import MessageBus
+    from ya_agent_environment.shell import Shell
     from ya_agent_sdk.toolsets.core.base import BaseTool, Toolset
 
 logger = get_logger(__name__)
@@ -64,6 +65,15 @@ class BackgroundTaskInfo:
     prompt: str
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     is_resume: bool = False
+
+
+@dataclass
+class PendingBackgroundMessage:
+    """Queued background notification waiting for TUI-managed delivery."""
+
+    message: BusMessage
+    shell_process_id: str | None = None
+    shell_kind: Literal["output", "completion"] | None = None
 
 
 class BackgroundMonitor(BaseResource):
@@ -106,6 +116,10 @@ class BackgroundMonitor(BaseResource):
         self._monitored_processes: set[str] = set()
         self._notified_pending: set[str] = set()
 
+        # --- Wake-up redelivery ---
+        self._pending_messages: list[PendingBackgroundMessage] = []
+        self._pending_usage_snapshots: list[UsageSnapshot] = []
+
     # =========================================================================
     # Subagent task management
     # =========================================================================
@@ -147,6 +161,104 @@ class BackgroundMonitor(BaseResource):
                 self._completion_callback(agent_id)
             except Exception:
                 logger.exception("Error in completion callback for %s", agent_id)
+
+    def enqueue_message(self, message: BusMessage) -> None:
+        """Queue a background notification for delivery when the TUI can wake the main agent."""
+        self._pending_messages.append(PendingBackgroundMessage(message=message))
+
+    def enqueue_shell_message(
+        self,
+        message: BusMessage,
+        *,
+        process_id: str,
+        kind: Literal["output", "completion"],
+    ) -> None:
+        """Queue a shell notification tied to the current shell buffer state.
+
+        Shell wakeups are delivery triggers, while shell output and completion
+        results live in Shell output buffers. The buffer can be drained by
+        shell_wait() or inject_background_results() before the TUI redelivers
+        this notification, so delivery validates that the wakeup is still useful.
+        """
+        self._pending_messages.append(
+            PendingBackgroundMessage(
+                message=message,
+                shell_process_id=process_id,
+                shell_kind=kind,
+            )
+        )
+
+    def deliver_pending_messages(self, bus: MessageBus, agent_id: str) -> int:
+        """Deliver queued background notifications to the message bus.
+
+        The TUI calls this immediately before starting the wake-up turn. This
+        avoids losing messages when the main SDK context exits and clears bus state.
+        Shell wakeups are dropped if their process output was already drained.
+        """
+        if not self._pending_messages:
+            return 0
+        bus.subscribe(agent_id)
+        delivered = 0
+        remaining: list[PendingBackgroundMessage] = []
+        for pending in self._pending_messages:
+            message = pending.message
+            target = message.target
+            if target is not None and target != agent_id:
+                remaining.append(pending)
+                continue
+            if not self._is_pending_message_deliverable(pending):
+                logger.debug(
+                    "Dropping stale background notification: source=%s target=%s process_id=%s kind=%s",
+                    message.source,
+                    message.target,
+                    pending.shell_process_id,
+                    pending.shell_kind,
+                )
+                continue
+            bus.send(message)
+            delivered += 1
+        self._pending_messages = remaining
+        return delivered
+
+    def _is_pending_message_deliverable(self, pending: PendingBackgroundMessage) -> bool:
+        """Return whether a queued notification still has work for the agent."""
+        if pending.shell_process_id is None or pending.shell_kind is None:
+            return True
+        if self._shell is None:
+            return True
+
+        try:
+            buf = self._shell._output_buffers.get(pending.shell_process_id)
+        except AttributeError:
+            return True
+        if buf is None:
+            return False
+
+        if pending.shell_kind == "output":
+            return len(buf.stdout) > 0 or len(buf.stderr) > 0
+        if pending.shell_kind == "completion":
+            return bool(buf.completed)
+        return True
+
+    def enqueue_usage_snapshot(self, snapshot: UsageSnapshot) -> None:
+        """Queue a usage snapshot for delivery when the TUI wakes the main agent."""
+        self._pending_usage_snapshots.append(snapshot)
+
+    def drain_usage_snapshots(self) -> list[UsageSnapshot]:
+        """Return and clear queued usage snapshots."""
+        snapshots = list(self._pending_usage_snapshots)
+        self._pending_usage_snapshots.clear()
+        return snapshots
+
+    @property
+    def has_pending_messages(self) -> bool:
+        """Whether queued background notifications are waiting for TUI delivery."""
+        return bool(self._pending_messages)
+
+    @property
+    def has_pending_usage_snapshots(self) -> bool:
+        """Whether queued usage snapshots are waiting for TUI delivery."""
+        return bool(self._pending_usage_snapshots)
 
     def get_delegate_tool(self) -> BaseTool | None:
         """Get the delegate tool instance from the core toolset.
@@ -305,12 +417,14 @@ class BackgroundMonitor(BaseResource):
                 content += f" ({command})"
             content += ". Use shell_wait(process_id, timeout_seconds=0) to read it."
 
-            self._bus.send(
+            self.enqueue_shell_message(
                 BusMessage(
                     content=content,
                     source="shell-monitor",
                     target=self._agent_id,
-                )
+                ),
+                process_id=process_id,
+                kind="output",
             )
 
         if self._completion_callback:
@@ -420,12 +534,14 @@ class BackgroundMonitor(BaseResource):
             if command:
                 content += f" ({command})"
 
-            self._bus.send(
+            self.enqueue_shell_message(
                 BusMessage(
                     content=content,
                     source="shell-monitor",
                     target=self._agent_id,
-                )
+                ),
+                process_id=process_id,
+                kind="completion",
             )
 
         # Invoke completion callback (same as subagent completion)
@@ -492,3 +608,5 @@ class BackgroundMonitor(BaseResource):
         self._known_active.clear()
         self._monitored_processes.clear()
         self._notified_pending.clear()
+        self._pending_messages.clear()
+        self._pending_usage_snapshots.clear()

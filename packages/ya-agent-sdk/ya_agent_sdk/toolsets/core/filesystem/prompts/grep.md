@@ -3,7 +3,7 @@ FileOperator-backed content search with ripgrep-backed regex and glob semantics.
 Returns matching lines with optional surrounding context.
 
 <semantics>
-- Traversal uses FileOperator directory primitives, so search stays inside the active environment boundary.
+- Traversal uses FileOperator.walk_files, so search stays inside the active environment boundary.
 - Regex validation and matching use the native ripgrep core when available, with Python fallback for portability.
 - File selection uses ripgrep-style glob semantics shared with the glob tool.
 - Bare include patterns like `*.py` match recursively at any depth.

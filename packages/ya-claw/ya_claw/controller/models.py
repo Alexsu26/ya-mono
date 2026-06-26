@@ -6,7 +6,15 @@ from typing import Annotated, Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field
 
-from ya_claw.orm.tables import RunRecord, SessionRecord
+from ya_claw.json_types import JsonObject, JsonValue
+from ya_claw.orm.tables import (
+    AgencyFireRecord,
+    RunRecord,
+    SessionMemoryStateRecord,
+    SessionRecord,
+)
+from ya_claw.workspace.models import WorkspaceBindingSpec
+from ya_claw.workspace.runtime_models import SessionWorkspaceState, build_session_workspace_state
 
 
 class RunStatus(StrEnum):
@@ -26,17 +34,73 @@ class SessionStatus(StrEnum):
     CANCELLED = RunStatus.CANCELLED
 
 
+class SessionStatusReason(StrEnum):
+    IDLE = "idle"
+    RUN_QUEUED = "run_queued"
+    RUN_RUNNING = "run_running"
+    HITL_PENDING = "hitl_pending"
+    RUN_COMPLETED = "run_completed"
+    RUN_FAILED = "run_failed"
+    RUN_CANCELLED = "run_cancelled"
+
+
 class TriggerType(StrEnum):
     API = "api"
     BRIDGE = "bridge"
     SCHEDULE = "schedule"
     HEARTBEAT = "heartbeat"
     MEMORY = "memory"
+    AGENCY = "agency"
+    AGENCY_HANDOFF = "agency_handoff"
+    ASYNC_TASK = "async_task"
+    WORKFLOW = "workflow"
+
+
+class AgencyHandoffKind(StrEnum):
+    CONTEXT = "context"
+    EXCHANGE = "exchange"
+    REMINDER = "reminder"
+    TASK = "task"
+    RISK = "risk"
+    ASYNC_RESULT = "async_result"
+    DECISION = "decision"
+    CONFLICT = "conflict"
 
 
 class SessionType(StrEnum):
     CONVERSATION = "conversation"
     MEMORY = "memory"
+    AGENCY = "agency"
+    ASYNC_TASK = "async_task"
+
+
+class AsyncTaskStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class AsyncTaskWakePolicy(StrEnum):
+    STEER_OR_RUN = "steer_or_run"
+    RECORD_ONLY = "record_only"
+
+
+class AgencyFireKind(StrEnum):
+    MESSAGE_OBSERVED = "message_observed"
+    RUN_OUTPUT_OBSERVED = "run_output_observed"
+    MEMORY_SESSION_COMPLETED = "memory_session_completed"
+    HEARTBEAT = "heartbeat"
+
+
+class AgencyFireStatus(StrEnum):
+    PENDING = "pending"
+    SUBMITTED = "submitted"
+    STEERED = "steered"
+    MERGED = "merged"
+    CONSUMED = "consumed"
+    FAILED = "failed"
 
 
 class MemoryJobKind(StrEnum):
@@ -118,18 +182,54 @@ class UserInteraction(BaseModel):
     tool_call_id: str
     approved: bool
     reason: str | None = None
-    user_input: Any | None = None
+    user_input: JsonValue = None
+
+
+class ActiveInteraction(BaseModel):
+    interaction_id: str
+    run_id: str
+    session_id: str
+    tool_call_id: str
+    tool_name: str | None = None
+    kind: str = "approval"
+    title: str
+    description: str | None = None
+    arguments_preview: JsonValue = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["pending", "approved", "denied"] = "pending"
+    sequence_no: int = 1
+    total_count: int = 1
+    created_at: datetime | None = None
+    resolved_at: datetime | None = None
+
+
+class InteractionRespondRequest(BaseModel):
+    approved: bool
+    reason: str | None = None
+    user_input: JsonValue = None
+    client_token: str | None = None
+
+
+class InteractionRespondResponse(BaseModel):
+    session_id: str
+    run_id: str
+    interaction_id: str
+    tool_call_id: str
+    status: Literal["pending", "approved", "denied"]
+    remaining_interaction_count: int
+    current_interaction: ActiveInteraction | None = None
 
 
 class ToolResult(BaseModel):
     tool_call_id: str
-    content: Any
+    content: JsonValue
     error: str | None = None
 
 
 class SessionCreateRequest(BaseModel):
     profile_name: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    workspace: WorkspaceBindingSpec | None = None
     input_parts: list[InputPart] = Field(default_factory=list)
     dispatch_mode: DispatchMode = DispatchMode.ASYNC
     trigger_type: TriggerType = TriggerType.API
@@ -140,6 +240,7 @@ class SessionRunCreateRequest(BaseModel):
     reset_state: bool = False
     input_parts: list[InputPart] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    workspace: WorkspaceBindingSpec | None = None
     dispatch_mode: DispatchMode = DispatchMode.ASYNC
     trigger_type: TriggerType = TriggerType.API
 
@@ -148,6 +249,7 @@ class SessionForkRequest(BaseModel):
     restore_from_run_id: str | None = None
     profile_name: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    workspace: WorkspaceBindingSpec | None = None
 
 
 class RunCreateRequest(BaseModel):
@@ -158,11 +260,88 @@ class RunCreateRequest(BaseModel):
     input_parts: list[InputPart] = Field(default_factory=list)
     trigger_type: TriggerType = TriggerType.API
     metadata: dict[str, Any] = Field(default_factory=dict)
+    workspace: WorkspaceBindingSpec | None = None
     dispatch_mode: DispatchMode = DispatchMode.ASYNC
 
 
 class SteerRequest(BaseModel):
     input_parts: list[InputPart] = Field(default_factory=list)
+
+
+class SessionSubmitRequest(BaseModel):
+    input_parts: list[InputPart] = Field(default_factory=list)
+    restore_from_run_id: str | None = None
+    reset_state: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    workspace: WorkspaceBindingSpec | None = None
+    dispatch_mode: DispatchMode = DispatchMode.ASYNC
+    trigger_type: TriggerType = TriggerType.API
+
+
+class SessionSubmitResponse(BaseModel):
+    session_id: str
+    run_id: str
+    delivery: Literal["steered", "merged", "submitted", "queued"]
+    status: RunStatus | str
+    run: RunDetail | None = None
+
+
+class AsyncTaskSpawnRequest(BaseModel):
+    subagent_name: str
+    prompt: str
+    name: str | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
+    wake_policy: AsyncTaskWakePolicy = AsyncTaskWakePolicy.STEER_OR_RUN
+    parent_run_id: str | None = None
+    parent_agent_id: str = "main"
+
+
+class AsyncTaskSteerRequest(BaseModel):
+    input_parts: list[InputPart] = Field(default_factory=list)
+    prompt: str | None = None
+
+
+class AsyncTaskCancelRequest(BaseModel):
+    reason: str | None = None
+
+
+class AsyncTaskSummary(BaseModel):
+    name: str
+    task_session_id: str
+    status: AsyncTaskStatus | str
+
+
+class AsyncTaskDetail(AsyncTaskSummary):
+    task_id: str
+    parent_session_id: str
+    parent_run_id: str | None = None
+    parent_agent_id: str = "main"
+    task_run_id: str | None = None
+    subagent_name: str
+    wake_policy: AsyncTaskWakePolicy | str = AsyncTaskWakePolicy.STEER_OR_RUN
+    result_run_id: str | None = None
+    error_message: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    child_session: dict[str, Any] | None = None
+    latest_run: dict[str, Any] | None = None
+    output_text: str | None = None
+    trace_ref: dict[str, Any] | None = None
+    delivery: Literal["submitted", "existing_active", "resumed", "recorded", "steered", "cancelled", "idle"] | None = (
+        None
+    )
+    instruction: str | None = None
+
+
+class AsyncTaskListResponse(BaseModel):
+    parent_session_id: str
+    subagents: list[AsyncTaskSummary] = Field(default_factory=list)
+
+
+class AsyncTaskResponse(BaseModel):
+    task: AsyncTaskDetail
 
 
 class RunSummary(BaseModel):
@@ -176,7 +355,6 @@ class RunSummary(BaseModel):
     input_preview: str | None = None
     input_parts: list[InputPart] | None = None
     output_text: str | None = None
-    output_summary: str | None = None
     error_message: str | None = None
     termination_reason: TerminationReason | None = None
     created_at: datetime
@@ -201,7 +379,6 @@ class SessionTurn(BaseModel):
     input_preview: str | None = None
     input_parts: list[InputPart] = Field(default_factory=list)
     output_text: str | None = None
-    output_summary: str | None = None
     created_at: datetime
     committed_at: datetime | None = None
 
@@ -210,8 +387,92 @@ class SessionTurnsResponse(BaseModel):
     session_id: str
     limit: int
     has_more: bool = False
+    next_cursor: str | None = None
     next_before_sequence_no: int | None = None
     turns: list[SessionTurn] = Field(default_factory=list)
+
+
+class AgencyRiskPolicy(BaseModel):
+    max_auto_action_risk: Literal["low", "medium", "high", "extra_high"] = "extra_high"
+
+
+class AgencyFireSummary(BaseModel):
+    id: str
+    kind: AgencyFireKind | str
+    status: AgencyFireStatus | str
+    scheduled_at: datetime
+    fired_at: datetime | None = None
+    dedupe_key: str
+    source_session_id: str | None = None
+    source_run_id: str | None = None
+    agency_session_id: str | None = None
+    run_id: str | None = None
+    active_run_id: str | None = None
+    run_status: RunStatus | str | None = None
+    priority: int = 100
+    payload: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    consumed_at: datetime | None = None
+
+
+class AgencyFireListResponse(BaseModel):
+    fires: list[AgencyFireSummary] = Field(default_factory=list)
+
+
+class AgencyConfigResponse(BaseModel):
+    enabled: bool = True
+    profile_name: str
+    timer_interval_seconds: int
+    agency_session_id: str
+    singleton_scope_key: str
+    singleton_source_session_id: str
+    risk_policy: AgencyRiskPolicy = Field(default_factory=AgencyRiskPolicy)
+    memory_files: dict[str, str] = Field(default_factory=dict)
+    next_fire_at: datetime | None = None
+
+
+class AgencyStatusResponse(BaseModel):
+    enabled: bool = True
+    agency_session_id: str
+    state: Literal["idle", "queued", "running"] = "idle"
+    active_run: RunSummary | None = None
+    latest_run: RunSummary | None = None
+    active_run_id: str | None = None
+    latest_run_id: str | None = None
+    next_fire_at: datetime | None = None
+    pending_fire_count: int = 0
+    last_fire: AgencyFireSummary | None = None
+    agency_session: SessionSummary
+
+
+class AgencyClearResponse(BaseModel):
+    accepted: bool = True
+    cleared_session_id: str | None = None
+    new_agency_session_id: str
+    archived_run_ids: list[str] = Field(default_factory=list)
+    deleted_fire_count: int = 0
+    cleared_at: datetime
+    agency_session: SessionSummary
+
+
+class AgencySourceSessionSubmitRequest(BaseModel):
+    session_id: str = Field(validation_alias=AliasChoices("session_id", "source_session_id"))
+    prompt: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    handoff_kind: AgencyHandoffKind
+    handoff_tags: list[str] = Field(default_factory=lambda: ["agency-reminder"])
+    agency_session_id: str | None = None
+    agency_run_id: str | None = None
+
+
+class AgencySourceSessionSubmitResponse(BaseModel):
+    source_session_id: str
+    delivery: Literal["steered", "merged", "submitted", "queued"]
+    run_id: str
+    status: RunStatus | str
+    session_submit: SessionSubmitResponse
 
 
 class RunTraceItem(BaseModel):
@@ -245,12 +506,15 @@ class SessionSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     status: SessionStatus = SessionStatus.IDLE
+    status_reason: SessionStatusReason = SessionStatusReason.IDLE
+    status_detail: dict[str, Any] = Field(default_factory=dict)
     run_count: int = 0
     head_run_id: str | None = None
     head_success_run_id: str | None = None
     active_run_id: str | None = None
     latest_run: RunSummary | None = None
     memory_state: MemoryStateSummary | None = None
+    workspace_state: SessionWorkspaceState | None = None
 
 
 class SessionDetail(SessionSummary):
@@ -297,14 +561,14 @@ class MemoryActionResponse(BaseModel):
 
 class SessionGetResponse(BaseModel):
     session: SessionDetail
-    state: dict[str, object] | None = None
+    state: JsonObject | None = None
     message: list[dict[str, Any]] | None = None
 
 
 class RunGetResponse(BaseModel):
     session: SessionSummary
     run: RunDetail
-    state: dict[str, object] | None = None
+    state: JsonObject | None = None
     message: list[dict[str, Any]] | None = None
 
 
@@ -319,6 +583,8 @@ class ProfileSubagent(BaseModel):
     name: str
     description: str
     system_prompt: str
+    tools: list[str] | None = None
+    optional_tools: list[str] | None = None
     model: str | None = None
     model_settings_preset: str | None = None
     model_settings_override: dict[str, Any] | None = None
@@ -434,17 +700,6 @@ def public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return dict(metadata)
 
 
-def parse_message_events(raw_message_payload: Any) -> list[dict[str, Any]] | None:
-    if raw_message_payload is None:
-        return None
-    if not isinstance(raw_message_payload, list):
-        raise TypeError("message payload must be a top-level JSON array of AGUI event objects")
-    parsed_events = [event for event in raw_message_payload if isinstance(event, dict)]
-    if len(parsed_events) != len(raw_message_payload):
-        raise TypeError("message payload must contain only AGUI event objects")
-    return parsed_events
-
-
 def run_summary_from_record(
     record: RunRecord,
     *,
@@ -464,7 +719,6 @@ def run_summary_from_record(
         input_preview=extract_input_preview(input_parts),
         input_parts=input_parts if include_input_parts else None,
         output_text=record.output_text,
-        output_summary=record.output_summary,
         error_message=record.error_message,
         termination_reason=termination_reason,
         created_at=record.created_at,
@@ -495,10 +749,18 @@ def session_turn_from_record(record: RunRecord) -> SessionTurn:
         input_preview=extract_input_preview(input_parts),
         input_parts=input_parts,
         output_text=record.output_text,
-        output_summary=record.output_summary,
         created_at=record.created_at,
         committed_at=record.committed_at,
     )
+
+
+def active_interactions_from_run_record(record: RunRecord) -> list[dict[str, Any]]:
+    if not isinstance(record.run_metadata, dict):
+        return []
+    interactions = record.run_metadata.get("active_interactions")
+    if not isinstance(interactions, list):
+        return []
+    return [interaction for interaction in interactions if isinstance(interaction, dict)]
 
 
 def resolve_session_status(latest_run: RunSummary | None) -> SessionStatus:
@@ -507,7 +769,52 @@ def resolve_session_status(latest_run: RunSummary | None) -> SessionStatus:
     return SessionStatus(latest_run.status)
 
 
-def memory_state_summary_from_record(record: Any) -> MemoryStateSummary:
+def resolve_session_status_reason(
+    latest_run: RunSummary | None,
+    *,
+    active_interactions: list[dict[str, Any]] | None = None,
+) -> SessionStatusReason:
+    if latest_run is None:
+        return SessionStatusReason.IDLE
+    if latest_run.status == RunStatus.QUEUED:
+        return SessionStatusReason.RUN_QUEUED
+    if latest_run.status == RunStatus.RUNNING:
+        if active_interactions:
+            return SessionStatusReason.HITL_PENDING
+        return SessionStatusReason.RUN_RUNNING
+    if latest_run.status == RunStatus.COMPLETED:
+        return SessionStatusReason.RUN_COMPLETED
+    if latest_run.status == RunStatus.FAILED:
+        return SessionStatusReason.RUN_FAILED
+    if latest_run.status == RunStatus.CANCELLED:
+        return SessionStatusReason.RUN_CANCELLED
+    return SessionStatusReason.IDLE
+
+
+def resolve_session_status_detail(
+    latest_run: RunSummary | None,
+    *,
+    active_interactions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if latest_run is None:
+        return {}
+
+    detail: dict[str, Any] = {
+        "run_id": latest_run.id,
+        "sequence_no": latest_run.sequence_no,
+        "trigger_type": latest_run.trigger_type,
+    }
+    if latest_run.termination_reason is not None:
+        detail["termination_reason"] = latest_run.termination_reason
+    if latest_run.error_message is not None:
+        detail["error_message"] = latest_run.error_message
+    if active_interactions:
+        detail["active_interactions"] = active_interactions
+        detail["active_interaction_count"] = len(active_interactions)
+    return detail
+
+
+def memory_state_summary_from_record(record: SessionMemoryStateRecord) -> MemoryStateSummary:
     return MemoryStateSummary(
         source_session_id=record.source_session_id,
         memory_session_id=record.memory_session_id,
@@ -523,6 +830,33 @@ def memory_state_summary_from_record(record: Any) -> MemoryStateSummary:
         metadata=public_memory_metadata(dict(record.memory_metadata or {})),
         created_at=record.created_at,
         updated_at=record.updated_at,
+    )
+
+
+def agency_fire_summary_from_record(
+    record: AgencyFireRecord,
+    *,
+    run_status: str | None = None,
+) -> AgencyFireSummary:
+    return AgencyFireSummary(
+        id=record.id,
+        kind=record.kind,
+        status=record.status,
+        scheduled_at=record.scheduled_at,
+        fired_at=record.fired_at,
+        dedupe_key=record.dedupe_key,
+        source_session_id=record.source_session_id,
+        source_run_id=record.source_run_id,
+        agency_session_id=record.agency_session_id,
+        run_id=record.run_id,
+        active_run_id=record.active_run_id,
+        run_status=run_status,
+        priority=record.priority,
+        payload=public_metadata(dict(record.payload or {})),
+        error_message=record.error_message,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        consumed_at=record.consumed_at,
     )
 
 
@@ -556,6 +890,8 @@ def session_summary_from_record(
     run_count: int,
     latest_run: RunSummary | None,
     memory_state: MemoryStateSummary | None = None,
+    active_interactions: list[dict[str, Any]] | None = None,
+    workspace_state: SessionWorkspaceState | None = None,
 ) -> SessionSummary:
     return SessionSummary(
         id=record.id,
@@ -567,10 +903,15 @@ def session_summary_from_record(
         created_at=record.created_at,
         updated_at=record.updated_at,
         status=resolve_session_status(latest_run),
+        status_reason=resolve_session_status_reason(latest_run, active_interactions=active_interactions),
+        status_detail=resolve_session_status_detail(latest_run, active_interactions=active_interactions),
         run_count=run_count,
         head_run_id=record.head_run_id,
         head_success_run_id=record.head_success_run_id,
         active_run_id=record.active_run_id,
         latest_run=latest_run,
         memory_state=memory_state,
+        workspace_state=workspace_state
+        if workspace_state is not None
+        else build_session_workspace_state(record.session_metadata),
     )

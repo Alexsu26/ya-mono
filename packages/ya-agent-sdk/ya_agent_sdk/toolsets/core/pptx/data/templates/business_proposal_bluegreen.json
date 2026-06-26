@@ -1,0 +1,100 @@
+{
+  "asset_policy": {
+    "allow_public_image_search": true,
+    "preferred_kinds": [
+      "business cooperation",
+      "project proposal",
+      "urban development",
+      "retail planning"
+    ],
+    "requires_template_assets": true,
+    "template_asset_profile": "business_proposal_bluegreen",
+    "template_backed": true
+  },
+  "id": "business_proposal_bluegreen",
+  "keywords": [
+    "\u5408\u4f5c",
+    "\u9879\u76ee\u5408\u4f5c",
+    "\u65b9\u6848",
+    "\u62a5\u4ef7",
+    "\u914d\u5408",
+    "\u9879\u76ee\u4ecb\u7ecd",
+    "\u9700\u6c42\u5206\u6790",
+    "\u9884\u7b97",
+    "\u5546\u4e1a",
+    "\u89c4\u5212"
+  ],
+  "layouts": [
+    {
+      "description": "Blue-green cooperation proposal cover",
+      "id": "cover",
+      "role": "cover"
+    },
+    {
+      "description": "Two-column contents with numbered blue blocks",
+      "id": "agenda",
+      "role": "agenda"
+    },
+    {
+      "description": "Full-width blue chapter divider with large section number",
+      "id": "section",
+      "role": "section"
+    },
+    {
+      "description": "Business metrics and data-stat chart cards",
+      "id": "metric_cards",
+      "role": "content"
+    },
+    {
+      "description": "Four-quadrant strategy or SWOT matrix",
+      "id": "matrix_2x2",
+      "role": "content"
+    },
+    {
+      "description": "Central system node with six surrounding ecosystem nodes",
+      "id": "hub_spoke",
+      "role": "content"
+    },
+    {
+      "description": "Partner responsibility cards for cooperation workstreams",
+      "id": "party_roles",
+      "role": "content"
+    },
+    {
+      "description": "Blue-header risk or budget table",
+      "id": "risk_grid",
+      "role": "content"
+    },
+    {
+      "description": "Blue-green alternating roadmap",
+      "id": "timeline",
+      "role": "content"
+    },
+    {
+      "description": "Two-column cooperation evidence split",
+      "id": "two_column",
+      "role": "content"
+    },
+    {
+      "description": "Blue-green closing recommendation",
+      "id": "summary",
+      "role": "summary"
+    }
+  ],
+  "scene": "business_proposal",
+  "style": "consulting_report",
+  "theme": {
+    "accentColor": "036EB8",
+    "backgroundColor": "FFFFFF",
+    "bodyColor": "333333",
+    "bodyFontFace": "Microsoft YaHei",
+    "cardColor": "FFFFFF",
+    "cardTextColor": "333333",
+    "fontFace": "Microsoft YaHei",
+    "mutedColor": "EEECE1",
+    "secondaryAccentColor": "34BF49",
+    "surfaceColor": "F6FAFD",
+    "titleColor": "333333",
+    "titleFontFace": "Microsoft YaHei"
+  }
+}

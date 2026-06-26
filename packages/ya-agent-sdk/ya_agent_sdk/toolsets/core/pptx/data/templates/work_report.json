@@ -1,0 +1,66 @@
+{
+  "asset_policy": {
+    "allow_public_image_search": true,
+    "preferred_kinds": [
+      "business",
+      "office",
+      "chart"
+    ]
+  },
+  "id": "work_report",
+  "keywords": [
+    "\u8ff0\u804c",
+    "\u4e1a\u7ee9",
+    "\u76ee\u6807",
+    "\u56e2\u961f\u534f\u4f5c",
+    "\u53cd\u601d",
+    "\u5165\u804c",
+    "\u6838\u5fc3\u6307\u6807"
+  ],
+  "layouts": [
+    {
+      "description": "Report title and reporting period",
+      "id": "cover",
+      "role": "cover"
+    },
+    {
+      "description": "Report agenda",
+      "id": "agenda",
+      "role": "agenda"
+    },
+    {
+      "description": "Report section divider",
+      "id": "section",
+      "role": "section"
+    },
+    {
+      "description": "Editable report content",
+      "id": "content",
+      "role": "content"
+    },
+    {
+      "description": "Performance case or project story",
+      "id": "case",
+      "role": "case"
+    },
+    {
+      "description": "Chart or evidence placeholder",
+      "id": "image_placeholder",
+      "role": "image_placeholder"
+    },
+    {
+      "description": "Summary and next steps",
+      "id": "summary",
+      "role": "summary"
+    }
+  ],
+  "scene": "work_report",
+  "style": "modern_business",
+  "theme": {
+    "accentColor": "2F80ED",
+    "backgroundColor": "F8FAFC",
+    "bodyColor": "2F3A45",
+    "fontFace": "Aptos",
+    "titleColor": "233142"
+  }
+}

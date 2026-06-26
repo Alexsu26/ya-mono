@@ -1,13 +1,9 @@
-import os
-
 import httpx
 from pydantic_ai.models import (
     get_user_agent,
 )
 from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig
 from tenacity import retry_if_exception_type, stop_after_attempt, wait_exponential
-
-_PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 
 
 def create_async_http_client(
@@ -37,13 +33,7 @@ def create_async_http_client(
     if extra_headers:
         headers.update(extra_headers)
 
-    timeout_config = httpx.Timeout(timeout=timeout, connect=connect, read=read)
-    if _has_proxy_env():
-        return httpx.AsyncClient(timeout=timeout_config, headers=headers)
-
     return httpx.AsyncClient(
-        timeout=timeout_config,
-        headers=headers,
         transport=AsyncTenacityTransport(
             config=RetryConfig(
                 retry=retry_if_exception_type((
@@ -55,8 +45,6 @@ def create_async_http_client(
                 reraise=True,
             )
         ),
+        timeout=httpx.Timeout(timeout=timeout, connect=connect, read=read),
+        headers=headers,
     )
-
-
-def _has_proxy_env() -> bool:
-    return any(os.environ.get(name) for name in _PROXY_ENV_VARS)

@@ -15,6 +15,8 @@ from pydantic_ai import RunContext
 from ya_agent_sdk.context import AgentContext
 from ya_agent_sdk.toolsets.core.base import BaseTool
 
+from ya_claw.json_types import JsonArray, JsonValue
+
 CLAW_SELF_CLIENT_KEY = "claw_self_client"
 _DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 
@@ -23,7 +25,13 @@ _DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 class SelfSessionClient(Protocol):
     session_id: str
 
-    async def list_session_turns(self, *, limit: int, before_sequence_no: int | None) -> dict[str, Any]: ...
+    async def list_session_turns(
+        self,
+        *,
+        limit: int,
+        before_sequence_no: int | None,
+        cursor: str | None,
+    ) -> dict[str, Any]: ...
 
     async def get_run_trace(self, *, run_id: str, max_item_chars: int, max_total_chars: int) -> dict[str, Any]: ...
 
@@ -57,9 +65,80 @@ class ClawSelfClient:
     def get_toolsets(self) -> list[Any]:
         return []
 
-    async def list_session_turns(self, *, limit: int, before_sequence_no: int | None) -> dict[str, Any]:
+    async def list_source_session_turns(
+        self,
+        *,
+        source_session_id: str | None = None,
+        limit: int,
+        before_sequence_no: int | None,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        session_id = source_session_id.strip() if isinstance(source_session_id, str) else ""
+        if session_id == "":
+            session_id = self.session_id
         params: dict[str, str] = {"limit": str(limit)}
-        if isinstance(before_sequence_no, int):
+        if isinstance(cursor, str) and cursor.strip() != "":
+            params["cursor"] = cursor.strip()
+        elif isinstance(before_sequence_no, int):
+            params["before_sequence_no"] = str(before_sequence_no)
+        path = f"/api/v1/sessions/{urllib.parse.quote(session_id)}/turns"
+        return await self._get_json(path, params=params)
+
+    async def get_source_run_trace(self, *, run_id: str, max_item_chars: int, max_total_chars: int) -> dict[str, Any]:
+        params = {
+            "max_item_chars": str(max_item_chars),
+            "max_total_chars": str(max_total_chars),
+        }
+        path = f"/api/v1/runs/{urllib.parse.quote(run_id)}/trace"
+        return await self._get_json(path, params=params)
+
+    async def list_agency_runs(self, *, limit: int) -> dict[str, Any]:
+        agency_session_id = self.session_id
+        detail = await self._get_json(
+            f"/api/v1/sessions/{urllib.parse.quote(agency_session_id)}",
+            params={"runs_limit": str(limit), "include_input_parts": "true", "include_message": "false"},
+        )
+        session = detail.get("session") if isinstance(detail, dict) else None
+        runs = session.get("runs") if isinstance(session, dict) else []
+        return {
+            "agency_session_id": agency_session_id,
+            "runs": runs if isinstance(runs, list) else [],
+        }
+
+    async def submit_to_session(
+        self,
+        *,
+        session_id: str,
+        prompt: str,
+        metadata: dict[str, Any] | None,
+        handoff_kind: str,
+        handoff_tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return await self._send_json(
+            "/api/v1/agency/source-session:submit",
+            method="POST",
+            payload={
+                "session_id": session_id,
+                "prompt": prompt,
+                "metadata": dict(metadata or {}),
+                "handoff_kind": handoff_kind,
+                "handoff_tags": list(handoff_tags or ["agency-reminder"]),
+                "agency_session_id": self.session_id,
+                "agency_run_id": self.run_id or None,
+            },
+        )
+
+    async def list_session_turns(
+        self,
+        *,
+        limit: int,
+        before_sequence_no: int | None,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        params: dict[str, str] = {"limit": str(limit)}
+        if isinstance(cursor, str) and cursor.strip() != "":
+            params["cursor"] = cursor.strip()
+        elif isinstance(before_sequence_no, int):
             params["before_sequence_no"] = str(before_sequence_no)
         path = f"/api/v1/sessions/{urllib.parse.quote(self.session_id)}/turns"
         return await self._get_json(path, params=params)
@@ -75,6 +154,56 @@ class ClawSelfClient:
         if response_session_id != self.session_id:
             raise RuntimeError("Requested run does not belong to the current session.")
         return payload
+
+    async def spawn_delegate(
+        self,
+        *,
+        subagent_name: str,
+        prompt: str,
+        name: str | None,
+        context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        path = f"/api/v1/sessions/{urllib.parse.quote(self.session_id)}/async-tasks:spawn"
+        payload = {
+            "subagent_name": subagent_name,
+            "prompt": prompt,
+            "name": name,
+            "context": dict(context or {}),
+            "parent_run_id": self.run_id or None,
+            "parent_agent_id": "main",
+        }
+        return await self._send_json(path, method="POST", payload=payload)
+
+    async def list_async_subagents(self, *, include_terminal: bool) -> dict[str, Any]:
+        path = f"/api/v1/sessions/{urllib.parse.quote(self.session_id)}/async-tasks"
+        return await self._get_json(
+            path,
+            params={"include_terminal": "true" if include_terminal else "false"},
+        )
+
+    async def get_async_subagent(self, *, name_or_task_id: str) -> dict[str, Any]:
+        path = (
+            f"/api/v1/sessions/{urllib.parse.quote(self.session_id)}/async-tasks/{urllib.parse.quote(name_or_task_id)}"
+        )
+        return await self._get_json(path, params={})
+
+    async def steer_async_subagent(
+        self,
+        *,
+        name_or_task_id: str,
+        prompt: str | None,
+        input_parts: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        path = f"/api/v1/sessions/{urllib.parse.quote(self.session_id)}/async-tasks/{urllib.parse.quote(name_or_task_id)}:steer"
+        return await self._send_json(
+            path,
+            method="POST",
+            payload={"prompt": prompt, "input_parts": list(input_parts or [])},
+        )
+
+    async def cancel_async_subagent(self, *, name_or_task_id: str, reason: str | None) -> dict[str, Any]:
+        path = f"/api/v1/sessions/{urllib.parse.quote(self.session_id)}/async-tasks/{urllib.parse.quote(name_or_task_id)}:cancel"
+        return await self._send_json(path, method="POST", payload={"reason": reason})
 
     async def list_schedules(
         self,
@@ -117,6 +246,77 @@ class ClawSelfClient:
         path = f"/api/v1/schedules/{urllib.parse.quote(schedule_id)}:trigger"
         return await self._send_json(path, method="POST", payload={"prompt_override": prompt_override})
 
+    async def list_workflows(self, *, params: dict[str, str]) -> dict[str, Any]:
+        effective_params = {"current_session_id": self.session_id, **params}
+        return await self._get_json("/api/v1/workflows", params=effective_params)
+
+    async def get_workflow(self, *, workflow_id: str) -> dict[str, Any]:
+        return await self._get_json(f"/api/v1/workflows/{urllib.parse.quote(workflow_id)}", params={})
+
+    async def create_workflow(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._send_json("/api/v1/agent/workflows", method="POST", payload=payload)
+
+    async def update_workflow(self, *, workflow_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._send_json(
+            f"/api/v1/workflows/{urllib.parse.quote(workflow_id)}",
+            method="PATCH",
+            payload=payload,
+        )
+
+    async def archive_workflow(self, *, workflow_id: str) -> dict[str, Any]:
+        return await self._send_json(
+            f"/api/v1/workflows/{urllib.parse.quote(workflow_id)}:archive",
+            method="POST",
+            payload={},
+        )
+
+    async def start_workflow(self, *, workflow_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._send_json(
+            f"/api/v1/agent/workflows/{urllib.parse.quote(workflow_id)}:trigger",
+            method="POST",
+            payload=payload,
+        )
+
+    async def list_workflow_runs(self, *, params: dict[str, str]) -> dict[str, Any]:
+        effective_params = {"current_session_id": self.session_id, **params}
+        return await self._get_json("/api/v1/workflow-runs", params=effective_params)
+
+    async def get_workflow_run(self, *, workflow_run_id: str) -> dict[str, Any]:
+        return await self._get_json(f"/api/v1/workflow-runs/{urllib.parse.quote(workflow_run_id)}", params={})
+
+    async def cancel_workflow_run(self, *, workflow_run_id: str, reason: str | None) -> dict[str, Any]:
+        return await self._send_json(
+            f"/api/v1/workflow-runs/{urllib.parse.quote(workflow_run_id)}/cancel",
+            method="POST",
+            payload={"reason": reason},
+        )
+
+    async def steer_workflow_node(
+        self,
+        *,
+        workflow_run_id: str,
+        node_id: str,
+        input_parts: list[dict[str, Any]],
+        prompt: str | None,
+    ) -> dict[str, Any]:
+        return await self._send_json(
+            f"/api/v1/workflow-runs/{urllib.parse.quote(workflow_run_id)}/nodes/{urllib.parse.quote(node_id)}/steer",
+            method="POST",
+            payload={"input_parts": input_parts, "prompt": prompt},
+        )
+
+    async def list_agent_presets(self, *, query: str | None) -> dict[str, Any]:
+        payload = await asyncio.to_thread(self._get_json_sync, "/api/v1/profiles", {})
+        profiles = (
+            payload if isinstance(payload, list) else payload.get("profiles") if isinstance(payload, dict) else []
+        )
+        if isinstance(query, str) and query.strip() != "" and isinstance(profiles, list):
+            needle = query.strip().lower()
+            profiles = [
+                item for item in profiles if isinstance(item, dict) and needle in str(item.get("name", "")).lower()
+            ]
+        return {"profiles": profiles if isinstance(profiles, list) else []}
+
     async def _get_json(self, path: str, *, params: dict[str, str]) -> dict[str, Any]:
         payload = await asyncio.to_thread(self._get_json_sync, path, params)
         if isinstance(payload, dict):
@@ -129,7 +329,7 @@ class ClawSelfClient:
             return response_payload
         raise RuntimeError("YA Claw self API returned a non-object JSON payload.")
 
-    def _get_json_sync(self, path: str, params: dict[str, str]) -> Any:
+    def _get_json_sync(self, path: str, params: dict[str, str]) -> JsonValue:
         query = urllib.parse.urlencode(params)
         url = f"{self._base_url}{path}"
         if query:
@@ -139,7 +339,7 @@ class ClawSelfClient:
             raise RuntimeError("YA Claw self API URL must use http or https.")
         request = urllib.request.Request(  # noqa: S310
             url,
-            headers={"Authorization": f"Bearer {self._api_token}"},
+            headers=self._headers(),
             method="GET",
         )
         try:
@@ -151,7 +351,7 @@ class ClawSelfClient:
         except urllib.error.URLError as exc:
             raise RuntimeError(f"YA Claw self API request failed: {exc.reason}") from exc
 
-    def _send_json_sync(self, path: str, method: str, payload: dict[str, Any]) -> Any:
+    def _send_json_sync(self, path: str, method: str, payload: dict[str, Any]) -> JsonValue:
         url = f"{self._base_url}{path}"
         parsed_url = urlparse(url)
         if parsed_url.scheme not in {"http", "https"}:
@@ -159,7 +359,7 @@ class ClawSelfClient:
         request = urllib.request.Request(  # noqa: S310
             url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Authorization": f"Bearer {self._api_token}", "Content-Type": "application/json"},
+            headers={**self._headers(), "Content-Type": "application/json"},
             method=method,
         )
         try:
@@ -171,6 +371,16 @@ class ClawSelfClient:
             raise RuntimeError(f"YA Claw self API request failed with status {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"YA Claw self API request failed: {exc.reason}") from exc
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {self._api_token}"}
+        if self.session_id:
+            headers["X-YA-Claw-Session-Id"] = self.session_id
+        if self.run_id:
+            headers["X-YA-Claw-Run-Id"] = self.run_id
+        if self.profile_name:
+            headers["X-YA-Claw-Profile-Name"] = self.profile_name
+        return headers
 
 
 class ListSessionTurnsTool(BaseTool):
@@ -199,6 +409,10 @@ class ListSessionTurnsTool(BaseTool):
             int | None,
             Field(description="Fetch completed turns with sequence_no lower than this value"),
         ] = None,
+        cursor: Annotated[
+            str | None,
+            Field(description="Fetch completed turns older than this run ID cursor"),
+        ] = None,
         max_input_chars: Annotated[int, Field(description="Maximum characters per turn input payload")] = 2000,
         max_output_chars: Annotated[int, Field(description="Maximum characters per turn output_text")] = 4000,
         include_binary_data: Annotated[bool, Field(description="Include trimmed binary base64 data when true")] = False,
@@ -213,6 +427,7 @@ class ListSessionTurnsTool(BaseTool):
             payload = await client.list_session_turns(
                 limit=normalized_limit,
                 before_sequence_no=before_sequence_no,
+                cursor=cursor,
             )
             if payload.get("session_id") != client.session_id:
                 return "Error: YA Claw self API returned a different session."
@@ -303,6 +518,7 @@ def _compact_turns_payload(
         "session_id": payload.get("session_id"),
         "limit": payload.get("limit"),
         "has_more": payload.get("has_more"),
+        "next_cursor": payload.get("next_cursor"),
         "next_before_sequence_no": payload.get("next_before_sequence_no"),
         "turns": compact_turns,
     }
@@ -315,8 +531,11 @@ def _compact_turn(
     max_output_chars: int,
     include_binary_data: bool,
 ) -> dict[str, Any]:
+    sanitized_input_parts: JsonArray = _sanitize_input_parts(
+        turn.get("input_parts"), include_binary_data=include_binary_data
+    )
     input_parts, input_truncated = _trim_json_value(
-        _sanitize_input_parts(turn.get("input_parts"), include_binary_data=include_binary_data),
+        sanitized_input_parts,
         max_chars=max_input_chars,
     )
     output_text, output_truncated = _trim_text(_string_or_none(turn.get("output_text")), max_output_chars)
@@ -330,13 +549,12 @@ def _compact_turn(
         "input_truncated": input_truncated,
         "output_text": output_text,
         "output_truncated": output_truncated,
-        "output_summary": turn.get("output_summary"),
         "created_at": turn.get("created_at"),
         "committed_at": turn.get("committed_at"),
     }
 
 
-def _sanitize_input_parts(value: Any, *, include_binary_data: bool) -> Any:
+def _sanitize_input_parts(value: JsonValue, *, include_binary_data: bool) -> JsonArray:
     if not isinstance(value, list):
         return []
     return [
@@ -358,7 +576,7 @@ def _sanitize_input_part(part: dict[str, Any], *, include_binary_data: bool) -> 
     return sanitized
 
 
-def _trim_json_value(value: Any, *, max_chars: int) -> tuple[Any, bool]:
+def _trim_json_value(value: JsonValue, *, max_chars: int) -> tuple[JsonValue, bool]:
     dumped = _dump_json(value)
     if len(dumped) <= max_chars:
         return value, False
@@ -373,7 +591,7 @@ def _trim_text(value: str | None, max_chars: int) -> tuple[str | None, bool]:
     return value[:max_chars], True
 
 
-def _string_or_none(value: Any) -> str | None:
+def _string_or_none(value: object) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
@@ -381,7 +599,7 @@ def _string_or_none(value: Any) -> str | None:
     return str(value)
 
 
-def _dump_json(value: Any) -> str:
+def _dump_json(value: JsonValue) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 

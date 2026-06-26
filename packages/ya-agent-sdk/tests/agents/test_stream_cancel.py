@@ -13,24 +13,55 @@ import contextvars
 from pathlib import Path
 from unittest.mock import patch
 
+from pydantic_ai import FunctionToolCallEvent, RunContext
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    NativeToolCallPart,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturnPart,
+)
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from ya_agent_sdk.agents.main import (
     AgentInterrupted,
+    AgentStreamer,
+    PartialTextAccumulator,
     _restore_task_cancellation,
     _suspend_current_task_cancellation,
     create_agent,
     stream_agent,
 )
+from ya_agent_sdk.context import AgentContext, ToolIdWrapper
 from ya_agent_sdk.environment.local import LocalEnvironment
+from ya_agent_sdk.toolsets.core.base import BaseTool
 
 
-def _make_runtime(tmp_path: Path):
+def _make_runtime(tmp_path: Path, model="test", **kwargs):
     """Create a simple runtime with test model for cancel tests."""
     env = LocalEnvironment(
         allowed_paths=[tmp_path],
         default_path=tmp_path,
         tmp_base_dir=tmp_path,
     )
-    return create_agent(model="test", env=env)
+    return create_agent(model=model, env=env, **kwargs)
+
+
+class ReviewedTool(BaseTool):
+    """Tool used to exercise HITL approval deferral in stream recovery tests."""
+
+    name = "reviewed_tool"
+    description = "A reviewed tool for HITL stream tests"
+
+    async def call(self, ctx: RunContext[AgentContext], path: str) -> str:
+        return f"reviewed {path}"
 
 
 async def test_cancel_stops_agent_execution(tmp_path: Path) -> None:
@@ -195,6 +226,297 @@ async def test_cancel_with_external_cancellation(tmp_path: Path) -> None:
 
             assert streamer.exception is None
             assert len(events) > 0
+
+
+async def test_completed_stream_uses_final_run_history_without_partial_duplicate(tmp_path: Path) -> None:
+    """Completed streams expose final run history exactly once."""
+
+    async def stream_function(_messages, _agent_info: AgentInfo):
+        yield "hello "
+        yield "world"
+
+    runtime = _make_runtime(tmp_path, FunctionModel(stream_function=stream_function))
+
+    async with stream_agent(runtime, "say something") as streamer:
+        async for _event in streamer:
+            pass
+
+    assert streamer.run is not None
+    messages = streamer.recoverable_messages()
+    assert messages == streamer.run.all_messages()
+    response = messages[-1]
+    assert isinstance(response, ModelResponse)
+    assert response.parts == [TextPart(content="hello world")]
+    assert response.metadata is None
+
+
+async def test_recoverable_messages_preserve_completed_hitl_tool_call_history() -> None:
+    """Completed HITL tool-call history takes precedence over accumulated partial parts."""
+
+    formal_response = ModelResponse(
+        parts=[ToolCallPart(tool_name="reviewed_tool", args={"path": "file.py"}, tool_call_id="call-1")]
+    )
+    formal_history = [ModelRequest(parts=[]), formal_response]
+
+    class CompletedHitlRun:
+        def all_messages(self) -> list[ModelRequest | ModelResponse]:
+            return formal_history
+
+    streamer = AgentStreamer(
+        _output_queue=asyncio.Queue(),
+        _main_task=asyncio.create_task(asyncio.sleep(0)),
+        _poll_done=asyncio.Event(),
+        _tasks=[],
+    )
+    streamer.run = CompletedHitlRun()  # type: ignore[assignment]
+    streamer._partial_text.observe(PartStartEvent(index=2, part=TextPart(content="duplicate partial")))
+
+    assert streamer.recoverable_messages() == formal_history
+
+
+async def test_recoverable_messages_wrap_formal_history_with_stream_event_ids() -> None:
+    """Formal recoverable history uses the same wrapped IDs as streamed events."""
+
+    wrapper = ToolIdWrapper()
+    event = wrapper.wrap_event(
+        FunctionToolCallEvent(part=ToolCallPart(tool_name="reviewed_tool", args={}, tool_call_id="provider-call-1"))
+    )
+    wrapped_id = event.part.tool_call_id
+    formal_history = [
+        ModelResponse(parts=[ToolCallPart(tool_name="reviewed_tool", args={}, tool_call_id="provider-call-1")])
+    ]
+
+    class CompletedToolCallRun:
+        def all_messages(self) -> list[ModelResponse]:
+            return formal_history
+
+    streamer = AgentStreamer(
+        _output_queue=asyncio.Queue(),
+        _main_task=asyncio.create_task(asyncio.sleep(0)),
+        _poll_done=asyncio.Event(),
+        _tasks=[],
+        _tool_id_wrapper=wrapper,
+    )
+    streamer.run = CompletedToolCallRun()  # type: ignore[assignment]
+
+    messages = streamer.recoverable_messages()
+    response = messages[-1]
+    assert isinstance(response, ModelResponse)
+    part = response.parts[0]
+    assert isinstance(part, ToolCallPart)
+    assert part.tool_call_id == wrapped_id
+    assert part.tool_call_id.startswith("ya-")
+
+
+async def test_recoverable_messages_wrap_native_tool_call_history() -> None:
+    """Formal native tool-call history uses normalized IDs."""
+
+    wrapper = ToolIdWrapper()
+    formal_history = [
+        ModelResponse(parts=[NativeToolCallPart(tool_name="web_search", args={}, tool_call_id="provider-native-1")])
+    ]
+
+    class CompletedNativeToolCallRun:
+        def all_messages(self) -> list[ModelResponse]:
+            return formal_history
+
+    streamer = AgentStreamer(
+        _output_queue=asyncio.Queue(),
+        _main_task=asyncio.create_task(asyncio.sleep(0)),
+        _poll_done=asyncio.Event(),
+        _tasks=[],
+        _tool_id_wrapper=wrapper,
+    )
+    streamer.run = CompletedNativeToolCallRun()  # type: ignore[assignment]
+
+    messages = streamer.recoverable_messages()
+    response = messages[-1]
+    assert isinstance(response, ModelResponse)
+    part = response.parts[0]
+    assert isinstance(part, NativeToolCallPart)
+    assert part.tool_call_id.startswith("ya-")
+    assert part.tool_call_id == wrapper.upsert_tool_call_id("provider-native-1")
+
+
+async def test_interrupted_stream_exposes_text_only_recoverable_messages(tmp_path: Path) -> None:
+    """Interrupted streams expose emitted text as partial recoverable history."""
+
+    async def stream_function(_messages, _agent_info: AgentInfo):
+        yield "hello "
+        await asyncio.sleep(10)
+        yield "world"
+
+    runtime = _make_runtime(tmp_path, FunctionModel(stream_function=stream_function))
+
+    async with stream_agent(runtime, "say something") as streamer:
+        async for event in streamer:
+            if isinstance(event.event, PartStartEvent) and isinstance(event.event.part, TextPart):
+                streamer.interrupt()
+                break
+
+    messages = streamer.recoverable_messages()
+    assert len(messages) >= 2
+    response = messages[-1]
+    assert isinstance(response, ModelResponse)
+    assert response.parts == [TextPart(content="hello ")]
+    assert response.metadata == {"ya_agent_sdk": {"partial": True, "reason": "stream_interrupted"}}
+
+
+async def test_interrupted_stream_skips_partial_history_after_tool_call_part(tmp_path: Path) -> None:
+    """Partial history skips streams that emitted tool call structure."""
+
+    async def stream_function(_messages, _agent_info: AgentInfo):
+        yield ModelResponse(parts=[ToolCallPart(tool_name="some_tool", args={}, tool_call_id="call-1")])
+        await asyncio.sleep(10)
+
+    runtime = _make_runtime(tmp_path, FunctionModel(stream_function=stream_function))
+
+    async with stream_agent(runtime, "call tool") as streamer:
+        async for _event in streamer:
+            streamer.interrupt()
+            break
+
+    messages = streamer.recoverable_messages()
+    assert not (messages and isinstance(messages[-1], ModelResponse))
+
+
+async def test_interrupted_stream_appends_current_text_after_completed_tool_history(tmp_path: Path) -> None:
+    """Current partial text is appended after prior tool/text history."""
+
+    history = [
+        ModelResponse(parts=[ToolCallPart(tool_name="first_tool", args={}, tool_call_id="call-1")]),
+        ModelRequest(parts=[ToolReturnPart(tool_name="first_tool", content="first result", tool_call_id="call-1")]),
+        ModelResponse(
+            parts=[
+                TextPart(content="Text after first tool."),
+                ToolCallPart(tool_name="second_tool", args={}, tool_call_id="call-2"),
+            ]
+        ),
+        ModelRequest(parts=[ToolReturnPart(tool_name="second_tool", content="second result", tool_call_id="call-2")]),
+    ]
+
+    async def stream_function(_messages, _agent_info: AgentInfo):
+        yield "final partial "
+        await asyncio.sleep(10)
+        yield "tail"
+
+    runtime = _make_runtime(tmp_path, FunctionModel(stream_function=stream_function))
+
+    async with stream_agent(runtime, "continue", message_history=history) as streamer:
+        async for event in streamer:
+            if isinstance(event.event, PartStartEvent) and event.event.part == TextPart(content="final partial "):
+                streamer.interrupt()
+                break
+
+    messages = streamer.recoverable_messages()
+    assert messages[: len(history)] == history
+    response = messages[-1]
+    assert isinstance(response, ModelResponse)
+    assert response.parts == [TextPart(content="final partial ")]
+    assert response.metadata == {"ya_agent_sdk": {"partial": True, "reason": "stream_interrupted"}}
+
+
+def test_recoverable_messages_keep_complete_thinking_before_partial_text() -> None:
+    """Completed thinking is preserved as a whole block before partial text."""
+
+    accumulator = PartialTextAccumulator()
+    accumulator.observe(PartStartEvent(index=0, part=ThinkingPart(content="Plan")))
+    accumulator.observe(PartDeltaEvent(index=0, delta=ThinkingPartDelta(content_delta=" carefully")))
+    accumulator.observe(PartEndEvent(index=0, part=ThinkingPart(content="Plan carefully", signature="sig")))
+    accumulator.observe(PartStartEvent(index=1, part=TextPart(content="Answer")))
+    accumulator.observe(PartDeltaEvent(index=1, delta=TextPartDelta(content_delta=" partial")))
+
+    response = accumulator.build_response()
+    assert response is not None
+    assert response.parts == [
+        ThinkingPart(content="Plan carefully", signature="sig"),
+        TextPart(content="Answer partial"),
+    ]
+    assert response.metadata == {"ya_agent_sdk": {"partial": True, "reason": "stream_interrupted"}}
+
+
+def test_recoverable_messages_keep_complete_tool_call_args() -> None:
+    """Completed tool calls are preserved as whole arguments for the next run."""
+
+    wrapper = ToolIdWrapper()
+    accumulator = PartialTextAccumulator()
+    wrapped_delta = wrapper.wrap_event(
+        PartDeltaEvent(index=0, delta=ToolCallPartDelta(tool_name_delta="shell", tool_call_id="provider-call-1"))
+    )
+    assert isinstance(wrapped_delta, PartDeltaEvent)
+    assert isinstance(wrapped_delta.delta, ToolCallPartDelta)
+    wrapped_id = wrapped_delta.delta.tool_call_id
+    accumulator.observe(wrapped_delta)
+    accumulator.observe(PartDeltaEvent(index=0, delta=ToolCallPartDelta(args_delta='{"command": "echo')))
+    accumulator.observe(PartDeltaEvent(index=0, delta=ToolCallPartDelta(args_delta=' hello"}')))
+    accumulator.observe(
+        wrapper.wrap_event(
+            PartEndEvent(
+                index=0,
+                part=ToolCallPart(
+                    tool_name="shell",
+                    args='{"command": "echo hello"}',
+                    tool_call_id="provider-call-1",
+                ),
+            )
+        )
+    )
+
+    response = accumulator.build_response()
+    assert response is not None
+    assert response.parts == [
+        ToolCallPart(tool_name="shell", args='{"command": "echo hello"}', tool_call_id=wrapped_id)
+    ]
+
+
+def test_recoverable_messages_wait_for_whole_thinking_and_tool_call_parts() -> None:
+    """In-progress thinking and tool-call deltas enter history after PartEndEvent."""
+
+    accumulator = PartialTextAccumulator()
+    accumulator.observe(PartDeltaEvent(index=0, delta=ThinkingPartDelta(content_delta="hidden")))
+    accumulator.observe(
+        PartDeltaEvent(index=1, delta=ToolCallPartDelta(tool_name_delta="shell", args_delta='{"command"'))
+    )
+    assert accumulator.build_response() is None
+
+    accumulator.observe(PartEndEvent(index=0, part=ThinkingPart(content="hidden")))
+    accumulator.observe(
+        PartEndEvent(index=1, part=ToolCallPart(tool_name="shell", args='{"command": "pwd"}', tool_call_id="call-2"))
+    )
+
+    response = accumulator.build_response()
+    assert response is not None
+    assert response.parts == [
+        ThinkingPart(content="hidden"),
+        ToolCallPart(tool_name="shell", args='{"command": "pwd"}', tool_call_id="call-2"),
+    ]
+
+
+def test_recoverable_messages_preserve_interleaved_thinking_tool_and_text_order() -> None:
+    """Interleaved thinking and tool calls are preserved in stream order."""
+
+    accumulator = PartialTextAccumulator()
+    accumulator.observe(PartStartEvent(index=0, part=ThinkingPart(content="Think before tool")))
+    accumulator.observe(PartEndEvent(index=0, part=ThinkingPart(content="Think before tool", signature="sig-1")))
+    accumulator.observe(
+        PartEndEvent(
+            index=1,
+            part=ToolCallPart(tool_name="shell", args={"command": "pwd"}, tool_call_id="call-1"),
+        )
+    )
+    accumulator.observe(PartStartEvent(index=2, part=ThinkingPart(content="Think after tool")))
+    accumulator.observe(PartEndEvent(index=2, part=ThinkingPart(content="Think after tool", signature="sig-2")))
+    accumulator.observe(PartStartEvent(index=3, part=TextPart(content="Final")))
+    accumulator.observe(PartDeltaEvent(index=3, delta=TextPartDelta(content_delta=" partial")))
+
+    response = accumulator.build_response()
+    assert response is not None
+    assert response.parts == [
+        ThinkingPart(content="Think before tool", signature="sig-1"),
+        ToolCallPart(tool_name="shell", args={"command": "pwd"}, tool_call_id="call-1"),
+        ThinkingPart(content="Think after tool", signature="sig-2"),
+        TextPart(content="Final partial"),
+    ]
 
 
 async def test_suspend_current_task_cancellation_allows_cleanup_waits() -> None:

@@ -30,6 +30,8 @@ lint: ## Lint the code
 	@uv lock --locked
 	@echo "Running pre-commit"
 	@uv run pre-commit run -a
+	@echo "Running YAACLI Desktop lint"
+	@$(MAKE) desktop-lint
 
 .PHONY: cli
 cli: ## Run the CLI
@@ -87,6 +89,49 @@ web-build: ## Run TypeScript and Vite build checks for the YA Claw web app
 	@echo "Running ya-claw-web build"
 	@corepack pnpm --dir apps/ya-claw-web build
 
+.PHONY: desktop-install
+desktop-install: ## Install YAACLI Desktop workspace and frontend dependencies
+	@echo "Installing YAACLI Desktop dependencies"
+	@uv sync --package yaacli
+	@corepack pnpm install
+
+.PHONY: desktop-dev
+desktop-dev: desktop-install ## Run YAACLI Desktop with Tauri
+	@echo "Running YAACLI Desktop"
+	@corepack pnpm --dir apps/yaacli-desktop tauri:dev
+
+.PHONY: desktop-lint
+desktop-lint: ## Run ESLint for YAACLI Desktop
+	@echo "Running YAACLI Desktop lint"
+	@corepack pnpm --dir apps/yaacli-desktop lint
+
+.PHONY: desktop-build
+desktop-build: ## Run TypeScript and Vite build checks for YAACLI Desktop
+	@echo "Running YAACLI Desktop frontend build"
+	@corepack pnpm --dir apps/yaacli-desktop build
+
+.PHONY: desktop-test
+desktop-test: ## Run YAACLI Desktop frontend tests
+	@echo "Running YAACLI Desktop tests"
+	@corepack pnpm --dir apps/yaacli-desktop test
+
+.PHONY: desktop-rust-check
+desktop-rust-check: ## Run Rust checks for the YAACLI Desktop host
+	@echo "Checking YAACLI Desktop Rust host"
+	@cargo check --manifest-path apps/yaacli-desktop/src-tauri/Cargo.toml
+	@cargo test --manifest-path apps/yaacli-desktop/src-tauri/Cargo.toml
+
+.PHONY: desktop-sidecar-build
+desktop-sidecar-build: ## Build and smoke-test the self-contained Apple Silicon sidecar
+	@./scripts/build-yaacli-desktop-sidecar.sh
+
+.PHONY: desktop-bundle
+desktop-bundle: desktop-install ## Build unsigned Apple Silicon app and DMG bundles
+	@corepack pnpm --dir apps/yaacli-desktop tauri:build
+
+.PHONY: desktop-check
+desktop-check: desktop-lint desktop-build desktop-test ## Run YAACLI Desktop frontend checks
+
 .PHONY: docker-build-claw
 docker-build-claw: ## Build the YA Claw Docker image
 	@echo "Building ya-claw Docker image"
@@ -126,15 +171,21 @@ check: ## Run code quality tools for all active packages
 	@echo "Checking bundled skills sync"
 	@./scripts/check-skills-sync.sh
 	@echo "Checking release skill zip build"
-	@uv run python scripts/build-skill-zips.py --check
+	@python scripts/build-skill-zips.py --check
 	@echo "Running web lint"
 	@$(MAKE) web-lint
 	@echo "Running web build"
 	@$(MAKE) web-build
+	@echo "Running YAACLI Desktop checks"
+	@$(MAKE) desktop-check
 	@echo "Running pyright"
 	@uv run python -m pyright
+	@echo "Running deptry for ya-agent-environment"
+	@(cd packages/ya-agent-environment && uvx deptry ya_agent_environment)
 	@echo "Running deptry for ya-agent-sdk"
 	@(cd packages/ya-agent-sdk && uvx deptry ya_agent_sdk)
+	@echo "Running deptry for ya-agent-stream-protocol"
+	@(cd packages/ya-agent-stream-protocol && uvx deptry ya_agent_stream_protocol)
 	@echo "Running deptry for ya-oauth"
 	@(cd packages/ya-oauth && uvx deptry ya_oauth)
 	@echo "Running deptry for ya-oauth-provider"
@@ -144,15 +195,53 @@ check: ## Run code quality tools for all active packages
 	@echo "Running deptry for ya-claw"
 	@(cd packages/ya-claw && uvx deptry ya_claw)
 
+.PHONY: bench-file-search
+bench-file-search: ## Run full file search backend benchmarks
+	@echo "Running full file search backend benchmarks"
+	@uv run python benchmarks/file_search/bench_file_search.py run \
+		--case full \
+		--dataset .bench/file-search-full \
+		--variants python-native ripgrep-core \
+		--repeat 3 \
+		--output .bench/results/file-search.jsonl \
+		--summary .bench/results/file-search-summary.md
+
+.PHONY: bench-search
+bench-search: bench-file-search ## Alias for bench-file-search
+
+.PHONY: bench-file-search-quick
+bench-file-search-quick: ## Run quick file search backend smoke benchmarks
+	@echo "Running quick file search backend smoke benchmarks"
+	@uv run python benchmarks/file_search/bench_file_search.py run \
+		--case quick \
+		--dataset .bench/file-search-quick \
+		--variants python-native ripgrep-core \
+		--repeat 1 \
+		--output .bench/results/file-search-quick.jsonl \
+		--summary .bench/results/file-search-quick-summary.md
+
+.PHONY: bench-search-quick
+bench-search-quick: bench-file-search-quick ## Alias for bench-file-search-quick
+
 .PHONY: test
-test: ## Run SDK, CLI, and YA Claw tests
+test: ## Run environment, SDK, stream protocol, CLI, and YA Claw tests
 	@echo "Running pytest for workspace packages"
-	@uv run python -m pytest packages/ya-agent-sdk/tests packages/ya-oauth/tests packages/ya-oauth-provider/tests packages/yaacli/tests packages/ya-claw/tests -n auto -vv --inline-snapshot=disable --cov --cov-config=pyproject.toml --cov-report term-missing
+	@uv run python -m pytest packages/ya-agent-environment/tests packages/ya-ripgrep-core/tests packages/ya-agent-sdk/tests packages/ya-agent-stream-protocol/tests packages/yaacli/tests packages/ya-claw/tests -n auto -vv --inline-snapshot=disable --cov --cov-config=pyproject.toml --cov-report term-missing
+
+.PHONY: test-environment
+test-environment: ## Run ya-agent-environment tests
+	@echo "Running ya-agent-environment pytest"
+	@uv run python -m pytest packages/ya-agent-environment/tests -n auto -vv --cov --cov-config=pyproject.toml --cov-report term-missing
 
 .PHONY: test-sdk
 test-sdk: ## Run SDK tests
 	@echo "Running SDK pytest"
-	@uv run python -m pytest packages/ya-agent-sdk/tests packages/ya-oauth/tests packages/ya-oauth-provider/tests -n auto -vv --inline-snapshot=disable --cov --cov-config=pyproject.toml --cov-report term-missing
+	@uv run python -m pytest packages/ya-agent-sdk/tests -n auto -vv --inline-snapshot=disable --cov --cov-config=pyproject.toml --cov-report term-missing
+
+.PHONY: test-stream-protocol
+test-stream-protocol: ## Run ya-agent-stream-protocol tests
+	@echo "Running ya-agent-stream-protocol pytest"
+	@uv run python -m pytest packages/ya-agent-stream-protocol/tests -n auto -vv --inline-snapshot=disable --cov --cov-config=pyproject.toml --cov-report term-missing
 
 .PHONY: test-cli
 test-cli: ## Run CLI tests
@@ -182,12 +271,22 @@ claw-sse-complete-smoke: ## Run YA Claw SSE completion smoke test against the co
 .PHONY: test-fix
 test-fix: ## Run pytest with inline snapshot updates
 	@echo "Running pytest with inline snapshot updates"
-	@uv run python -m pytest packages/ya-agent-sdk/tests packages/yaacli/tests packages/ya-claw/tests -vv --inline-snapshot=fix
+	@uv run python -m pytest packages/ya-agent-environment/tests packages/ya-agent-sdk/tests packages/ya-agent-stream-protocol/tests packages/yaacli/tests packages/ya-claw/tests -vv --inline-snapshot=fix
 
 .PHONY: build
 build: clean-build ## Build ya-agent-sdk distribution
 	@echo "Building ya-agent-sdk"
 	@uv build --package ya-agent-sdk -o dist
+
+.PHONY: build-environment
+build-environment: clean-build ## Build ya-agent-environment distribution
+	@echo "Building ya-agent-environment"
+	@uv build --package ya-agent-environment -o dist
+
+.PHONY: build-stream-protocol
+build-stream-protocol: clean-build ## Build ya-agent-stream-protocol distribution
+	@echo "Building ya-agent-stream-protocol"
+	@uv build --package ya-agent-stream-protocol -o dist
 
 .PHONY: build-claw
 build-claw: clean-build ## Build ya-claw distribution
@@ -207,7 +306,7 @@ build-all: clean-build ## Build distributions for all workspace packages
 .PHONY: clean-build
 clean-build: ## Clean build artifacts
 	@echo "Removing build artifacts"
-	@uv run python -c "from pathlib import Path; import shutil; [shutil.rmtree(path, ignore_errors=True) for path in (Path('dist'), Path('packages/ya-agent-sdk/dist'), Path('packages/yaacli/dist'), Path('packages/ya-claw/dist'), Path('packages/ya-agent-platform/dist'))]"
+	@uv run python -c "from pathlib import Path; import shutil; [shutil.rmtree(path, ignore_errors=True) for path in (Path('dist'), Path('packages/ya-agent-environment/dist'), Path('packages/ya-agent-sdk/dist'), Path('packages/ya-agent-stream-protocol/dist'), Path('packages/yaacli/dist'), Path('packages/ya-claw/dist'), Path('packages/ya-agent-platform/dist'))]"
 
 .PHONY: publish
 publish: ## Publish built distributions to PyPI
@@ -215,7 +314,7 @@ publish: ## Publish built distributions to PyPI
 	@uv publish dist/*
 
 .PHONY: build-and-publish
-build-and-publish: build publish ## Build and publish.
+build-and-publish: build-all publish ## Build and publish all workspace packages.
 
 .PHONY: help
 help:

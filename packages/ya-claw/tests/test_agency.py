@@ -1,0 +1,998 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from ya_claw.agency.lifecycle import AGENCY_SINGLETON_SOURCE_SESSION_ID, AgencyLifecycle
+from ya_claw.config import ClawSettings
+from ya_claw.controller.models import AgencyFireKind, RunStatus, SessionSubmitRequest, TextPart, TriggerType
+from ya_claw.controller.session import SessionController
+from ya_claw.db.engine import create_engine, create_session_factory
+from ya_claw.orm.base import Base
+from ya_claw.orm.tables import AgencyFireRecord, RunRecord, SessionRecord
+from ya_claw.runtime_state import create_runtime_state
+
+
+@pytest.fixture
+async def db_engine(tmp_path: Path) -> AsyncEngine:
+    engine = create_engine(f"sqlite+aiosqlite:///{(tmp_path / 'agency.sqlite3').resolve()}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+async def db_session(db_engine: AsyncEngine) -> AsyncSession:
+    session_factory = create_session_factory(db_engine)
+    async with session_factory() as session:
+        yield session
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> ClawSettings:
+    data_dir = tmp_path / "runtime-data"
+    workspace_dir = tmp_path / "workspace"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    return ClawSettings(
+        api_token="test-token",  # noqa: S106
+        data_dir=data_dir,
+        workspace_dir=workspace_dir,
+        agency_enabled=True,
+        _env_file=None,
+    )
+
+
+def _text(value: str) -> TextPart:
+    return TextPart(type="text", text=value)
+
+
+def test_agency_source_session_submit_request_accepts_session_id_aliases_and_requires_kind() -> None:
+    from ya_claw.controller.models import AgencyHandoffKind, AgencySourceSessionSubmitRequest
+
+    modern = AgencySourceSessionSubmitRequest(
+        session_id="session-1",
+        prompt="hello",
+        handoff_kind=AgencyHandoffKind.REMINDER,
+    )
+    legacy = AgencySourceSessionSubmitRequest(
+        source_session_id="session-2",
+        prompt="hello",
+        handoff_kind=AgencyHandoffKind.EXCHANGE,
+    )
+
+    assert modern.session_id == "session-1"
+    assert legacy.session_id == "session-2"
+    assert modern.handoff_kind == AgencyHandoffKind.REMINDER
+    assert legacy.handoff_kind == AgencyHandoffKind.EXCHANGE
+    assert modern.handoff_tags == ["agency-reminder"]
+    assert (
+        AgencySourceSessionSubmitRequest(
+            session_id="session-4",
+            prompt="hello",
+            handoff_kind="decision",
+        ).handoff_kind
+        == AgencyHandoffKind.DECISION
+    )
+    assert (
+        AgencySourceSessionSubmitRequest(
+            session_id="session-5",
+            prompt="hello",
+            handoff_kind="conflict",
+        ).handoff_kind
+        == AgencyHandoffKind.CONFLICT
+    )
+    with pytest.raises(ValidationError):
+        AgencySourceSessionSubmitRequest(session_id="session-3", prompt="hello")
+
+
+async def test_message_observed_creates_singleton_agency_session_and_run(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    db_session.add(SessionRecord(id="session-1", profile_name="general", session_metadata={}))
+    await db_session.commit()
+    submitted: list[str] = []
+    lifecycle = AgencyLifecycle(
+        settings=settings,
+        runtime_state=create_runtime_state(),
+        submit_run=lambda run_id: not submitted.append(run_id),
+    )
+
+    delivery = await lifecycle.observe_message(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-1",
+        input_parts=[_text("hello agency")],
+        source_kind=TriggerType.API.value,
+        client_token="message-1",  # noqa: S106
+        metadata={"client": "test"},
+    )
+
+    assert delivery is not None
+    assert delivery.delivery == "submitted"
+    assert delivery.run_id is not None
+    assert submitted == [delivery.run_id]
+    assert delivery.agency_session.session_type == "agency"
+    assert delivery.agency_session.source_session_id == AGENCY_SINGLETON_SOURCE_SESSION_ID
+
+    fire = await db_session.get(AgencyFireRecord, delivery.fire.id)
+    assert isinstance(fire, AgencyFireRecord)
+    assert fire.kind == AgencyFireKind.MESSAGE_OBSERVED.value
+    assert fire.status == "submitted"
+    assert fire.source_session_id == "session-1"
+    assert fire.source_run_id == "run-1"
+    assert fire.payload["input_parts"][0]["text"] == "hello agency"
+    assert fire.payload["metadata"] == {"client": "test"}
+
+    run = await db_session.get(RunRecord, delivery.run_id)
+    assert isinstance(run, RunRecord)
+    assert run.session_id == delivery.agency_session.id
+    assert run.trigger_type == TriggerType.AGENCY.value
+    assert run.run_metadata["agency"]["fire_ids"] == [fire.id]
+    assert run.run_metadata["agency"]["trigger_kinds"] == [AgencyFireKind.MESSAGE_OBSERVED.value]
+    assert run.input_parts[0]["name"] == "agency_fire"
+
+
+async def test_run_output_observed_fire_carries_output(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    db_session.add(SessionRecord(id="session-1", profile_name="general", session_metadata={}))
+    await db_session.commit()
+    lifecycle = AgencyLifecycle(settings=settings, runtime_state=create_runtime_state())
+
+    delivery = await lifecycle.observe_run_output(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-1",
+        source_sequence_no=7,
+        trigger_type=TriggerType.API.value,
+        output_text="source output text",
+        source_kind=TriggerType.API.value,
+        metadata={"profile_name": "general"},
+        dispatch=False,
+    )
+
+    assert delivery is not None
+    assert delivery.delivery == "pending"
+    fire = await db_session.get(AgencyFireRecord, delivery.fire.id)
+    assert isinstance(fire, AgencyFireRecord)
+    assert fire.kind == AgencyFireKind.RUN_OUTPUT_OBSERVED.value
+    assert fire.source_session_id == "session-1"
+    assert fire.source_run_id == "run-1"
+    assert fire.payload["source_sequence_no"] == 7
+    assert fire.payload["trigger_type"] == TriggerType.API.value
+    assert fire.payload["output_text"] == "source output text"
+    assert fire.payload["metadata"] == {"profile_name": "general"}
+
+
+async def test_run_output_observed_skips_empty_output(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    db_session.add(SessionRecord(id="session-1", profile_name="general", session_metadata={}))
+    await db_session.commit()
+    lifecycle = AgencyLifecycle(settings=settings, runtime_state=create_runtime_state())
+
+    delivery = await lifecycle.observe_run_output(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-1",
+        source_sequence_no=1,
+        trigger_type=TriggerType.API.value,
+        output_text=None,
+        dispatch=False,
+    )
+
+    assert delivery is None
+
+
+async def test_memory_session_completed_fire_carries_output(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    db_session.add(SessionRecord(id="session-1", profile_name="general", session_metadata={}))
+    await db_session.commit()
+    lifecycle = AgencyLifecycle(settings=settings, runtime_state=create_runtime_state())
+
+    delivery = await lifecycle.on_memory_session_completed(
+        db_session,
+        source_session_id="session-1",
+        memory_session_id="memory-session-1",
+        memory_run_id="memory-run-1",
+        memory_job_kind="extract",
+        output_text="memory output text",
+        payload={"source_run_ids": ["run-1"]},
+        dispatch=False,
+    )
+
+    assert delivery is not None
+    assert delivery.delivery == "pending"
+    fire = await db_session.get(AgencyFireRecord, delivery.fire.id)
+    assert isinstance(fire, AgencyFireRecord)
+    assert fire.kind == AgencyFireKind.MEMORY_SESSION_COMPLETED.value
+    assert fire.source_session_id == "session-1"
+    assert fire.source_run_id == "memory-run-1"
+    assert fire.payload["memory_session_id"] == "memory-session-1"
+    assert fire.payload["memory_run_id"] == "memory-run-1"
+    assert fire.payload["output_text"] == "memory output text"
+
+
+async def test_pending_fires_batch_into_new_agency_run(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    db_session.add_all([
+        SessionRecord(id="session-1", profile_name="general", session_metadata={}),
+        SessionRecord(id="session-2", profile_name="general", session_metadata={}),
+    ])
+    await db_session.commit()
+    submitted: list[str] = []
+    lifecycle = AgencyLifecycle(
+        settings=settings,
+        runtime_state=create_runtime_state(),
+        submit_run=lambda run_id: not submitted.append(run_id),
+    )
+
+    first = await lifecycle.observe_message(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-1",
+        input_parts=[_text("hello")],
+        source_kind=TriggerType.API.value,
+        client_token="message-1",  # noqa: S106
+        dispatch=False,
+    )
+    second = await lifecycle.on_memory_session_completed(
+        db_session,
+        source_session_id="session-2",
+        memory_session_id="memory-session-1",
+        memory_run_id="memory-run-1",
+        memory_job_kind="summary",
+        output_text="summary output",
+        dispatch=False,
+    )
+    delivery = await lifecycle.dispatch_pending(db_session)
+
+    assert first is not None
+    assert second is not None
+    assert delivery.delivery == "submitted"
+    assert submitted == [delivery.run_id]
+    run = await db_session.get(RunRecord, delivery.run_id)
+    assert isinstance(run, RunRecord)
+    assert set(run.run_metadata["agency"]["fire_ids"]) == {first.fire.id, second.fire.id}
+    assert set(run.run_metadata["agency"]["trigger_kinds"]) == {
+        AgencyFireKind.MESSAGE_OBSERVED.value,
+        AgencyFireKind.MEMORY_SESSION_COMPLETED.value,
+    }
+    assert len(run.input_parts) == 2
+
+
+async def test_pending_fires_prioritize_message_output_then_memory(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    db_session.add(SessionRecord(id="session-1", profile_name="general", session_metadata={}))
+    await db_session.commit()
+    lifecycle = AgencyLifecycle(settings=settings, runtime_state=create_runtime_state())
+
+    await lifecycle.on_memory_session_completed(
+        db_session,
+        source_session_id="session-1",
+        memory_session_id="memory-session-1",
+        memory_run_id="memory-run-1",
+        memory_job_kind="summary",
+        output_text="memory output",
+        dispatch=False,
+    )
+    await lifecycle.observe_run_output(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-1",
+        source_sequence_no=1,
+        trigger_type=TriggerType.API.value,
+        output_text="source output",
+        dispatch=False,
+    )
+    await lifecycle.observe_message(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-2",
+        input_parts=[_text("new message")],
+        source_kind=TriggerType.API.value,
+        dispatch=False,
+    )
+    delivery = await lifecycle.dispatch_pending(db_session)
+
+    assert delivery.delivery == "submitted"
+    run = await db_session.get(RunRecord, delivery.run_id)
+    assert isinstance(run, RunRecord)
+    assert [part["params"]["kind"] for part in run.input_parts] == [
+        AgencyFireKind.MESSAGE_OBSERVED.value,
+        AgencyFireKind.RUN_OUTPUT_OBSERVED.value,
+        AgencyFireKind.MEMORY_SESSION_COMPLETED.value,
+    ]
+
+
+async def test_fire_steers_active_agency_run(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    source_session = SessionRecord(id="session-1", profile_name="general", session_metadata={})
+    agency_session = SessionRecord(
+        id="agency-1",
+        profile_name="general",
+        session_type="agency",
+        source_session_id=AGENCY_SINGLETON_SOURCE_SESSION_ID,
+        session_metadata={"agency": {"kind": "claw_agency_session"}},
+        active_run_id="agency-run-1",
+        head_run_id="agency-run-1",
+    )
+    active_run = RunRecord(
+        id="agency-run-1",
+        session_id="agency-1",
+        sequence_no=1,
+        status="running",
+        trigger_type=TriggerType.AGENCY.value,
+        input_parts=[],
+        run_metadata={"agency": {"agency_session_id": "agency-1", "fire_ids": []}},
+    )
+    db_session.add_all([source_session, agency_session, active_run])
+    await db_session.commit()
+    runtime_state = create_runtime_state()
+    runtime_state.register_run("agency-1", "agency-run-1", dispatch_mode="async")
+    lifecycle = AgencyLifecycle(settings=settings, runtime_state=runtime_state)
+
+    delivery = await lifecycle.observe_message(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-1",
+        input_parts=[_text("follow up")],
+        source_kind=TriggerType.API.value,
+        client_token="message-1",  # noqa: S106
+    )
+
+    assert delivery is not None
+    assert delivery.delivery == "steered"
+    assert delivery.active_run_id == "agency-run-1"
+    batches = runtime_state.consume_steering_inputs("agency-run-1")
+    assert len(batches) == 1
+    assert batches[0][0]["name"] == "agency_fire"
+    fire = await db_session.get(AgencyFireRecord, delivery.fire.id)
+    assert isinstance(fire, AgencyFireRecord)
+    assert fire.status == "steered"
+    await db_session.refresh(active_run)
+    assert fire.id in active_run.run_metadata["agency"]["fire_ids"]
+    assert fire.id in active_run.run_metadata["agency"]["steered_fire_ids"]
+
+
+async def test_fire_merges_into_queued_agency_run(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    db_session.add_all([
+        SessionRecord(id="session-1", profile_name="general", session_metadata={}),
+        SessionRecord(id="session-2", profile_name="general", session_metadata={}),
+    ])
+    await db_session.commit()
+    submitted: list[str] = []
+    lifecycle = AgencyLifecycle(
+        settings=settings,
+        runtime_state=create_runtime_state(),
+        submit_run=lambda run_id: not submitted.append(run_id),
+    )
+
+    first = await lifecycle.observe_message(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-1",
+        input_parts=[_text("first")],
+        source_kind=TriggerType.API.value,
+        client_token="message-1",  # noqa: S106
+    )
+    second = await lifecycle.observe_message(
+        db_session,
+        source_session_id="session-2",
+        source_run_id="run-2",
+        input_parts=[_text("second")],
+        source_kind=TriggerType.API.value,
+        client_token="message-2",  # noqa: S106
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first.delivery == "submitted"
+    assert second.delivery == "merged"
+    assert second.run_id == first.run_id
+    assert submitted == [first.run_id]
+    run = await db_session.get(RunRecord, first.run_id)
+    assert isinstance(run, RunRecord)
+    assert len(run.input_parts) == 2
+    assert set(run.run_metadata["agency"]["source_session_ids"]) == {"session-1", "session-2"}
+
+
+async def test_duplicate_message_fire_reports_duplicate(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    db_session.add(SessionRecord(id="session-1", profile_name="general", session_metadata={}))
+    await db_session.commit()
+    lifecycle = AgencyLifecycle(settings=settings, runtime_state=create_runtime_state())
+
+    first = await lifecycle.observe_message(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-1",
+        input_parts=[_text("hello")],
+        source_kind=TriggerType.API.value,
+        client_token="message-1",  # noqa: S106
+        dispatch=False,
+    )
+    second = await lifecycle.observe_message(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-1",
+        input_parts=[_text("hello")],
+        source_kind=TriggerType.API.value,
+        client_token="message-1",  # noqa: S106
+        dispatch=False,
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first.delivery == "pending"
+    assert second.delivery == "duplicate"
+    assert second.fire.id == first.fire.id
+    result = await db_session.execute(select(AgencyFireRecord))
+    assert len(list(result.scalars().all())) == 1
+
+
+async def test_heartbeat_due_creates_and_dispatches_fire(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    settings.agency_idle_after_seconds = 1
+    settings.agency_cooldown_seconds = 60
+    settings.agency_timer_interval_seconds = 60
+    submitted: list[str] = []
+    lifecycle = AgencyLifecycle(
+        settings=settings,
+        runtime_state=create_runtime_state(),
+        submit_run=lambda run_id: not submitted.append(run_id),
+    )
+    agency_session = await lifecycle.ensure_agency_session(db_session)
+    agency_session.created_at = datetime(2026, 5, 19, 7, 0, tzinfo=UTC)
+    await db_session.commit()
+
+    result = await lifecycle.tick(db_session)
+
+    assert len(result.heartbeat_fire_ids) == 1
+    assert result.created_fire_ids == result.heartbeat_fire_ids
+    assert submitted == result.submitted_run_ids
+    fire = await db_session.get(AgencyFireRecord, result.heartbeat_fire_ids[0])
+    assert isinstance(fire, AgencyFireRecord)
+    assert fire.kind == AgencyFireKind.HEARTBEAT.value
+    assert fire.scheduled_at.replace(tzinfo=UTC) == datetime(2026, 5, 19, 7, 1, tzinfo=UTC)
+    assert fire.payload["reason"] == "scheduled_timer_review"
+    assert fire.payload["schedule_policy"] == "fixed_interval"
+    assert fire.payload["review_scope"]["pending_intentions"] is True
+    instructions = " ".join(fire.payload["instructions"])
+    assert "submit_to_session" in instructions
+    assert "make no file changes" in instructions
+    run = await db_session.get(RunRecord, result.submitted_run_ids[0])
+    assert isinstance(run, RunRecord)
+    assert run.run_metadata["agency"]["trigger_kinds"] == [AgencyFireKind.HEARTBEAT.value]
+
+
+async def test_heartbeat_uses_fixed_interval_schedule(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    settings.agency_idle_after_seconds = 1
+    settings.agency_cooldown_seconds = 3600
+    settings.agency_timer_interval_seconds = 120
+    lifecycle = AgencyLifecycle(settings=settings, runtime_state=create_runtime_state())
+    agency_session = await lifecycle.ensure_agency_session(db_session)
+    agency_session.created_at = datetime(2026, 5, 19, 7, 0, tzinfo=UTC)
+    await db_session.commit()
+
+    first_due_at = await lifecycle.next_timer_fire_at(
+        db_session,
+        now=datetime(2026, 5, 19, 7, 0, 30, tzinfo=UTC),
+    )
+    assert first_due_at == datetime(2026, 5, 19, 7, 2, tzinfo=UTC)
+
+    db_session.add(
+        AgencyFireRecord(
+            id="heartbeat-fire-1",
+            kind=AgencyFireKind.HEARTBEAT.value,
+            status="consumed",
+            scheduled_at=datetime(2026, 5, 19, 7, 2, tzinfo=UTC),
+            fired_at=datetime(2026, 5, 19, 7, 2, 5, tzinfo=UTC),
+            dedupe_key="agency:heartbeat:20260519070200",
+            agency_session_id=agency_session.id,
+            payload={},
+            created_at=datetime(2026, 5, 19, 7, 2, 5, tzinfo=UTC),
+        )
+    )
+    db_session.add(
+        RunRecord(
+            id="recent-agency-run",
+            session_id=agency_session.id,
+            sequence_no=1,
+            status=RunStatus.COMPLETED.value,
+            trigger_type=TriggerType.AGENCY.value,
+            input_parts=[],
+            run_metadata={},
+            committed_at=datetime(2026, 5, 19, 7, 3, 30, tzinfo=UTC),
+        )
+    )
+    await db_session.commit()
+
+    next_due_at = await lifecycle.next_timer_fire_at(
+        db_session,
+        now=datetime(2026, 5, 19, 7, 3, 45, tzinfo=UTC),
+    )
+    assert next_due_at == datetime(2026, 5, 19, 7, 4, tzinfo=UTC)
+
+
+async def test_heartbeat_waits_for_pending_fire(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    settings.agency_idle_after_seconds = 1
+    lifecycle = AgencyLifecycle(settings=settings, runtime_state=create_runtime_state())
+    agency_session = await lifecycle.ensure_agency_session(db_session)
+    db_session.add(
+        AgencyFireRecord(
+            id="pending-fire-1",
+            kind=AgencyFireKind.MESSAGE_OBSERVED.value,
+            status="pending",
+            scheduled_at=datetime.now(UTC),
+            dedupe_key="pending-fire-1",
+            agency_session_id=agency_session.id,
+            payload={},
+        )
+    )
+    await db_session.commit()
+
+    assert await lifecycle.dispatch_due(db_session) is None
+    assert await lifecycle.next_timer_fire_at(db_session) is None
+
+
+async def test_tick_dispatches_pending_fires_without_timer(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    db_session.add(SessionRecord(id="session-1", profile_name="general", session_metadata={}))
+    await db_session.commit()
+    submitted: list[str] = []
+    lifecycle = AgencyLifecycle(
+        settings=settings,
+        runtime_state=create_runtime_state(),
+        submit_run=lambda run_id: not submitted.append(run_id),
+    )
+    pending = await lifecycle.observe_message(
+        db_session,
+        source_session_id="session-1",
+        source_run_id="run-1",
+        input_parts=[_text("hello")],
+        source_kind=TriggerType.API.value,
+        client_token="message-1",  # noqa: S106
+        dispatch=False,
+    )
+
+    result = await lifecycle.tick(db_session)
+    empty = await lifecycle.tick(db_session)
+
+    assert pending is not None
+    assert result.created_fire_ids == [pending.fire.id]
+    assert len(result.submitted_run_ids) == 1
+    assert submitted == result.submitted_run_ids
+    assert empty.created_fire_ids == []
+    assert await lifecycle.next_timer_fire_at(db_session) is not None
+
+
+async def test_agency_run_commit_consumes_fires(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    agency_session = SessionRecord(
+        id="agency-1",
+        profile_name="general",
+        session_type="agency",
+        source_session_id=AGENCY_SINGLETON_SOURCE_SESSION_ID,
+        session_metadata={"agency": {"kind": "claw_agency_session"}},
+    )
+    run = RunRecord(
+        id="agency-run-1",
+        session_id="agency-1",
+        sequence_no=1,
+        status="completed",
+        trigger_type=TriggerType.AGENCY.value,
+        input_parts=[],
+        run_metadata={"agency": {"agency_session_id": "agency-1", "fire_ids": ["fire-1", "fire-2"]}},
+        committed_at=datetime.now(UTC),
+    )
+    fires = [
+        AgencyFireRecord(
+            id="fire-1",
+            kind=AgencyFireKind.MESSAGE_OBSERVED.value,
+            status="submitted",
+            scheduled_at=datetime.now(UTC),
+            dedupe_key="fire-1",
+            agency_session_id="agency-1",
+            run_id="agency-run-1",
+            payload={},
+        ),
+        AgencyFireRecord(
+            id="fire-2",
+            kind=AgencyFireKind.MEMORY_SESSION_COMPLETED.value,
+            status="steered",
+            scheduled_at=datetime.now(UTC),
+            dedupe_key="fire-2",
+            agency_session_id="agency-1",
+            run_id="agency-run-1",
+            payload={},
+        ),
+    ]
+    db_session.add_all([agency_session, run, *fires])
+    await db_session.commit()
+
+    lifecycle = AgencyLifecycle(settings=settings, runtime_state=create_runtime_state())
+    await lifecycle.on_agency_run_committed(db_session, run)
+    await db_session.commit()
+
+    for fire in fires:
+        await db_session.refresh(fire)
+        assert fire.status == "consumed"
+        assert fire.consumed_at is not None
+
+
+async def test_session_submit_creates_merges_and_steers(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    session = SessionRecord(id="session-1", profile_name="general", session_metadata={})
+    db_session.add(session)
+    await db_session.commit()
+    runtime_state = create_runtime_state()
+    controller = SessionController()
+
+    created = await controller.submit_input(
+        db_session,
+        settings,
+        runtime_state,
+        "session-1",
+        SessionSubmitRequest(input_parts=[_text("first")]),
+    )
+    merged = await controller.submit_input(
+        db_session,
+        settings,
+        runtime_state,
+        "session-1",
+        SessionSubmitRequest(input_parts=[_text("second")], metadata={"agency": {"fire_ids": ["fire-2"]}}),
+    )
+    run = await db_session.get(RunRecord, created.run_id)
+    assert isinstance(run, RunRecord)
+    run.status = "running"
+    session.active_run_id = run.id
+    await db_session.commit()
+    steered = await controller.submit_input(
+        db_session,
+        settings,
+        runtime_state,
+        "session-1",
+        SessionSubmitRequest(input_parts=[_text("third")]),
+    )
+
+    assert created.delivery == "submitted"
+    assert merged.delivery == "merged"
+    assert steered.delivery == "steered"
+    assert merged.run_id == created.run_id
+    await db_session.refresh(run)
+    assert [part["text"] for part in run.input_parts] == ["first", "second", "third"]
+    assert runtime_state.consume_steering_inputs(run.id)[0][0]["text"] == "third"
+
+
+async def test_agency_submit_to_session_creates_handoff_run(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    from ya_claw.controller.agency import AgencyController
+    from ya_claw.controller.models import AgencySourceSessionSubmitRequest
+
+    source_session = SessionRecord(id="source-session", profile_name="general", session_metadata={})
+    agency_session = SessionRecord(
+        id="agency-session",
+        profile_name="general",
+        session_type="agency",
+        source_session_id=AGENCY_SINGLETON_SOURCE_SESSION_ID,
+        session_metadata={"agency": {"kind": "claw_agency_session"}},
+        active_run_id="agency-run",
+        head_run_id="agency-run",
+    )
+    agency_run = RunRecord(
+        id="agency-run",
+        session_id="agency-session",
+        sequence_no=1,
+        status=RunStatus.RUNNING.value,
+        trigger_type=TriggerType.AGENCY.value,
+        input_parts=[],
+        run_metadata={"agency": {"fire_ids": ["fire-1"]}},
+    )
+    db_session.add_all([source_session, agency_session, agency_run])
+    await db_session.commit()
+    runtime_state = create_runtime_state()
+    runtime_state.register_run("agency-session", "agency-run", dispatch_mode="async")
+
+    response = await AgencyController().submit_to_session(
+        db_session,
+        settings,
+        runtime_state,
+        AgencySourceSessionSubmitRequest(
+            session_id="source-session",
+            prompt="Review the async findings and update the user.",
+            metadata={"fire_ids": ["fire-1"]},
+            handoff_kind="async_result",
+            handoff_tags=["agency-reminder", "async-result"],
+            agency_session_id="agency-session",
+            agency_run_id="agency-run",
+        ),
+    )
+
+    assert response.delivery == "submitted"
+    assert response.source_session_id == "source-session"
+    run = await db_session.get(RunRecord, response.run_id)
+    assert isinstance(run, RunRecord)
+    assert run.session_id == "source-session"
+    assert run.trigger_type == TriggerType.AGENCY_HANDOFF.value
+    handoff_text = run.input_parts[0]["text"]
+    assert handoff_text.startswith('<system-reminder>\n<agency-handoff-reference kind="async_result">')
+    assert "Use this as advisory reference from the global Agency session." in handoff_text
+    assert "You may stay silent when a user-facing response adds little value." in handoff_text
+    assert (
+        '<agency-handoff kind="async_result">\nReview the async findings and update the user.\n</agency-handoff>'
+        in handoff_text
+    )
+    assert run.input_parts[0]["metadata"]["source"] == "agency_handoff"
+    assert run.input_parts[0]["metadata"]["handoff_kind"] == "async_result"
+    assert run.input_parts[0]["metadata"]["handoff_tags"] == ["agency-reminder", "async-result"]
+    handoff = run.run_metadata["agency_handoff"]
+    assert handoff["latest"]["agency_session_id"] == "agency-session"
+    assert handoff["latest"]["agency_run_id"] == "agency-run"
+    assert handoff["latest"]["source_session_id"] == "source-session"
+    assert handoff["latest"]["kind"] == "async_result"
+    assert handoff["latest"]["tags"] == ["agency-reminder", "async-result"]
+    assert handoff["latest"]["metadata"] == {"fire_ids": ["fire-1"]}
+    assert handoff["handoffs"] == [handoff["latest"]]
+
+
+async def test_agency_submit_to_session_merges_queued_source_run(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    from ya_claw.controller.agency import AgencyController
+    from ya_claw.controller.models import AgencySourceSessionSubmitRequest
+
+    source_session = SessionRecord(
+        id="source-session",
+        profile_name="general",
+        session_metadata={},
+        active_run_id="source-run",
+        head_run_id="source-run",
+    )
+    source_run = RunRecord(
+        id="source-run",
+        session_id="source-session",
+        sequence_no=1,
+        status=RunStatus.QUEUED.value,
+        trigger_type=TriggerType.API.value,
+        input_parts=[{"type": "text", "text": "original"}],
+        run_metadata={},
+    )
+    agency_session = SessionRecord(
+        id="agency-session",
+        profile_name="general",
+        session_type="agency",
+        source_session_id=AGENCY_SINGLETON_SOURCE_SESSION_ID,
+        session_metadata={"agency": {"kind": "claw_agency_session"}},
+    )
+    agency_run = RunRecord(
+        id="agency-run",
+        session_id="agency-session",
+        sequence_no=1,
+        status=RunStatus.RUNNING.value,
+        trigger_type=TriggerType.AGENCY.value,
+        input_parts=[],
+        run_metadata={},
+    )
+    db_session.add_all([source_session, source_run, agency_session, agency_run])
+    await db_session.commit()
+    agency_session.active_run_id = "agency-run"
+    await db_session.commit()
+    runtime_state = create_runtime_state()
+    runtime_state.register_run("agency-session", "agency-run", dispatch_mode="async")
+
+    response = await AgencyController().submit_to_session(
+        db_session,
+        settings,
+        runtime_state,
+        AgencySourceSessionSubmitRequest(
+            session_id="source-session",
+            prompt="Add agency context.",
+            metadata={"source_run_ids": ["run-1"]},
+            handoff_kind="exchange",
+            agency_session_id="agency-session",
+            agency_run_id="agency-run",
+        ),
+    )
+
+    assert response.delivery == "merged"
+    assert response.run_id == "source-run"
+    await db_session.refresh(source_run)
+    assert source_run.input_parts[0]["text"] == "original"
+    assert source_run.input_parts[1]["text"].startswith('<system-reminder>\n<agency-handoff-reference kind="exchange">')
+    assert (
+        '<agency-handoff kind="exchange">\nAdd agency context.\n</agency-handoff>' in source_run.input_parts[1]["text"]
+    )
+    assert source_run.run_metadata["agency_handoff"]["latest"]["metadata"] == {"source_run_ids": ["run-1"]}
+    assert len(source_run.run_metadata["agency_handoff"]["handoffs"]) == 1
+
+
+async def test_agency_submit_to_session_steers_running_source_run(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    from ya_claw.controller.agency import AgencyController
+    from ya_claw.controller.models import AgencySourceSessionSubmitRequest
+
+    source_session = SessionRecord(
+        id="source-session",
+        profile_name="general",
+        session_metadata={},
+        active_run_id="source-run",
+        head_run_id="source-run",
+    )
+    source_run = RunRecord(
+        id="source-run",
+        session_id="source-session",
+        sequence_no=1,
+        status=RunStatus.RUNNING.value,
+        trigger_type=TriggerType.API.value,
+        input_parts=[{"type": "text", "text": "original"}],
+        run_metadata={},
+    )
+    agency_session = SessionRecord(
+        id="agency-session",
+        profile_name="general",
+        session_type="agency",
+        source_session_id=AGENCY_SINGLETON_SOURCE_SESSION_ID,
+        session_metadata={"agency": {"kind": "claw_agency_session"}},
+    )
+    agency_run = RunRecord(
+        id="agency-run",
+        session_id="agency-session",
+        sequence_no=1,
+        status=RunStatus.RUNNING.value,
+        trigger_type=TriggerType.AGENCY.value,
+        input_parts=[],
+        run_metadata={},
+    )
+    db_session.add_all([source_session, source_run, agency_session, agency_run])
+    await db_session.commit()
+    agency_session.active_run_id = "agency-run"
+    await db_session.commit()
+    runtime_state = create_runtime_state()
+    runtime_state.register_run("source-session", "source-run", dispatch_mode="async")
+    runtime_state.register_run("agency-session", "agency-run", dispatch_mode="async")
+
+    response = await AgencyController().submit_to_session(
+        db_session,
+        settings,
+        runtime_state,
+        AgencySourceSessionSubmitRequest(
+            session_id="source-session",
+            prompt="Steer with agency context.",
+            metadata={"async_task_ids": ["task-1"]},
+            handoff_kind="exchange",
+            agency_session_id="agency-session",
+            agency_run_id="agency-run",
+        ),
+    )
+
+    assert response.delivery == "steered"
+    assert response.run_id == "source-run"
+    steering = runtime_state.consume_steering_inputs("source-run")
+    assert steering[0][0]["text"].startswith('<system-reminder>\n<agency-handoff-reference kind="exchange">')
+    assert '<agency-handoff kind="exchange">\nSteer with agency context.\n</agency-handoff>' in steering[0][0]["text"]
+    await db_session.refresh(source_run)
+    assert source_run.input_parts[0]["text"] == "original"
+    assert source_run.input_parts[1]["text"].startswith('<system-reminder>\n<agency-handoff-reference kind="exchange">')
+    assert (
+        '<agency-handoff kind="exchange">\nSteer with agency context.\n</agency-handoff>'
+        in source_run.input_parts[1]["text"]
+    )
+    assert source_run.run_metadata["agency_handoff"]["latest"]["kind"] == "exchange"
+    assert source_run.run_metadata["agency_handoff"]["latest"]["tags"] == ["agency-reminder"]
+    assert source_run.run_metadata["agency_handoff"]["latest"]["metadata"] == {"async_task_ids": ["task-1"]}
+
+
+async def test_agency_submit_to_session_rejects_invalid_callers_and_targets(
+    db_session: AsyncSession,
+    settings: ClawSettings,
+) -> None:
+    from fastapi import HTTPException
+    from ya_claw.controller.agency import AgencyController
+    from ya_claw.controller.models import AgencySourceSessionSubmitRequest
+
+    controller = AgencyController()
+    source_session = SessionRecord(id="source-session", profile_name="general", session_metadata={})
+    memory_session = SessionRecord(
+        id="memory-session",
+        profile_name="general",
+        session_type="memory",
+        source_session_id="source-session",
+        session_metadata={},
+    )
+    agency_session = SessionRecord(
+        id="agency-session",
+        profile_name="general",
+        session_type="agency",
+        source_session_id=AGENCY_SINGLETON_SOURCE_SESSION_ID,
+        session_metadata={"agency": {"kind": "claw_agency_session"}},
+    )
+    queued_agency_run = RunRecord(
+        id="agency-run",
+        session_id="agency-session",
+        sequence_no=1,
+        status=RunStatus.QUEUED.value,
+        trigger_type=TriggerType.AGENCY.value,
+        input_parts=[],
+        run_metadata={},
+    )
+    db_session.add_all([source_session, memory_session, agency_session, queued_agency_run])
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as queued_exc:
+        await controller.submit_to_session(
+            db_session,
+            settings,
+            create_runtime_state(),
+            AgencySourceSessionSubmitRequest(
+                session_id="source-session",
+                prompt="hello",
+                handoff_kind="reminder",
+                agency_session_id="agency-session",
+                agency_run_id="agency-run",
+            ),
+        )
+    assert queued_exc.value.status_code == 403
+
+    queued_agency_run.status = RunStatus.RUNNING.value
+    agency_session.active_run_id = "agency-run"
+    await db_session.commit()
+    runtime_state = create_runtime_state()
+    runtime_state.register_run("agency-session", "agency-run", dispatch_mode="async")
+    with pytest.raises(HTTPException) as target_exc:
+        await controller.submit_to_session(
+            db_session,
+            settings,
+            runtime_state,
+            AgencySourceSessionSubmitRequest(
+                session_id="memory-session",
+                prompt="hello",
+                handoff_kind="reminder",
+                agency_session_id="agency-session",
+                agency_run_id="agency-run",
+            ),
+        )
+    assert target_exc.value.status_code == 422

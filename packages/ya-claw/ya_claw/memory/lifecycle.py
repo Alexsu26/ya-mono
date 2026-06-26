@@ -6,13 +6,18 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
+from fastapi import HTTPException
 from loguru import logger
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from ya_agent_environment import Environment
 from ya_agent_sdk.agents.lifecycle import BaseLifecycleExtension, ContextHandoffCompleteContext, ContextHandoffSource
+from ya_agent_sdk.agents.main import RuntimeReadyContext
 
+from ya_claw.agency.lifecycle import AgencyLifecycle
 from ya_claw.config import ClawSettings
+from ya_claw.context import ClawAgentContext
 from ya_claw.controller.models import DispatchMode, MemoryJobKind, TriggerType
 from ya_claw.execution.state_machine import queue_run
 from ya_claw.orm.tables import RunRecord, SessionMemoryStateRecord, SessionRecord
@@ -21,8 +26,15 @@ from ya_claw.runtime_state import InMemoryRuntimeState
 MEMORY_CONTEXT_TAG = "memory-context"
 MEMORY_MD_CONTEXT_TAG = "memory-md-context"
 MEMORY_FILE_INDEX_TAG = "memory-file-index"
-AUTO_TASK_CONTEXT_TAGS = ("heartbeat-guidance", "schedule-context", "heartbeat-context")
-_MEMORY_EXCLUDED_TRIGGER_TYPES = {TriggerType.HEARTBEAT.value, TriggerType.SCHEDULE.value, TriggerType.MEMORY.value}
+AUTO_TASK_CONTEXT_TAGS = ("heartbeat-guidance", "schedule-context", "workflow-context", "heartbeat-context")
+AGENCY_CONTEXT_TAGS = ("agency-context", "agency-index-context", "agency-action-log-context", "agency-file-index")
+_MEMORY_EXCLUDED_TRIGGER_TYPES = {
+    TriggerType.HEARTBEAT.value,
+    TriggerType.SCHEDULE.value,
+    TriggerType.WORKFLOW.value,
+    TriggerType.MEMORY.value,
+    TriggerType.AGENCY.value,
+}
 _MEMORY_TRIGGER_KEY = "memory_triggers"
 _PENDING_MEMORY_REQUESTS_KEY = "pending_requests"
 
@@ -36,9 +48,10 @@ class MemoryRunRequest:
     source_sequence_start: int | None = None
     source_sequence_end: int | None = None
     trigger_payload: dict[str, Any] | None = None
+    source_identity: dict[str, Any] | None = None
 
 
-class ClawMemoryExtension(BaseLifecycleExtension[Any, Any]):
+class ClawMemoryExtension(BaseLifecycleExtension[ClawAgentContext, Environment]):
     """SDK lifecycle extension for workspace-native YA Claw memory."""
 
     name = "ya_claw_memory"
@@ -52,28 +65,37 @@ class ClawMemoryExtension(BaseLifecycleExtension[Any, Any]):
         self._settings = settings
         self._session_factory = session_factory
 
-    async def on_runtime_ready(self, ctx: Any) -> None:
+    async def on_runtime_ready(self, ctx: RuntimeReadyContext[ClawAgentContext, Any, Environment]) -> None:
         try:
             await self._on_runtime_ready(ctx)
         except Exception:
             logger.exception("YA Claw memory context injection failed")
 
-    async def on_context_handoff_complete(self, ctx: ContextHandoffCompleteContext[Any]) -> None:
+    async def on_context_handoff_complete(self, ctx: ContextHandoffCompleteContext[ClawAgentContext]) -> None:
         try:
             self._on_context_handoff_complete(ctx)
         except Exception:
             logger.exception("YA Claw memory context handoff capture failed")
 
-    async def _on_runtime_ready(self, ctx: Any) -> None:
+    async def _on_runtime_ready(self, ctx: RuntimeReadyContext[ClawAgentContext, Any, Environment]) -> None:
         runtime_ctx = getattr(ctx.runtime, "ctx", None)
         if runtime_ctx is None:
             return
         source_kind = getattr(runtime_ctx, "source_kind", None)
         existing_tags = runtime_ctx.injected_context_tags
-        if source_kind in {TriggerType.HEARTBEAT.value, TriggerType.SCHEDULE.value}:
+        if source_kind in {TriggerType.HEARTBEAT.value, TriggerType.SCHEDULE.value, TriggerType.WORKFLOW.value}:
             missing_auto_tags = [tag for tag in AUTO_TASK_CONTEXT_TAGS if tag not in existing_tags]
             if missing_auto_tags:
                 runtime_ctx.injected_context_tags = (*existing_tags, *missing_auto_tags)
+            return
+        if source_kind == TriggerType.AGENCY.value:
+            missing_agency_tags = [
+                tag
+                for tag in (*AGENCY_CONTEXT_TAGS, MEMORY_MD_CONTEXT_TAG, MEMORY_FILE_INDEX_TAG)
+                if tag not in existing_tags
+            ]
+            if missing_agency_tags:
+                runtime_ctx.injected_context_tags = (*existing_tags, *missing_agency_tags)
             return
         if not self._settings.memory_enabled or not self._settings.memory_inject_enabled:
             return
@@ -87,7 +109,7 @@ class ClawMemoryExtension(BaseLifecycleExtension[Any, Any]):
         if missing_tags:
             runtime_ctx.injected_context_tags = (*runtime_ctx.injected_context_tags, *missing_tags)
 
-    def _on_context_handoff_complete(self, ctx: ContextHandoffCompleteContext[Any]) -> None:
+    def _on_context_handoff_complete(self, ctx: ContextHandoffCompleteContext[ClawAgentContext]) -> None:
         if not self._settings.memory_enabled:
             return
         deps = ctx.deps
@@ -127,11 +149,13 @@ class MemoryLifecycle:
         session_factory: async_sessionmaker[AsyncSession],
         runtime_state: InMemoryRuntimeState,
         submit_run: Callable[[str], bool] | None = None,
+        agency_submit_run: Callable[[str], bool] | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._runtime_state = runtime_state
         self._submit_run = submit_run
+        self._agency_submit_run = agency_submit_run
 
     async def on_run_committed(
         self,
@@ -207,11 +231,12 @@ class MemoryLifecycle:
         if not self._settings.memory_enabled:
             return []
         queued_run_ids: list[str] = []
+        agency_signal: tuple[str, dict[str, Any]] | None = None
         async with self._session_factory() as db_session:
             scope = await self._load_memory_run_scope(db_session, memory_run_id)
             if scope is None:
                 return []
-            _run, source_session, state, kind, memory = scope
+            run_record, source_session, state, kind, memory = scope
             if kind == MemoryJobKind.EXTRACT:
                 state.last_extracted_sequence_no = max(
                     state.last_extracted_sequence_no,
@@ -240,12 +265,30 @@ class MemoryLifecycle:
                 state.pending_summary = False
                 state.last_summary_run_id = memory_run_id
 
+            agency_signal = (
+                source_session.id,
+                {
+                    "memory_session_id": run_record.session_id,
+                    "memory_run_id": memory_run_id,
+                    "memory_job_kind": kind.value,
+                    "memory_reason": memory.get("reason"),
+                    "source_run_ids": [item for item in memory.get("source_run_ids", []) if isinstance(item, str)]
+                    if isinstance(memory.get("source_run_ids"), list)
+                    else [],
+                    "source_sequence_start": memory.get("source_sequence_start"),
+                    "source_sequence_end": memory.get("source_sequence_end"),
+                    "output_text": run_record.output_text,
+                },
+            )
+
             run_id = await self._enqueue_next_pending(db_session, state, source_session)
             if run_id is not None:
                 queued_run_ids.append(run_id)
 
             await db_session.commit()
 
+        if agency_signal is not None:
+            await self._emit_memory_session_completed_signal(*agency_signal)
         self._submit_all(queued_run_ids)
         return queued_run_ids
 
@@ -394,6 +437,8 @@ class MemoryLifecycle:
     ) -> str | None:
         memory_session = await self._ensure_memory_session(db_session, source_session)
         state.memory_session_id = memory_session.id
+        if request.source_identity is None:
+            request.source_identity = await _build_source_identity(db_session, source_session, request)
         if await _memory_session_busy(db_session, memory_session.id):
             _mark_pending_request(state, request)
             return None
@@ -423,6 +468,33 @@ class MemoryLifecycle:
         if request is None:
             return None
         return await self._enqueue_or_mark_pending(db_session, state, source_session, request)
+
+    async def _emit_memory_session_completed_signal(self, source_session_id: str, payload: dict[str, Any]) -> None:
+        if not self._settings.agency_enabled:
+            return
+        memory_run_id = str(payload.get("memory_run_id") or uuid4().hex)
+        memory_kind = str(payload.get("memory_job_kind") or "extract")
+        async with self._session_factory() as db_session:
+            lifecycle = AgencyLifecycle(
+                settings=self._settings,
+                runtime_state=self._runtime_state,
+                submit_run=self._agency_submit_run,
+            )
+            try:
+                await lifecycle.on_memory_session_completed(
+                    db_session,
+                    source_session_id=source_session_id,
+                    memory_run_id=memory_run_id,
+                    memory_session_id=payload.get("memory_session_id")
+                    if isinstance(payload.get("memory_session_id"), str)
+                    else None,
+                    memory_job_kind=memory_kind,
+                    output_text=payload.get("output_text") if isinstance(payload.get("output_text"), str) else None,
+                    payload=payload,
+                )
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
 
     def _submit_all(self, run_ids: list[str]) -> None:
         if self._submit_run is None:
@@ -477,6 +549,7 @@ def _pop_next_pending_request(state: SessionMemoryStateRecord) -> MemoryRunReque
     if kind is None:
         return _pop_next_pending_request(state)
     trigger_payload = request_data.get("context_handoff")
+    source_identity = request_data.get("source_identity")
     return MemoryRunRequest(
         source_session_id=str(request_data.get("source_session_id") or state.source_session_id),
         kind=kind,
@@ -491,6 +564,7 @@ def _pop_next_pending_request(state: SessionMemoryStateRecord) -> MemoryRunReque
         if isinstance(request_data.get("source_sequence_end"), int)
         else None,
         trigger_payload=dict(trigger_payload) if isinstance(trigger_payload, dict) else None,
+        source_identity=dict(source_identity) if isinstance(source_identity, dict) else None,
     )
 
 
@@ -531,10 +605,13 @@ def _request_metadata(request: MemoryRunRequest, *, memory_session_id: str) -> d
     }
     if request.trigger_payload is not None:
         metadata["context_handoff"] = request.trigger_payload
+    if request.source_identity is not None:
+        metadata["source_identity"] = request.source_identity
     return metadata
 
 
 async def _build_memory_prompt(db_session: AsyncSession, request: MemoryRunRequest) -> str:
+    source_identity = request.source_identity or await _build_source_identity(db_session, None, request)
     payload = {
         "kind": request.kind.value,
         "reason": request.reason,
@@ -542,6 +619,7 @@ async def _build_memory_prompt(db_session: AsyncSession, request: MemoryRunReque
         "source_run_ids": request.source_run_ids,
         "source_sequence_start": request.source_sequence_start,
         "source_sequence_end": request.source_sequence_end,
+        "source_identity": source_identity,
         "context_handoff": request.trigger_payload,
         "source_runs": await _source_run_material(db_session, request) if _should_embed_source_runs(request) else [],
     }
@@ -549,16 +627,18 @@ async def _build_memory_prompt(db_session: AsyncSession, request: MemoryRunReque
         instruction = (
             "Run workspace memory extraction. Use context_handoff trimmed messages when present. "
             "For threshold or manual extracts, inspect the referenced source session with session tools. "
-            "Update memory/MEMORY.md, memory/CHANGELOG.md, and event notes named memory/YYYYMMDD-event.md."
+            "Keep memory/MEMORY.md as a compact durable brief. Write details to event notes named memory/YYYYMMDD-event.md. "
+            "Update memory/CHANGELOG.md after changing memory files."
         )
     else:
         instruction = (
             "Run workspace memory summary. Review memory/MEMORY.md, memory/CHANGELOG.md, and event notes matching memory/YYYYMMDD-event.md. "
-            "Reorganize, merge, and rewrite memory files while preserving useful provenance. Keep MEMORY.md and CHANGELOG.md current."
+            "Reorganize, merge, and rewrite memory files while preserving useful provenance. "
+            "Keep MEMORY.md compact and move detailed chronology into event notes or CHANGELOG.md."
         )
     return "\n\n".join([
         instruction,
-        "Memory file protocol: memory/MEMORY.md is the main index loaded for the primary agent. memory/CHANGELOG.md records memory updates. Event files use memory/YYYYMMDD-event.md filenames with YAML frontmatter containing name and description.",
+        "Memory file protocol: memory/MEMORY.md is the compact durable brief loaded for the primary agent. memory/CHANGELOG.md records memory updates. Event files use memory/YYYYMMDD-event.md filenames with YAML frontmatter containing name and description, and their frontmatter is the discovery surface for detailed memory.",
         "Memory job payload:",
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
     ])
@@ -573,18 +653,18 @@ def _memory_metadata(run_metadata: dict[str, Any]) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-def _memory_kind(value: Any) -> MemoryJobKind | None:
+def _memory_kind(value: object) -> MemoryJobKind | None:
     try:
         return MemoryJobKind(value)
     except Exception:
         return None
 
 
-def _string_or_none(value: Any) -> str | None:
+def _string_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
-def _int_or_zero(value: Any) -> int:
+def _int_or_zero(value: object) -> int:
     return value if isinstance(value, int) else 0
 
 
@@ -629,7 +709,90 @@ async def _memory_session_busy(db_session: AsyncSession, memory_session_id: str)
     return bool(result.scalar_one())
 
 
-async def _source_run_material(db_session: AsyncSession, request: MemoryRunRequest) -> list[dict[str, Any]]:
+_BRIDGE_IDENTITY_KEYS = (
+    "adapter",
+    "tenant_key",
+    "chat_id",
+    "chat_type",
+    "event_id",
+    "message_id",
+    "root_id",
+    "parent_id",
+    "thread_id",
+    "sender_id",
+    "sender_type",
+    "message_type",
+    "create_time",
+)
+
+
+async def _build_source_identity(
+    db_session: AsyncSession,
+    source_session: SessionRecord | None,
+    request: MemoryRunRequest,
+) -> dict[str, Any]:
+    if source_session is None:
+        loaded_session = await db_session.get(SessionRecord, request.source_session_id)
+        source_session = loaded_session if isinstance(loaded_session, SessionRecord) else None
+
+    identity: dict[str, Any] = {
+        "source_session": {
+            "session_id": request.source_session_id,
+        },
+    }
+    if isinstance(source_session, SessionRecord):
+        identity["source_session"] = {
+            "session_id": source_session.id,
+            "profile_name": source_session.profile_name,
+            "session_type": source_session.session_type,
+        }
+        conversation_identity = _bridge_identity_from_container(source_session.session_metadata)
+        if conversation_identity:
+            identity["bridge"] = {"conversation": conversation_identity}
+
+    source_runs = await _source_run_identities(db_session, request)
+    if source_runs:
+        identity["source_runs"] = source_runs
+        latest_bridge_message = next(
+            (item["bridge"] for item in reversed(source_runs) if isinstance(item.get("bridge"), dict)),
+            None,
+        )
+        if isinstance(latest_bridge_message, dict):
+            bridge_identity = dict(identity.get("bridge") or {})
+            bridge_identity["latest_message"] = latest_bridge_message
+            identity["bridge"] = bridge_identity
+    return identity
+
+
+async def _source_run_identities(db_session: AsyncSession, request: MemoryRunRequest) -> list[dict[str, Any]]:
+    identities: list[dict[str, Any]] = []
+    for record in await _source_run_records(db_session, request):
+        item: dict[str, Any] = {
+            "run_id": record.id,
+            "sequence_no": record.sequence_no,
+            "trigger_type": record.trigger_type,
+        }
+        bridge_identity = _bridge_identity_from_container(record.run_metadata)
+        if bridge_identity:
+            item["bridge"] = bridge_identity
+        identities.append(item)
+    return identities
+
+
+def _bridge_identity_from_container(container: object) -> dict[str, Any]:
+    if not isinstance(container, dict):
+        return {}
+    candidate = container.get("bridge")
+    bridge = candidate if isinstance(candidate, dict) else container
+    identity: dict[str, Any] = {}
+    for key in _BRIDGE_IDENTITY_KEYS:
+        value = bridge.get(key)
+        if isinstance(value, str | int | float | bool):
+            identity[key] = value
+    return identity
+
+
+async def _source_run_records(db_session: AsyncSession, request: MemoryRunRequest) -> list[RunRecord]:
     statement = select(RunRecord).where(
         RunRecord.session_id == request.source_session_id,
         RunRecord.status == "completed",
@@ -643,16 +806,23 @@ async def _source_run_material(db_session: AsyncSession, request: MemoryRunReque
             statement = statement.where(RunRecord.sequence_no <= request.source_sequence_end)
     statement = statement.order_by(RunRecord.sequence_no.asc()).limit(50)
     result = await db_session.execute(statement)
+    return list(result.scalars().all())
+
+
+async def _source_run_material(db_session: AsyncSession, request: MemoryRunRequest) -> list[dict[str, Any]]:
     return [
         {
             "run_id": record.id,
             "sequence_no": record.sequence_no,
+            "trigger_type": record.trigger_type,
+            "source_identity": {
+                "bridge": _bridge_identity_from_container(record.run_metadata),
+            },
             "input_parts": record.input_parts,
             "output_text": record.output_text,
-            "output_summary": record.output_summary,
             "committed_at": record.committed_at.isoformat() if record.committed_at is not None else None,
         }
-        for record in result.scalars().all()
+        for record in await _source_run_records(db_session, request)
     ]
 
 

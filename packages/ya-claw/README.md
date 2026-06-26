@@ -31,7 +31,7 @@ Key areas in this package:
 - `spec/` — architecture and runtime design documents
 - `tests/` — runtime tests
 - `ya_claw/api/` — HTTP API surface
-- `ya_claw/bridge/` — IM bridge adapters and relay logic
+- `ya_claw/bridge/` — IM bridge adapters and event handling
 - `ya_claw/app.py` and `ya_claw/cli.py` — application entrypoints
 - `ya_claw/config.py` — runtime configuration
 
@@ -78,9 +78,9 @@ This section is the maintainer index for implementation details that affect code
 - Committed continuity blobs live in `run-store/{run_id}/state.json` and `run-store/{run_id}/message.json`.
 - `message.json` stores the compacted replay list of AGUI-aligned events as a top-level JSON array.
 - Input payloads use `input_parts`; run records preserve `input_parts` as original JSON-compatible payloads for replay and UI reconstruction.
-- Successful run records store final `output_text` directly in the database and keep `output_summary` for compact displays.
+- Successful run records store final `output_text` directly in the database.
 - Session GET exposes paginated runs with optional raw `input_parts` and compacted message replay lists, returns optional top-level committed state/message from `head_success_run_id`, and derives session status from the latest run.
-- Session turns API returns successful completed turns with raw `input_parts`, `output_text`, and `output_summary`.
+- Session turns API returns successful completed turns with raw `input_parts`, `output_text`,.
 - Run GET returns `session + run + optional state + optional message`.
 - Run trace API returns compact tool-call/tool-response projections from `message.json`.
 - Rerun can explicitly target failed or interrupted runs through `restore_from_run_id`.
@@ -98,7 +98,7 @@ This section is the maintainer index for implementation details that affect code
 
 ### Workspace Providers and Docker Runtime
 
-- `LocalWorkspaceProvider` uses `LocalFileOperator` plus `LocalShell` over the real workspace path.
+- `LocalWorkspaceProvider` uses `LocalFileOperator` plus policy-driven `LocalShell` over the real workspace path. Claw passes resolved shell sandbox policy for local sandbox execution; raw host shell is controlled by explicit policy.
 - `DockerWorkspaceProvider` uses Docker mounts through `SandboxEnvironment`; file operations map the service-visible workspace path to `/workspace`, and Docker shell uses `/workspace`.
 - `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_HOST_WORKSPACE_DIR` provides the Docker daemon-visible host mount path when the YA Claw service itself runs in Docker.
 - Docker workspace containers receive UID/GID envs (`YA_CLAW_WORKSPACE_UID`, `YA_CLAW_WORKSPACE_GID`, `YA_CLAW_HOST_UID`, `YA_CLAW_HOST_GID`) from the service process by default or from `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_UID/GID`.
@@ -130,6 +130,29 @@ This section is the maintainer index for implementation details that affect code
 - Session list/detail responses expose `memory_state`.
 - Manual endpoints are `memory:extract` and `memory:summarize`.
 - File browsing should use workspace filetree APIs.
+
+## Installation
+
+Recommended standalone install with uv:
+
+```bash
+uv tool install 'ya-claw[rs]'
+ya-clawd version
+```
+
+`[rs]` passes `ya-agent-sdk[all,rs]` into the runtime and installs the native Rust filesystem search binding. The equivalent extra-dependency form is:
+
+```bash
+uv tool install ya-claw --with ya-ripgrep-core
+```
+
+`ya-ripgrep-core` is a library dependency, so `--with` is the matching uv form; `--with-executables-from` applies to companion packages that also expose CLI executables.
+
+Pip can install the same runtime shape:
+
+```bash
+pip install 'ya-claw[rs]'
+```
 
 ## Quick Start
 
@@ -163,6 +186,8 @@ Profile, MCP, and coordinator settings:
 - `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_HOME=/home/claw`
 - `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_CONTAINER_CACHE_DIR=~/.ya-claw/data/docker-workspace-containers`
 - `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_EXTRA_MOUNTS=/srv/ya-claw/home:/home/claw:rw,/srv/ya-claw/cache:/cache:ro`
+- `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_RETENTION_POLICY=stop_on_idle`
+- `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_IDLE_TTL_SECONDS=3600`
 - `YA_CLAW_WORKSPACE_ENV_VARS=MY_TOOL_API_KEY,MY_TOOL_ENDPOINT`
 - `YA_CLAW_BRIDGE_DISPATCH_MODE=embedded|manual`
 - `YA_CLAW_BRIDGE_ENABLED_ADAPTERS=lark`
@@ -176,14 +201,38 @@ Profile, MCP, and coordinator settings:
 - `LARKSUITE_CLI_BRAND=feishu`
 - `LARKSUITE_CLI_DEFAULT_AS=bot`
 - `LARKSUITE_CLI_STRICT_MODE=bot`
+- `MALLOC_ARENA_MAX=2`
+- `MALLOC_TRIM_THRESHOLD_=131072`
+- `PYTHONMALLOC=malloc`
 
-Profiles store model, prompt, model context config, builtin tool groups, subagents, approval policy, MCP server definitions, and MCP namespace filters. YA Claw accepts profile MCP servers with `streamable_http` transport. Every YA Claw agent runtime receives the profile MCP configuration through `ToolProxyToolset`, and each profile can narrow that surface with `enabled_mcps` and `disabled_mcps`.
+The official YA Claw service and workspace Docker images set `MALLOC_ARENA_MAX=2`, `MALLOC_TRIM_THRESHOLD_=131072`, and `PYTHONMALLOC=malloc` for long-lived Python workloads. Use the same allocator values for systemd or custom container deployments when memory residency matters.
 
-Session and run requests use the shared workspace configured by `YA_CLAW_WORKSPACE_DIR`. YA Claw maps that host directory to `/workspace` for file operations and shell execution. Workspace guidance loads from `/workspace/AGENTS.md`, and workspace skills are discovered from `/workspace/.agents/skills/`.
+Profiles store model, prompt, model context config, builtin tool groups, subagents, approval policy, security policy, MCP server definitions, and MCP namespace filters. YA Claw accepts profile MCP servers with `streamable_http` transport. Every YA Claw agent runtime receives the profile MCP configuration through `ToolProxyToolset`, and each profile can narrow that surface with `enabled_mcps` and `disabled_mcps`.
 
-Workspace environments receive `LARK_APP_ID` and `LARK_APP_SECRET` from explicit process environment values or from the configured Lark bridge app settings. The official Docker workspace entrypoint writes these values into `/home/claw/.lark-cli/config.json` for `lark-cli` bot commands, and clears `LARKSUITE_CLI_APP_ID` / `LARKSUITE_CLI_APP_SECRET` in the container runtime environment so `lark-cli` uses the generated config profile. `LARKSUITE_CLI_BRAND`, `LARKSUITE_CLI_DEFAULT_AS`, and `LARKSUITE_CLI_STRICT_MODE` tune that generated profile. `YA_CLAW_WORKSPACE_ENV_VARS` forwards additional comma-separated process environment variable names into workspace environments. For Docker workspaces, forwarded values are passed at reusable workspace container creation time.
+Codex OAuth profiles use the `oauth@codex:gpt-5.5` model string after the service host has run `ya-oauth login codex`. YA Claw maps provider session headers to the YA Claw session ID and provider thread headers to the run ID. Docker deployments should mount a persistent host directory to the service user's `~/.yaai`, keep directory mode `0700` and `auth.json` mode `0600`, and keep credentials out of image layers.
 
-The default Docker workspace image is `ghcr.io/wh1isper/ya-claw-workspace:latest`. It is based on Debian stable and includes Python, Node.js, Debian Chromium, the `agent-browser` CLI, and an `agent-browser` discovery skill copied into mounted workspaces at container start. Auto-started workspace containers receive `YA_CLAW_WORKSPACE_UID`, `YA_CLAW_WORKSPACE_GID`, `YA_CLAW_HOST_UID`, and `YA_CLAW_HOST_GID`; the default values come from the YA Claw service process UID/GID and can be overridden with `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_UID` and `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_GID`. Docker exec uses `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_EXEC_USER=auto` by default, which resolves to the configured workspace UID:GID, and sets `HOME` from `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_HOME` with default `/home/claw`. `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_EXTRA_MOUNTS` adds comma-separated `host_path:container_path[:mode]` mounts to Docker workspace containers, with `rw` and `ro` modes. Docker workspace containers reuse one stable container for the configured workspace, cache the container ID under `~/.ya-claw/data/docker-workspace-containers`, check running and Docker health status before each reuse, start stopped containers, and refresh the cache after container recreation. Use `agent-browser skills get core` inside a workspace session for the version-matched browser automation workflow.
+Shell command review is configured per profile under `security.shell_review`. The review model is explicit when enabled, and `model_settings` accepts SDK preset names such as `openai_responses_low` or an inline settings object. YA Claw runs shell review in auto-pilot deny mode: commands that reach `risk_threshold` trigger the configured action, and profile values of `on_needs_approval: defer` are coerced to deny at runtime. The default profile risk threshold is `extra_high`.
+
+```yaml
+profiles:
+  - name: default
+    model: gateway@openai-responses:gpt-5.5
+    model_settings_preset: openai_responses_high
+    model_config_preset: gpt5_270k
+    security:
+      shell_review:
+        enabled: true
+        model: gateway@openai-responses:gpt-5.4-mini
+        model_settings: openai_responses_low
+        on_needs_approval: deny
+        risk_threshold: extra_high
+```
+
+Session and run requests can provide `workspace.mounts` with one or more logical workspace folders, one default mount, a default cwd, and `rw` or `ro` access per mount. When requests omit workspace configuration, YA Claw uses the shared workspace configured by `YA_CLAW_WORKSPACE_DIR` and maps it to `/workspace`. Workspace guidance and memory use the default logical mount, and runtime prompts list the resolved mount set.
+
+Workspace environments receive `LARK_APP_ID` and `LARK_APP_SECRET` from explicit process environment values or from the configured Lark bridge app settings. The official Docker workspace entrypoint writes these values into `/home/claw/.lark-cli/config.json` for `lark-cli` bot commands, and clears `LARKSUITE_CLI_APP_ID` / `LARKSUITE_CLI_APP_SECRET` in the container runtime environment so `lark-cli` uses the generated config profile. `LARKSUITE_CLI_BRAND`, `LARKSUITE_CLI_DEFAULT_AS`, and `LARKSUITE_CLI_STRICT_MODE` tune that generated profile. `YA_CLAW_WORKSPACE_ENV_VARS` forwards additional comma-separated process environment variable names into workspace environments. For Docker workspaces, forwarded values are passed at session or run workspace container creation time.
+
+The default Docker workspace image is `ghcr.io/wh1isper/ya-claw-workspace:latest`. It is based on Debian stable and includes Python, Node.js, `lark-cli`, and bundled workspace skills copied into mounted workspaces at container start. Auto-started workspace containers receive `YA_CLAW_WORKSPACE_UID`, `YA_CLAW_WORKSPACE_GID`, `YA_CLAW_HOST_UID`, and `YA_CLAW_HOST_GID`; the default values come from the YA Claw service process UID/GID and can be overridden with `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_UID` and `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_GID`. Docker exec uses `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_EXEC_USER=auto` by default, which resolves to the configured workspace UID:GID, and sets `HOME` from `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_HOME` with default `/home/claw`. `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_EXTRA_MOUNTS` adds comma-separated provider support mounts to Docker workspace containers, with `rw` and `ro` modes. Docker session sandboxes use generation-specific containers named `ya-claw-session-{session_id_short}-gN`, store cache metadata under `~/.ya-claw/data/docker-workspace-containers/sessions/{session_id}/workspace.json`, resolve and store the Docker image digest before reuse, refresh `last_used_at` during active runs and once on run exit, and stop idle containers according to `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_RETENTION_POLICY` and `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_IDLE_TTL_SECONDS`. TTL cleanup deletes the session `workspace.json` cache file and uses the same cache-path lock as run startup. A changed image digest causes YA Claw to remove the stale container and start a new one from the current image. Schedule and heartbeat runs use run-scoped containers named `ya-claw-run-{run_id_short}` and cache metadata under `runs/{run_id}/workspace.json`.
 
 Profiles can be managed through:
 
@@ -237,6 +286,16 @@ Run the web shell from the repository root:
 ```bash
 make web-dev
 ```
+
+## PPT Agent
+
+YA Claw seeds a `ppt-agent` profile that includes `filesystem`, `shell`, `document`, `web`, and `pptx` toolsets. Start the backend from the repository root:
+
+```bash
+YA_CLAW_API_TOKEN=local-token uv run --package ya-claw ya-claw serve --reload
+```
+
+Then select profile `ppt-agent` from the web app or API. The agent plans a `SlidePlan`, calls `pptx_render`, and returns the workspace path to the generated editable `.pptx`. Optional image search uses `YA_AGENT_PPTX_PEXELS_API_KEY`, `YA_AGENT_PPTX_UNSPLASH_ACCESS_KEY`, and `YA_AGENT_PPTX_ASSET_SEARCH_ENABLED`.
 
 ## Docker
 

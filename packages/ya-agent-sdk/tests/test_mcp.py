@@ -88,11 +88,11 @@ def test_filter_mcp_config_enabled_and_disabled() -> None:
         servers={
             "github": MCPServerConfig(transport="stdio", command="npx"),
             "context7": MCPServerConfig(transport="streamable_http", url="https://mcp.context7.com/mcp"),
-            "browser": MCPServerConfig(transport="stdio", command="uvx"),
+            "filesystem": MCPServerConfig(transport="stdio", command="uvx"),
         }
     )
 
-    filtered = filter_mcp_config(config, enabled_mcps=["github", "browser"], disabled_mcps=["browser"])
+    filtered = filter_mcp_config(config, enabled_mcps=["github", "filesystem"], disabled_mcps=["filesystem"])
 
     assert list(filtered.servers) == ["github"]
 
@@ -257,7 +257,7 @@ async def test_hook_no_approval_needed(mock_context: MagicMock, mock_call_tool: 
     result = await hook(mock_context, mock_call_tool, "read_file", {"path": "/home/user/test.txt"})
 
     assert result == "tool result"
-    mock_call_tool.assert_called_once_with("read_file", {"path": "/home/user/test.txt"}, None)
+    mock_call_tool.assert_called_once_with("read_file", {"path": "/home/user/test.txt"}, metadata=None)
 
 
 @pytest.mark.asyncio
@@ -286,7 +286,7 @@ async def test_hook_already_approved(mock_context: MagicMock, mock_call_tool: As
     result = await hook(mock_context, mock_call_tool, "write_file", {"path": "/home/user/test.txt"})
 
     assert result == "tool result"
-    mock_call_tool.assert_called_once_with("write_file", {"path": "/home/user/test.txt"}, None)
+    mock_call_tool.assert_called_once_with("write_file", {"path": "/home/user/test.txt"}, metadata=None)
 
 
 @pytest.mark.asyncio

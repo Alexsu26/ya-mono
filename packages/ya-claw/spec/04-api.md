@@ -2,12 +2,14 @@
 
 YA Claw exposes one local HTTP API under `/api/v1`.
 
-The API has four layers:
+The API has these layers:
 
 - **session API** for the common high-level workflow
 - **run API** for explicit low-level orchestration
+- **workflow API** for Claw-managed agent-supervised workflow orchestration
 - **schedule API** for timer-managed work
 - **heartbeat API** for runtime-owned operational timer visibility
+- **workspace binding fields** on session and run creation for multi-folder execution
 
 ## API Principle
 
@@ -23,8 +25,10 @@ flowchart TB
     ROOT --> RUNS[/runs]
     ROOT --> EVENTS[/events via nested session and run routes]
     ROOT --> PROFILES[/profiles and seed operations]
+    ROOT --> WORKFLOWS[/workflows and workflow-runs]
     ROOT --> SCHEDULES[/schedules]
     ROOT --> HEARTBEAT[/heartbeat]
+    ROOT --> WORKSPACE[/workspace runtime and sandbox state]
     ROOT --> CLAW[/claw info and notifications]
 ```
 
@@ -35,6 +39,39 @@ flowchart TB
 | `GET`  | `/healthz`                   | service, storage, and runtime health         |
 | `GET`  | `/api/v1/claw/info`          | web console startup handshake and capability |
 | `GET`  | `/api/v1/claw/notifications` | global console notification SSE stream       |
+
+## Workflows
+
+| Method  | Path                                                            | Purpose                                                   |
+| ------- | --------------------------------------------------------------- | --------------------------------------------------------- |
+| `GET`   | `/api/v1/workflows`                                             | list workflow definitions                                 |
+| `POST`  | `/api/v1/workflows`                                             | create workflow definition                                |
+| `GET`   | `/api/v1/workflows/{workflow_id}`                               | inspect workflow definition                               |
+| `PATCH` | `/api/v1/workflows/{workflow_id}`                               | update workflow definition metadata or body               |
+| `POST`  | `/api/v1/workflows/{workflow_id}:archive`                       | archive workflow definition                               |
+| `POST`  | `/api/v1/workflows/{workflow_id}:trigger`                       | create a workflow run                                     |
+| `GET`   | `/api/v1/workflow-runs`                                         | list workflow runs                                        |
+| `GET`   | `/api/v1/workflow-runs/{workflow_run_id}`                       | inspect workflow run, node state, result, and linked runs |
+| `GET`   | `/api/v1/workflow-runs/{workflow_run_id}/events`                | replay and tail workflow events                           |
+| `POST`  | `/api/v1/workflow-runs/{workflow_run_id}/cancel`                | cancel workflow run                                       |
+| `POST`  | `/api/v1/workflow-runs/{workflow_run_id}/nodes/{node_id}/steer` | steer an active node run                                  |
+
+Workflow semantics live in [13-workflows.md](13-workflows.md). Workflow trigger creates a durable workflow run first, then the workflow executor starts node work through the regular queued-run execution model.
+
+## Workspace Runtime
+
+| Method | Path                                            | Purpose                                                 |
+| ------ | ----------------------------------------------- | ------------------------------------------------------- |
+| `GET`  | `/api/v1/workspace/runtime`                     | inspect configured workspace backend and runtime checks |
+| `POST` | `/api/v1/workspace:resolve`                     | resolve provider binding for supplied metadata          |
+| `GET`  | `/api/v1/sessions/{session_id}/workspace`       | inspect a session's resolved workspace and sandbox      |
+| `GET`  | `/api/v1/sessions/{session_id}/sandbox`         | inspect a session's sandbox state                       |
+| `POST` | `/api/v1/sessions/{session_id}/sandbox:prepare` | prepare a Docker-backed session sandbox                 |
+| `POST` | `/api/v1/sessions/{session_id}/sandbox:stop`    | stop a Docker-backed session sandbox                    |
+
+`workspace.runtime` exposes backend, execution location, workspace service path, virtual path, checks, Docker daemon/image/cache status, sandbox lifecycle capabilities, and update time. Session summaries and session detail responses include `workspace_state` with the persisted sandbox state when sandbox metadata exists.
+
+Sandbox state uses `status` for lifecycle (`created`, `preparing`, `ready`, `failed`, `stopped`) and `ready_state` for client display (`not_started`, `starting`, `ready`, `failed`). Docker session sandboxes expose container reference, container id, verified container id, image, work dir, retention policy, idle TTL, computed expiry, and TTL seconds remaining.
 
 ## Sessions
 
@@ -90,6 +127,7 @@ Suggested fields:
 
 - `profile_name`
 - `metadata`
+- `workspace`
 - `input_parts`
 - `dispatch_mode`
 - `trigger_type`
@@ -101,6 +139,7 @@ Suggested fields:
 - `restore_from_run_id`
 - `input_parts`
 - `metadata`
+- `workspace`
 - `dispatch_mode`
 - `trigger_type`
 
@@ -113,8 +152,40 @@ Suggested fields:
 - `profile_name`
 - `input_parts`
 - `metadata`
+- `workspace`
 - `dispatch_mode`
 - `trigger_type`
+
+### Workspace Binding Request Field
+
+`workspace` is an optional first-class field for session and run creation. It lets clients bind a session or run to one or more host folders.
+
+```json
+{
+  "workspace": {
+    "mounts": [
+      {
+        "id": "main",
+        "name": "ya-mono",
+        "host_path": "/Users/jizhongsheng/code/yet-another-agents/ya-mono",
+        "virtual_path": "/workspace/main",
+        "mode": "rw"
+      },
+      {
+        "id": "docs",
+        "name": "product-docs",
+        "host_path": "/Users/jizhongsheng/docs/product",
+        "virtual_path": "/workspace/docs",
+        "mode": "ro"
+      }
+    ],
+    "default_mount_id": "main",
+    "cwd": "/workspace/main"
+  }
+}
+```
+
+Session create stores `workspace` in session metadata. Session continuation inherits the session workspace. Run create and session-run create can provide a workspace override for that execution. Workspace mount-set semantics live in [10-workspace-mount-sets.md](10-workspace-mount-sets.md).
 
 ## Creation Semantics
 
@@ -145,7 +216,6 @@ Suggested run summary fields:
 - `input_preview`
 - `input_parts` when `include_input_parts=true`
 - `output_text`
-- `output_summary`
 - `error_message`
 - `termination_reason`
 - `created_at`
@@ -174,6 +244,14 @@ Session and run GET endpoints should return the structured record plus committed
     "head_run_id": "run_3",
     "head_success_run_id": "run_2",
     "active_run_id": "run_3",
+    "workspace_state": {
+      "sandbox_state": {
+        "backend": "docker",
+        "ready_state": "ready",
+        "container_id": "container_123",
+        "ttl_seconds_remaining": 1800
+      }
+    },
     "recent_runs": []
   },
   "state": {},
@@ -185,10 +263,21 @@ Session and run GET endpoints should return the structured record plus committed
 
 ### Session Turns
 
-`GET /api/v1/sessions/{session_id}/turns?limit=20`
+`GET /api/v1/sessions/{session_id}/turns?limit=20&cursor=run_2`
 
-Returns completed runs only. Each turn includes the original `input_parts`, `output_text`, and `output_summary`.
-The endpoint paginates by descending `sequence_no` with `before_sequence_no`.
+Returns completed runs only. Each turn includes the original `input_parts`, `output_text`,.
+The endpoint paginates newest-first by descending `(sequence_no, run_id)`. Use `next_cursor` as the next request's `cursor` to load older turns for chatbox history. `before_sequence_no` remains available for sequence-number based callers.
+
+```json
+{
+  "session_id": "session_123",
+  "limit": 20,
+  "has_more": true,
+  "next_cursor": "run_2",
+  "next_before_sequence_no": 2,
+  "turns": []
+}
+```
 
 ### Run GET
 
@@ -299,9 +388,24 @@ Suggested response shape:
     "session_events": true,
     "run_events": true,
     "notifications": true,
+    "notification_replay": true,
+    "session_status_reasons": true,
+    "hitl_status_reason": true,
     "profiles": true,
     "schedules": true,
-    "heartbeat": true
+    "heartbeat": true,
+    "session_workspace_binding": true,
+    "run_workspace_override": true,
+    "multi_mount_workspaces": true,
+    "session_docker_sandbox": true,
+    "run_scoped_auto_task_sandbox": true,
+    "sandbox_idle_ttl": true
+  },
+  "workspace_mount_modes": ["rw", "ro"],
+  "sandbox_retention_policies": ["stop_on_idle", "keep_warm"],
+  "limits": {
+    "max_workspace_mounts_per_session": 8,
+    "default_sandbox_idle_ttl_seconds": 3600
   }
 }
 ```
@@ -311,21 +415,32 @@ The notification stream at `/api/v1/claw/notifications` is a global SSE stream f
 ```json
 {
   "id": "1",
-  "type": "run.updated",
+  "type": "session.updated",
   "created_at": "2026-04-25T13:00:00Z",
   "payload": {
     "session_id": "session_123",
-    "run_id": "run_456",
-    "status": "running"
+    "status": "running",
+    "status_reason": "hitl_pending",
+    "status_detail": {
+      "run_id": "run_456",
+      "sequence_no": 4,
+      "active_interaction_count": 1
+    },
+    "active_run_id": "run_456"
   }
 }
 ```
+
+Session summaries expose stable `status` values plus `status_reason` and `status_detail` for UI-specific transition context. HITL uses `status="running"` with `status_reason="hitl_pending"` so clients can show approval prompts while the run remains active.
+
+Run notifications also include `session_status`, `session_status_reason`, and `session_status_detail` for clients that process run events directly.
 
 Notification events are buffered in process memory and support `Last-Event-ID` replay. The web console should still use session and run event streams for detailed AGUI output.
 
 Initial notification types:
 
 - `session.created`
+- `session.updated`
 - `run.created`
 - `run.updated`
 - `profile.created`
@@ -356,7 +471,7 @@ Schedules are available through `/api/v1/schedules` CRUD routes plus manual fire
 | `POST`   | `/api/v1/schedules/{schedule_id}:trigger` | create manual fire   |
 | `GET`    | `/api/v1/schedules/{schedule_id}/fires`   | list schedule fires  |
 
-Schedule execution modes are `continue_session`, `fork_session`, and `isolate_session`.
+Schedule execution modes are `continue_session`, `fork_session`, and `isolate_session`. Schedule-triggered Docker runs use run-scoped sandboxes and close them at terminal state.
 
 ## Heartbeat
 
@@ -369,7 +484,7 @@ Heartbeat has read-oriented console routes and an admin manual trigger route.
 | `GET`  | `/api/v1/heartbeat/fires`   | list heartbeat fires                       |
 | `POST` | `/api/v1/heartbeat:trigger` | create manual heartbeat fire for admin use |
 
-Heartbeat is runtime-owned and available through heartbeat console/admin routes.
+Heartbeat is runtime-owned and available through heartbeat console/admin routes. Heartbeat-triggered Docker runs use run-scoped sandboxes and close them at terminal state.
 
 ## Profiles
 

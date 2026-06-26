@@ -78,10 +78,15 @@ from ya_agent_sdk.presets import (
     OPENAI_LOW,
     OPENAI_MEDIUM,
     OPENAI_RESPONSES_DEFAULT,
+    OPENAI_RESPONSES_DEFAULT_FAST,
     OPENAI_RESPONSES_HIGH,
+    OPENAI_RESPONSES_HIGH_FAST,
     OPENAI_RESPONSES_LOW,
+    OPENAI_RESPONSES_LOW_FAST,
     OPENAI_RESPONSES_MEDIUM,
+    OPENAI_RESPONSES_MEDIUM_FAST,
     OPENAI_RESPONSES_XHIGH,
+    OPENAI_RESPONSES_XHIGH_FAST,
     OPENAI_XHIGH,
     ModelConfigPreset,
     ModelSettingsPreset,
@@ -106,6 +111,7 @@ def _assert_anthropic_adaptive_preset(
     assert preset["anthropic_thinking"] == {"type": "adaptive", "display": "summarized"}
     assert preset["anthropic_effort"] == effort
     assert preset["anthropic_cache_instructions"] is True
+    assert preset["anthropic_cache_tool_definitions"] is True
     assert preset["anthropic_cache_messages"] is True
 
     beta_header = preset.get("extra_headers", {}).get("anthropic-beta", "")
@@ -134,6 +140,35 @@ def test_anthropic_presets_structure() -> None:
 
     assert ANTHROPIC_OFF["anthropic_thinking"]["type"] == "disabled"
     assert "extra_headers" not in ANTHROPIC_OFF
+
+
+def test_anthropic_presets_cache_tool_definitions() -> None:
+    """Test that Anthropic cache presets also cache tool definitions."""
+    for preset in [
+        ANTHROPIC_DEFAULT,
+        ANTHROPIC_HIGH,
+        ANTHROPIC_MEDIUM,
+        ANTHROPIC_LOW,
+        ANTHROPIC_OFF,
+        ANTHROPIC_1M_DEFAULT,
+        ANTHROPIC_1M_HIGH,
+        ANTHROPIC_1M_MEDIUM,
+        ANTHROPIC_1M_LOW,
+        ANTHROPIC_1M_OFF,
+        ANTHROPIC_CM_DEFAULT,
+        ANTHROPIC_CM_HIGH,
+        ANTHROPIC_CM_MEDIUM,
+        ANTHROPIC_CM_LOW,
+        ANTHROPIC_CM_OFF,
+        ANTHROPIC_1M_CM_DEFAULT,
+        ANTHROPIC_1M_CM_HIGH,
+        ANTHROPIC_1M_CM_MEDIUM,
+        ANTHROPIC_1M_CM_LOW,
+        ANTHROPIC_1M_CM_OFF,
+    ]:
+        assert preset["anthropic_cache_instructions"] is True
+        assert preset["anthropic_cache_tool_definitions"] is True
+        assert preset["anthropic_cache_messages"] is True
 
 
 def test_anthropic_1m_presets_structure() -> None:
@@ -261,6 +296,7 @@ def test_anthropic_adaptive_presets_structure() -> None:
         assert preset["anthropic_effort"] in ("low", "medium", "high", "xhigh", "max")
         # Caching enabled
         assert preset["anthropic_cache_instructions"] is True
+        assert preset["anthropic_cache_tool_definitions"] is True
         assert preset["anthropic_cache_messages"] is True
         # No beta headers needed (adaptive auto-enables interleaved)
         assert "extra_headers" not in preset
@@ -357,12 +393,30 @@ def test_openai_responses_presets_structure() -> None:
         OPENAI_RESPONSES_HIGH,
         OPENAI_RESPONSES_MEDIUM,
         OPENAI_RESPONSES_LOW,
+        OPENAI_RESPONSES_DEFAULT_FAST,
+        OPENAI_RESPONSES_XHIGH_FAST,
+        OPENAI_RESPONSES_HIGH_FAST,
+        OPENAI_RESPONSES_MEDIUM_FAST,
+        OPENAI_RESPONSES_LOW_FAST,
     ]:
         assert "openai_reasoning_effort" in preset
         assert "openai_reasoning_summary" in preset
 
+    for preset in [
+        OPENAI_RESPONSES_DEFAULT_FAST,
+        OPENAI_RESPONSES_XHIGH_FAST,
+        OPENAI_RESPONSES_HIGH_FAST,
+        OPENAI_RESPONSES_MEDIUM_FAST,
+        OPENAI_RESPONSES_LOW_FAST,
+    ]:
+        assert preset["openai_service_tier"] == "priority"
+
     assert OPENAI_RESPONSES_XHIGH["openai_reasoning_effort"] == "xhigh"
-    assert OPENAI_RESPONSES_XHIGH["max_output_tokens"] > OPENAI_RESPONSES_HIGH["max_output_tokens"]
+    assert OPENAI_RESPONSES_XHIGH_FAST["openai_reasoning_effort"] == "xhigh"
+    assert OPENAI_RESPONSES_HIGH_FAST["openai_reasoning_effort"] == "high"
+    assert OPENAI_RESPONSES_MEDIUM_FAST["openai_reasoning_effort"] == "medium"
+    assert OPENAI_RESPONSES_LOW_FAST["openai_reasoning_effort"] == "low"
+    assert OPENAI_RESPONSES_XHIGH["max_tokens"] > OPENAI_RESPONSES_HIGH["max_tokens"]
 
 
 def test_deepseek_v4_presets_structure() -> None:
@@ -411,6 +465,9 @@ def test_get_model_settings_by_enum() -> None:
     settings_openai_responses_xhigh = get_model_settings(ModelSettingsPreset.OPENAI_RESPONSES_XHIGH)
     assert settings_openai_responses_xhigh == OPENAI_RESPONSES_XHIGH
 
+    settings_openai_responses_high_fast = get_model_settings(ModelSettingsPreset.OPENAI_RESPONSES_HIGH_FAST)
+    assert settings_openai_responses_high_fast == OPENAI_RESPONSES_HIGH_FAST
+
     settings_deepseek = get_model_settings(ModelSettingsPreset.DEEPSEEK_V4_MAX)
     assert settings_deepseek == DEEPSEEK_V4_MAX
 
@@ -435,6 +492,9 @@ def test_get_model_settings_by_string() -> None:
 
     settings_openai_responses_xhigh = get_model_settings("openai_responses_xhigh")
     assert settings_openai_responses_xhigh == OPENAI_RESPONSES_XHIGH
+
+    settings_openai_responses_high_fast = get_model_settings("openai_responses_high_fast")
+    assert settings_openai_responses_high_fast == OPENAI_RESPONSES_HIGH_FAST
 
     settings_deepseek = get_model_settings("deepseek_v4_max")
     assert settings_deepseek == DEEPSEEK_V4_MAX
@@ -640,10 +700,15 @@ def test_list_presets() -> None:
         "openai_medium",
         "openai_responses",
         "openai_responses_default",
+        "openai_responses_default_fast",
         "openai_responses_high",
+        "openai_responses_high_fast",
         "openai_responses_low",
+        "openai_responses_low_fast",
         "openai_responses_medium",
+        "openai_responses_medium_fast",
         "openai_responses_xhigh",
+        "openai_responses_xhigh_fast",
         "openai_xhigh",
     ])
 

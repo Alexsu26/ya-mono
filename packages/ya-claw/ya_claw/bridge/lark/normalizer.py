@@ -3,10 +3,51 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ya_claw.bridge.models import BridgeAdapterType, BridgeInboundMessage
+from ya_claw.bridge.models import BridgeAdapterType, BridgeInboundAction, BridgeInboundMessage
+from ya_claw.json_types import JsonObject, JsonValue
 
 _MESSAGE_RECEIVE_EVENT = "im.message.receive_v1"
 _DRIVE_EVENT_PREFIX = "drive."
+
+
+def normalize_lark_action(raw_event: dict[str, Any]) -> BridgeInboundAction | None:
+    header = _dict_value(raw_event.get("header"))
+    event = _dict_value(raw_event.get("event")) or raw_event
+    action = _dict_value(event.get("action"))
+    value = _dict_value(action.get("value")) or _dict_value(event.get("value"))
+    raw_action = _string_value(value.get("action") or action.get("action") or event.get("action"))
+    event_id = _string_value(header.get("event_id") or raw_event.get("event_id") or raw_event.get("uuid"))
+    tenant_key = _string_value(header.get("tenant_key") or raw_event.get("tenant_key")) or "default"
+    action_id = _string_value(action.get("tag") or action.get("name")) or raw_action or "bridge_action"
+
+    interaction_token = _string_value(value.get("interaction_token") or event.get("interaction_token"))
+    if interaction_token is not None and raw_action in {"approve", "deny"}:
+        return BridgeInboundAction(
+            adapter=BridgeAdapterType.LARK,
+            tenant_key=tenant_key,
+            event_id=event_id or interaction_token,
+            action_id=action_id,
+            action_type="hitl_respond",
+            token=interaction_token,
+            approved=raw_action == "approve",
+            raw_event=raw_event,
+            metadata={"action": raw_action},
+        )
+
+    recovery_token = _string_value(value.get("recovery_token") or event.get("recovery_token"))
+    if recovery_token is not None and raw_action in {"retry", "reset_and_retry"}:
+        return BridgeInboundAction(
+            adapter=BridgeAdapterType.LARK,
+            tenant_key=tenant_key,
+            event_id=event_id or recovery_token,
+            action_id=action_id,
+            action_type="session_recovery",
+            token=recovery_token,
+            raw_event=raw_event,
+            metadata={"action": raw_action},
+        )
+
+    return None
 
 
 def normalize_lark_event(raw_event: dict[str, Any]) -> BridgeInboundMessage | None:
@@ -38,6 +79,9 @@ def normalize_lark_compact_event(raw_event: dict[str, Any]) -> BridgeInboundMess
         tenant_key=_string_value(raw_event.get("tenant_key")) or "default",
         event_id=event_id,
         message_id=message_id,
+        root_id=_string_value(raw_event.get("root_id")),
+        parent_id=_string_value(raw_event.get("parent_id")),
+        thread_id=_string_value(raw_event.get("thread_id")),
         chat_id=chat_id,
         event_type=event_type,
         sender_id=_string_value(raw_event.get("sender_id")),
@@ -79,6 +123,9 @@ def _normalize_message_receive(
         tenant_key=_string_value(header.get("tenant_key") or raw_event.get("tenant_key")) or "default",
         event_id=resolved_event_id,
         message_id=message_id,
+        root_id=_string_value(message.get("root_id") or raw_event.get("root_id")),
+        parent_id=_string_value(message.get("parent_id") or raw_event.get("parent_id")),
+        thread_id=_string_value(message.get("thread_id") or raw_event.get("thread_id")),
         chat_id=chat_id,
         event_type=event_type,
         sender_id=_string_value(sender_id.get("open_id") or sender_id.get("user_id") or raw_event.get("sender_id")),
@@ -132,6 +179,9 @@ def _normalize_generic_event(
         tenant_key=_string_value(header.get("tenant_key") or raw_event.get("tenant_key")) or "default",
         event_id=resolved_event_id,
         message_id=message_id,
+        root_id=_string_value(_find_first_key(event, ("root_id",))),
+        parent_id=_string_value(_find_first_key(event, ("parent_id",))),
+        thread_id=_string_value(_find_first_key(event, ("thread_id",))),
         chat_id=chat_id,
         event_type=event_type,
         sender_id=_string_value(
@@ -189,7 +239,7 @@ def _generic_content_text(event_type: str, event: dict[str, Any]) -> str:
     return json.dumps({"event_type": event_type, "event": event}, ensure_ascii=False)
 
 
-def _find_first_key(value: Any, keys: tuple[str, ...]) -> Any:
+def _find_first_key(value: JsonValue, keys: tuple[str, ...]) -> JsonValue:
     if isinstance(value, dict):
         for key in keys:
             candidate = value.get(key)
@@ -207,7 +257,7 @@ def _find_first_key(value: Any, keys: tuple[str, ...]) -> Any:
     return None
 
 
-def _parse_content(value: Any) -> dict[str, Any] | None:
+def _parse_content(value: JsonValue) -> JsonObject | None:
     if isinstance(value, dict):
         return value
     if isinstance(value, str) and value.strip() != "":
@@ -219,23 +269,24 @@ def _parse_content(value: Any) -> dict[str, Any] | None:
     return None
 
 
-def _content_text(message_type: str, content: dict[str, Any] | None, fallback: Any) -> str | None:
+def _content_text(message_type: str, content: JsonObject | None, fallback: JsonValue) -> str | None:
     if content is None:
         return fallback if isinstance(fallback, str) else None
-    if message_type == "text" and isinstance(content.get("text"), str):
-        return content["text"]
+    text_value = content.get("text")
+    if message_type == "text" and isinstance(text_value, str):
+        return text_value
     if message_type == "post":
         return json.dumps(content, ensure_ascii=False)
-    if isinstance(content.get("text"), str):
-        return content["text"]
+    if isinstance(text_value, str):
+        return text_value
     return json.dumps(content, ensure_ascii=False)
 
 
-def _dict_value(value: Any) -> dict[str, Any]:
+def _dict_value(value: JsonValue) -> JsonObject:
     return value if isinstance(value, dict) else {}
 
 
-def _string_value(value: Any) -> str | None:
+def _string_value(value: JsonValue) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip()

@@ -1,15 +1,25 @@
-"""Color/style tokens for the streaming console.
-
-Centralised so that block renderers can refer to semantic names like
-``console.dot.running`` instead of raw color codes.
-"""
+"""Color and style tokens for the streaming console."""
 
 from __future__ import annotations
 
-from rich.theme import Theme
+from typing import Literal, cast
 
-CONSOLE_STYLES: dict[str, str] = {
-    # Transcript-first design tokens
+from rich.theme import Theme as RichTheme
+from textual.theme import Theme as TextualTheme
+
+ThemeName = Literal["dark", "light", "cappuccino"]
+THEME_NAMES: tuple[ThemeName, ...] = ("dark", "light", "cappuccino")
+
+
+def normalize_theme_name(value: object) -> ThemeName:
+    """Return a supported theme name, falling back to dark."""
+    name = str(value or "").strip().lower()
+    if name in THEME_NAMES:
+        return cast(ThemeName, name)
+    return "dark"
+
+
+DARK_CONSOLE_STYLES: dict[str, str] = {
     "console.surface.base": "#11131a",
     "console.surface.raised": "#171a23",
     "console.surface.overlay": "#1d2130",
@@ -38,7 +48,6 @@ CONSOLE_STYLES: dict[str, str] = {
     "console.code.border": "#30364a",
     "console.search.match": "black on #e0af68",
     "console.search.active": "black on #7aa2f7",
-    # Anchors
     "console.dot": "bold #7dcfff",
     "console.dot.running": "#7dcfff",
     "console.dot.success": "#9ece6a",
@@ -46,40 +55,31 @@ CONSOLE_STYLES: dict[str, str] = {
     "console.dot.warning": "#e0af68",
     "console.lbar": "#3b4252",
     "console.user": "bold #c099ff",
-    # Tool call
     "console.tool.name": "bold #89ddff",
     "console.tool.arg": "#aeb6c8",
     "console.tool.result": "#d8dee9",
     "console.tool.duration": "#6f778a",
     "console.tool.spinner": "#7dcfff",
     "console.tool.tag": "#6f778a italic",
-    # Thinking
     "console.thinking.gutter": "#3b4252",
     "console.thinking.text": "#6f778a italic",
-    # Diff
     "console.diff.header": "bold",
     "console.diff.add": "green",
     "console.diff.del": "red",
     "console.diff.context": "default",
     "console.diff.meta": "dim",
-    # Todo
     "console.todo.done": "green",
     "console.todo.in_progress": "bold yellow",
     "console.todo.pending": "dim",
-    # Error
     "console.error.title": "bold #f7768e",
     "console.error.body": "#f7768e",
     "console.error.frame": "#f7768e",
-    # HITL
     "console.hitl.warn": "bold yellow",
     "console.hitl.choice_key": "bold cyan",
     "console.hitl.choice_text": "default",
-    # Steering breadcrumb
     "console.steering": "bold #c099ff",
-    # Mode
     "console.mode.act": "bold green",
     "console.mode.plan": "bold blue",
-    # Header / footer
     "console.header.path": "bold #d8dee9",
     "console.header.branch": "#6f778a",
     "console.header.dirty": "#e0af68",
@@ -89,13 +89,315 @@ CONSOLE_STYLES: dict[str, str] = {
     "console.footer.key": "bold",
     "console.footer.ready": "#9ece6a",
     "console.footer.working": "#7dcfff",
-    # System
     "console.system.title": "bold #9aa5ce",
     "console.system.frame": "#3b4252",
     "console.breadcrumb": "#6f778a italic",
+    "markdown.text": "#dde3ea",
+    "markdown.paragraph": "#dde3ea",
+    "markdown.strong": "bold #eef2f6",
+    "markdown.em": "italic #aab4c0",
+    "markdown.emph": "italic #aab4c0",
+    "markdown.s": "strike #7a8492",
+    "markdown.code": "#8bd7ff on #151c24",
+    "markdown.code_block": "#dce4ef on #111820",
+    "markdown.h1": "bold #eef2f6",
+    "markdown.h2": "bold #eef2f6",
+    "markdown.h3": "bold #c8d2de",
+    "markdown.h4": "bold #aab4c0",
+    "markdown.h5": "bold #aab4c0",
+    "markdown.h6": "#7a8492",
+    "markdown.hr": "#2b3440",
+    "markdown.item": "#dde3ea",
+    "markdown.item.number": "bold #8bd7c8",
+    "markdown.item.bullet": "bold #8bd7c8",
+    "markdown.block_quote": "italic #9aa7b8",
+    "markdown.table.border": "#2b3440",
+    "markdown.table.header": "bold #dde3ea",
+    "markdown.link": "underline #91cdfb",
+    "markdown.link_url": "underline #91cdfb",
+    "markdown.kbd": "bold #dde3ea on #151c24",
 }
 
 
-def build_theme() -> Theme:
-    """Build the Rich Theme used by the streaming console."""
-    return Theme(CONSOLE_STYLES, inherit=True)
+LIGHT_CONSOLE_STYLES: dict[str, str] = {
+    # Catppuccin Latte foundations with stronger terminal contrast.
+    "console.surface.base": "#eff1f5",
+    "console.surface.raised": "#e6e9ef",
+    "console.surface.overlay": "#dce0e8",
+    "console.text.primary": "#3c405b",
+    "console.text.secondary": "#52566f",
+    "console.text.muted": "#6c7086",
+    "console.border.subtle": "#bcc0cc",
+    "console.border.active": "#1e66f5",
+    "console.accent.user": "bold #7c3aed",
+    "console.accent.assistant": "bold #075985",
+    "console.accent.tool": "bold #0f766e",
+    "console.accent.system": "#5c5f77",
+    "console.state.idle": "#287a1f",
+    "console.state.waiting": "#9a5b00",
+    "console.state.running": "#075985",
+    "console.state.success": "#287a1f",
+    "console.state.warning": "#9a5b00",
+    "console.state.error": "#b80f35",
+    "console.state.cancelled": "#6c7086",
+    "console.heading.app": "bold #303348",
+    "console.heading.turn": "bold #303348",
+    "console.heading.block": "bold #41455f",
+    "console.meta": "#6c7086",
+    "console.dim": "dim #6c7086",
+    "console.code.bg": "#e6e9ef",
+    "console.code.border": "#bcc0cc",
+    "console.search.match": "#303348 on #f2d37b",
+    "console.search.active": "white on #1e66f5",
+    "console.dot": "bold #075985",
+    "console.dot.running": "#075985",
+    "console.dot.success": "#287a1f",
+    "console.dot.error": "#b80f35",
+    "console.dot.warning": "#9a5b00",
+    "console.lbar": "#acb0be",
+    "console.user": "bold #7c3aed",
+    "console.tool.name": "bold #0f766e",
+    "console.tool.arg": "#52566f",
+    "console.tool.result": "#3c405b",
+    "console.tool.duration": "#6c7086",
+    "console.tool.spinner": "#075985",
+    "console.tool.tag": "#6c7086 italic",
+    "console.thinking.gutter": "#acb0be",
+    "console.thinking.text": "#6c7086 italic",
+    "console.diff.header": "bold #303348",
+    "console.diff.add": "#287a1f",
+    "console.diff.del": "#b80f35",
+    "console.diff.context": "#52566f",
+    "console.diff.meta": "#6c7086",
+    "console.todo.done": "#287a1f",
+    "console.todo.in_progress": "bold #9a5b00",
+    "console.todo.pending": "#6c7086",
+    "console.error.title": "bold #b80f35",
+    "console.error.body": "#9f1239",
+    "console.error.frame": "#b80f35",
+    "console.hitl.warn": "bold #9a5b00",
+    "console.hitl.choice_key": "bold #075985",
+    "console.hitl.choice_text": "#3c405b",
+    "console.steering": "bold #7c3aed",
+    "console.mode.act": "bold #287a1f",
+    "console.mode.plan": "bold #1e66f5",
+    "console.header.path": "bold #303348",
+    "console.header.branch": "#6c7086",
+    "console.header.dirty": "#9a5b00",
+    "console.header.model": "bold #52566f",
+    "console.header.cost": "#6c7086",
+    "console.footer.hint": "#6c7086",
+    "console.footer.key": "bold #303348",
+    "console.footer.ready": "#287a1f",
+    "console.footer.working": "#075985",
+    "console.system.title": "bold #5c5f77",
+    "console.system.frame": "#bcc0cc",
+    "console.breadcrumb": "#6c7086 italic",
+    "markdown.text": "#3c405b",
+    "markdown.paragraph": "#3c405b",
+    "markdown.strong": "bold #303348",
+    "markdown.em": "italic #52566f",
+    "markdown.emph": "italic #52566f",
+    "markdown.s": "strike #7c7f93",
+    "markdown.code": "#075985 on #e6e9ef",
+    "markdown.code_block": "#303348 on #e6e9ef",
+    "markdown.h1": "bold #303348",
+    "markdown.h2": "bold #303348",
+    "markdown.h3": "bold #41455f",
+    "markdown.h4": "bold #52566f",
+    "markdown.h5": "bold #52566f",
+    "markdown.h6": "#6c7086",
+    "markdown.hr": "#bcc0cc",
+    "markdown.item": "#3c405b",
+    "markdown.item.number": "bold #0f766e",
+    "markdown.item.bullet": "bold #0f766e",
+    "markdown.block_quote": "italic #5c5f77",
+    "markdown.table.border": "#acb0be",
+    "markdown.table.header": "bold #303348",
+    "markdown.link": "underline #1e66f5",
+    "markdown.link_url": "underline #1e66f5",
+    "markdown.kbd": "bold #303348 on #dce0e8",
+}
+
+
+CAPPUCCINO_CONSOLE_STYLES: dict[str, str] = {
+    **DARK_CONSOLE_STYLES,
+    "console.surface.base": "#181825",
+    "console.surface.raised": "#1e1e2e",
+    "console.surface.overlay": "#313244",
+    "console.text.primary": "#cdd6f4",
+    "console.text.secondary": "#bac2de",
+    "console.text.muted": "#9399b2",
+    "console.border.subtle": "#45475a",
+    "console.border.active": "#b4befe",
+    "console.accent.user": "bold #cba6f7",
+    "console.accent.assistant": "bold #94e2d5",
+    "console.accent.tool": "bold #89dceb",
+    "console.accent.system": "#a6adc8",
+    "console.state.idle": "#a6e3a1",
+    "console.state.waiting": "#f9e2af",
+    "console.state.running": "#94e2d5",
+    "console.state.success": "#a6e3a1",
+    "console.state.warning": "#f9e2af",
+    "console.state.error": "#f38ba8",
+    "console.state.cancelled": "#9399b2",
+    "console.heading.app": "bold #cdd6f4",
+    "console.heading.turn": "bold #cdd6f4",
+    "console.heading.block": "bold #b4befe",
+    "console.meta": "#9399b2",
+    "console.dim": "dim #6c7086",
+    "console.code.bg": "#11111b",
+    "console.code.border": "#45475a",
+    "console.search.match": "#11111b on #f9e2af",
+    "console.search.active": "#11111b on #b4befe",
+    "console.dot": "bold #b4befe",
+    "console.dot.running": "#94e2d5",
+    "console.dot.success": "#a6e3a1",
+    "console.dot.error": "#f38ba8",
+    "console.dot.warning": "#f9e2af",
+    "console.lbar": "#45475a",
+    "console.user": "bold #cba6f7",
+    "console.tool.name": "bold #94e2d5",
+    "console.tool.arg": "#bac2de",
+    "console.tool.result": "#cdd6f4",
+    "console.tool.duration": "#9399b2",
+    "console.tool.spinner": "#b4befe",
+    "console.tool.tag": "#9399b2 italic",
+    "console.thinking.gutter": "#45475a",
+    "console.thinking.text": "#9399b2 italic",
+    "console.diff.header": "bold #cdd6f4",
+    "console.diff.add": "#a6e3a1",
+    "console.diff.del": "#f38ba8",
+    "console.diff.context": "#bac2de",
+    "console.diff.meta": "#9399b2",
+    "console.todo.done": "#a6e3a1",
+    "console.todo.in_progress": "bold #f9e2af",
+    "console.todo.pending": "#9399b2",
+    "console.error.title": "bold #f38ba8",
+    "console.error.body": "#f38ba8",
+    "console.error.frame": "#f38ba8",
+    "console.hitl.warn": "bold #f9e2af",
+    "console.hitl.choice_key": "bold #b4befe",
+    "console.hitl.choice_text": "#cdd6f4",
+    "console.steering": "bold #cba6f7",
+    "console.mode.act": "bold #a6e3a1",
+    "console.mode.plan": "bold #b4befe",
+    "console.header.path": "bold #cdd6f4",
+    "console.header.branch": "#9399b2",
+    "console.header.dirty": "#f9e2af",
+    "console.header.model": "bold #bac2de",
+    "console.header.cost": "#9399b2",
+    "console.footer.hint": "#9399b2",
+    "console.footer.key": "bold #cdd6f4",
+    "console.footer.ready": "#a6e3a1",
+    "console.footer.working": "#94e2d5",
+    "console.system.title": "bold #a6adc8",
+    "console.system.frame": "#45475a",
+    "console.breadcrumb": "#9399b2 italic",
+    "markdown.text": "#cdd6f4",
+    "markdown.paragraph": "#cdd6f4",
+    "markdown.strong": "bold #f5e0dc",
+    "markdown.em": "italic #bac2de",
+    "markdown.emph": "italic #bac2de",
+    "markdown.s": "strike #6c7086",
+    "markdown.code": "#94e2d5 on #11111b",
+    "markdown.code_block": "#cdd6f4 on #11111b",
+    "markdown.h1": "bold #f5e0dc",
+    "markdown.h2": "bold #f5e0dc",
+    "markdown.h3": "bold #b4befe",
+    "markdown.h4": "bold #bac2de",
+    "markdown.h5": "bold #bac2de",
+    "markdown.h6": "#9399b2",
+    "markdown.hr": "#45475a",
+    "markdown.item": "#cdd6f4",
+    "markdown.item.number": "bold #94e2d5",
+    "markdown.item.bullet": "bold #94e2d5",
+    "markdown.block_quote": "italic #a6adc8",
+    "markdown.table.border": "#45475a",
+    "markdown.table.header": "bold #cdd6f4",
+    "markdown.link": "underline #89b4fa",
+    "markdown.link_url": "underline #89b4fa",
+    "markdown.kbd": "bold #cdd6f4 on #313244",
+}
+
+# Backwards-compatible alias for callers/tests that inspect the default theme.
+CONSOLE_STYLES = DARK_CONSOLE_STYLES
+
+TEXTUAL_THEMES: dict[ThemeName, TextualTheme] = {
+    "dark": TextualTheme(
+        name="yaacli-dark",
+        primary="#7aa2f7",
+        secondary="#89ddff",
+        accent="#c099ff",
+        foreground="#d8dee9",
+        background="#11131a",
+        surface="#171a23",
+        panel="#1d2130",
+        success="#9ece6a",
+        warning="#e0af68",
+        error="#f7768e",
+        dark=True,
+        variables={
+            "input-selection-background": "#7aa2f7 35%",
+            "block-cursor-background": "#7aa2f7",
+        },
+    ),
+    "light": TextualTheme(
+        name="yaacli-light",
+        primary="#1e66f5",
+        secondary="#0f766e",
+        accent="#7c3aed",
+        foreground="#3c405b",
+        background="#eff1f5",
+        surface="#e6e9ef",
+        panel="#dce0e8",
+        success="#287a1f",
+        warning="#9a5b00",
+        error="#b80f35",
+        dark=False,
+        variables={
+            "input-selection-background": "#1e66f5 25%",
+            "block-cursor-background": "#1e66f5",
+        },
+    ),
+    "cappuccino": TextualTheme(
+        name="yaacli-cappuccino",
+        primary="#b4befe",
+        secondary="#94e2d5",
+        accent="#cba6f7",
+        foreground="#cdd6f4",
+        background="#181825",
+        surface="#1e1e2e",
+        panel="#313244",
+        success="#a6e3a1",
+        warning="#f9e2af",
+        error="#f38ba8",
+        dark=True,
+        variables={
+            "input-selection-background": "#b4befe 35%",
+            "block-cursor-background": "#b4befe",
+        },
+    ),
+}
+
+CONSOLE_STYLE_MAP: dict[ThemeName, dict[str, str]] = {
+    "dark": DARK_CONSOLE_STYLES,
+    "light": LIGHT_CONSOLE_STYLES,
+    "cappuccino": CAPPUCCINO_CONSOLE_STYLES,
+}
+
+
+def build_theme(name: ThemeName | str = "dark") -> RichTheme:
+    """Build the Rich theme used by transcript renderers."""
+    theme_name = normalize_theme_name(name)
+    return RichTheme(CONSOLE_STYLE_MAP[theme_name], inherit=True)
+
+
+def build_textual_theme(name: ThemeName | str) -> TextualTheme:
+    """Return the Textual theme for the requested palette."""
+    return TEXTUAL_THEMES[normalize_theme_name(name)]
+
+
+def code_theme_for(name: ThemeName | str) -> str:
+    """Return a Pygments theme with matching background luminosity."""
+    return "github-light" if normalize_theme_name(name) == "light" else "github-dark"

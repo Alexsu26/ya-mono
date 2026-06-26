@@ -7,7 +7,7 @@ YA Claw is a single-node runtime web service for `ya-agent-sdk`.
 It provides a durable local execution shell around SDK agent construction and streaming primitives with:
 
 - reusable execution profiles
-- one configured workspace directory
+- one configured default workspace directory with optional session-scoped mount sets
 - resolver-driven workspace binding construction
 - explicit runtime assembly from binding to agent runtime
 - resumable sessions and runs
@@ -22,11 +22,11 @@ It provides a durable local execution shell around SDK agent construction and st
 ### Product Goals
 
 - make local and self-hosted deployment the default operating model
-- keep runtime file and shell access bounded by one configured workspace root
+- keep runtime file and shell access bounded by declared workspace bindings and default shell sandbox policy
 - preserve SDK capabilities such as continuation, subagents, compact, and streaming
 - keep the runtime small enough to understand and evolve quickly
 - keep active execution management inside one process for the single-node target
-- support API, schedule, heartbeat, and bridge ingress through one queued-run execution model
+- support API, workflow, schedule, heartbeat, and bridge ingress through one queued-run execution model
 - run schedule dispatchers, heartbeat dispatchers, and bridge adapters as supervised runtime components in the single-node service shape
 
 ### Non-Goals
@@ -60,6 +60,7 @@ flowchart TB
         ENVF[EnvironmentFactory]
         BUILD[ClawRuntimeBuilder]
         COORD[RunCoordinator]
+        WF[WorkflowExecutor]
         SCHED[ScheduleDispatcher]
         HEART[HeartbeatDispatcher]
         BRIDGE[BridgeSupervisor]
@@ -94,6 +95,9 @@ flowchart TB
     RUNS --> SQL
     RUNS --> SUP
     SESS --> SUP
+    WF --> SESS
+    WF --> RUNS
+    WF --> SUP
     SCHED --> SESS
     SCHED --> RUNS
     SCHED --> SUP
@@ -126,15 +130,16 @@ flowchart TB
 | Concern                       | Owner                 |
 | ----------------------------- | --------------------- |
 | Agent execution primitives    | `ya-agent-sdk`        |
-| Workspace root enforcement    | YA Claw               |
+| Workspace binding enforcement | YA Claw               |
 | Profile resolution            | YA Claw               |
 | Runtime assembly              | YA Claw               |
 | Session persistence           | YA Claw               |
 | Run orchestration             | YA Claw               |
+| Workflow orchestration        | YA Claw               |
 | Active execution tracking     | YA Claw               |
 | Event delivery                | YA Claw               |
 | Committed session persistence | YA Claw               |
-| Workspace selection           | YA Claw configuration |
+| Default workspace selection   | YA Claw configuration |
 | Channel transport             | bridge adapter        |
 | LLM provider interaction      | SDK + model provider  |
 
@@ -143,19 +148,20 @@ flowchart TB
 The architecture revolves around a small set of runtime objects:
 
 - **Execution Profile**: reusable runtime configuration for model, prompt, tools, approvals, and policy
-- **Workspace Binding**: declarative single-workspace view for one run, including host path, virtual path, cwd, path policy, and metadata
+- **Workspace Binding**: declarative workspace view for one run, including mount set, default host path, virtual paths, cwd, path policy, and metadata
 - **Environment Factory**: runtime component that turns a workspace binding into a concrete SDK `Environment`
 - **ClawAgentContext**: YA Claw-specific `AgentContext` subclass that carries run, session, profile, workspace, and source metadata
 - **ClawRuntimeBuilder**: runtime component that assembles `Environment`, `ClawAgentContext`, toolsets, and agent configuration into one SDK runtime
 - **Execution Supervisor**: in-process manager that claims queued runs, starts coordinators, and tracks active execution
 - **Run Coordinator**: short-lived per-run executor from claim to terminal state
+- **Workflow**: durable Claw-managed orchestration resource that agents can supervise and control through built-in tools
 - **Session**: durable conversational continuity
 - **Run**: one execution attempt inside a session
-- **Schedule**: agent-manageable or user-manageable timer resource that creates or steers runs
+- **Schedule**: agent-manageable or user-manageable timer resource that creates or steers runs or triggers workflows
 - **Heartbeat**: runtime-owned timer resource that creates isolated operational runs from `HEARTBEAT.md` guidance
 - **Execution Registry**: in-memory registry of active run tasks and control signals
 
 ## Design Principle
 
 YA Claw owns durable execution intent, runtime assembly, and active execution management.
-Applications own project identity and high-level ingress context.
+Applications own project identity, user-facing folder registries, and high-level ingress context.

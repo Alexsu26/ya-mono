@@ -15,17 +15,14 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
-from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.shared.message import SessionMessage
+from fastmcp.client.transports import StdioTransport
 from pydantic import BaseModel, Field
 from pydantic_ai import ApprovalRequired, RunContext
-from pydantic_ai.mcp import MCPServer, MCPServerStdio, MCPServerStreamableHTTP
+from pydantic_ai.mcp import MCPToolset, ProcessToolCallback
+from pydantic_ai.toolsets import AbstractToolset
 
 from ya_agent_sdk._logger import get_logger
 
@@ -35,12 +32,6 @@ if TYPE_CHECKING:
     from ya_agent_sdk.context import AgentContext
 
 logger = get_logger(__name__)
-
-# Type alias matching pydantic-ai's ProcessToolCallback
-ProcessToolCallback = Callable[
-    ["RunContext[Any]", "CallToolFunc", str, dict[str, Any]],
-    Awaitable["ToolResult"],
-]
 
 
 class MCPServerSpec(BaseModel):
@@ -81,23 +72,12 @@ class MCPConfig(BaseModel):
     servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
-class QuietMCPServerStdio(MCPServerStdio):
-    """MCPServerStdio variant that suppresses server stderr output."""
+class NamedMCPToolset(MCPToolset):
+    """MCPToolset with a stable ``tool_prefix`` compatibility attribute."""
 
-    @asynccontextmanager
-    async def client_streams(
-        self,
-    ) -> AsyncIterator[
-        tuple[
-            MemoryObjectReceiveStream[SessionMessage | Exception],
-            MemoryObjectSendStream[SessionMessage],
-        ]
-    ]:
-        server = StdioServerParameters(command=self.command, args=list(self.args), env=self.env, cwd=self.cwd)
-        null_path = "NUL" if sys.platform == "win32" else "/dev/null"
-        with open(null_path, "w") as devnull:
-            async with stdio_client(server=server, errlog=devnull) as (read_stream, write_stream):
-                yield read_stream, write_stream
+    def __init__(self, *args: Any, tool_prefix: str, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.tool_prefix = tool_prefix
 
 
 def load_mcp_config_file(file_path: Path) -> MCPConfig:
@@ -143,7 +123,7 @@ def create_mcp_approval_hook(server_name: str) -> ProcessToolCallback:
             logger.debug("MCP tool %r requires approval", full_name)
             raise ApprovalRequired(metadata={"mcp_server": server_name, "mcp_tool": name, "full_name": full_name})
 
-        return await call_tool(name, tool_args, None)
+        return await call_tool(name, tool_args, metadata=None)
 
     return hook
 
@@ -152,8 +132,8 @@ def build_mcp_server(
     name: str,
     config: MCPServerConfig,
     need_approval: bool = False,
-) -> MCPServer | None:
-    """Build a single MCPServer instance from configuration."""
+) -> AbstractToolset[Any] | None:
+    """Build a single MCP toolset instance from configuration."""
 
     process_tool_call = create_mcp_approval_hook(name) if need_approval else None
 
@@ -162,21 +142,24 @@ def build_mcp_server(
             if not config.command:
                 logger.warning("MCP server %r has stdio transport but no command, skipping", name)
                 return None
-            return QuietMCPServerStdio(
-                command=config.command,
-                args=config.args,
-                env=config.env or None,
+            null_path = "NUL" if sys.platform == "win32" else "/dev/null"
+            return NamedMCPToolset(
+                StdioTransport(
+                    command=config.command, args=config.args, env=config.env or None, log_file=Path(null_path)
+                ),
                 tool_prefix=name,
+                id=name,
                 process_tool_call=process_tool_call,
             )
         case "streamable_http":
             if not config.url:
                 logger.warning("MCP server %r has streamable_http transport but no url, skipping", name)
                 return None
-            return MCPServerStreamableHTTP(
-                url=config.url,
+            return NamedMCPToolset(
+                config.url,
                 headers=config.headers or None,
                 tool_prefix=name,
+                id=name,
                 process_tool_call=process_tool_call,
             )
         case _:
@@ -187,19 +170,19 @@ def build_mcp_server(
 def build_mcp_servers(
     mcp_config: MCPConfig,
     need_approval_mcps: list[str] | None = None,
-) -> list[MCPServer]:
-    """Build MCPServer instances from MCPConfig."""
+) -> list[AbstractToolset[Any]]:
+    """Build MCP toolset instances from MCPConfig."""
 
-    servers: list[MCPServer] = []
+    servers: list[AbstractToolset[Any]] = []
     approval_names = _normalize_namespace_names(need_approval_mcps)
 
     for name, config in mcp_config.servers.items():
         server = build_mcp_server(name, config, need_approval=name in approval_names)
         if server is not None:
             servers.append(server)
-            logger.info("Added MCP server: %s (%s, approval=%s)", name, config.transport, name in approval_names)
+            logger.info("Added MCP toolset: %s (%s, approval=%s)", name, config.transport, name in approval_names)
 
-    logger.debug("Built %d MCP servers from config", len(servers))
+    logger.debug("Built %d MCP toolsets from config", len(servers))
     return servers
 
 

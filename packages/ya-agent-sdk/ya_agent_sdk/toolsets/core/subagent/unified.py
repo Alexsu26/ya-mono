@@ -125,6 +125,17 @@ def _is_self_fork_available(ctx: RunContext[AgentContext]) -> bool:
     return ctx.deps.self_fork_agent is not None
 
 
+def _is_config_available(
+    config: SubagentConfig,
+    parent_toolset: Toolset[Any],
+    ctx: RunContext[AgentContext],
+) -> bool:
+    """Check availability from config without constructing the subagent agent."""
+    if config.tools is None:
+        return True
+    return all(parent_toolset.is_tool_available(name, ctx) for name in config.tools)
+
+
 def _generate_instruction(
     entries: dict[str, SubagentEntry],
     parent_toolset: Toolset[Any],
@@ -164,6 +175,56 @@ def _generate_instruction(
             lines.append(instruction.strip())
         else:
             lines.append(entry.config.description)
+        lines.append("</subagent>\n")
+
+    lines.append("<execution-model>")
+    lines.append("Delegate calls are blocking: the parent waits for each delegated result before proceeding.")
+    lines.append("Multiple delegate calls in the same model response run concurrently.")
+    lines.append("The parent resumes after all delegate calls in that response complete.")
+    lines.append("Sequential delegate calls across turns run serially.")
+    lines.append("</execution-model>")
+
+    return "\n".join(lines)
+
+
+def _generate_instruction_from_configs(
+    configs: Sequence[SubagentConfig],
+    parent_toolset: Toolset[Any],
+    ctx: RunContext[AgentContext],
+) -> str | None:
+    """Generate delegate instructions without eagerly constructing subagents."""
+    available_configs = [
+        config for config in configs if config.name != SELF_SUBAGENT_NAME and _is_config_available(config, parent_toolset, ctx)
+    ]
+    self_available = _is_self_fork_available(ctx)
+
+    if not available_configs and not self_available:
+        return None
+
+    lines = ["Use the delegate tool for bounded subtasks that can return compact results.\n"]
+    lines.append("<delegation-best-practices>")
+    lines.append("Plan first, then call multiple delegates in the same response for independent work.")
+    if self_available:
+        lines.append(
+            "Use self forks for full-context plan steps, mid-task repository exploration, "
+            "assumption checks, approach comparisons, and implementation spikes."
+        )
+    if available_configs:
+        lines.append("Use named specialist subagents when a listed role matches the task.")
+    lines.append("Ask each delegate to return concise findings, changed files, tests run, and risks.")
+    lines.append("</delegation-best-practices>\n")
+
+    if self_available:
+        lines.append(f'<subagent name="{SELF_SUBAGENT_NAME}">')
+        lines.append(SELF_SUBAGENT_INSTRUCTION)
+        lines.append("</subagent>\n")
+
+    for config in available_configs:
+        lines.append(f'<subagent name="{config.name}">')
+        if config.instruction:
+            lines.append(config.instruction.strip())
+        else:
+            lines.append(config.description)
         lines.append("</subagent>\n")
 
     lines.append("<execution-model>")
@@ -262,9 +323,12 @@ def _ensure_configs(configs: Sequence[SubagentConfig]) -> None:
     if not configs:
         msg = "At least one SubagentConfig is required"
         raise ValueError(msg)
+    if any(config.name == SELF_SUBAGENT_NAME for config in configs):
+        msg = f"{SELF_SUBAGENT_NAME!r} is reserved for the built-in self fork subagent"
+        raise ValueError(msg)
 
 
-def _create_unified_subagent_tool(
+def _create_unified_subagent_tool(  # noqa: C901
     configs: Sequence[SubagentConfig],
     parent_toolset: Toolset[Any],
     *,
@@ -281,24 +345,28 @@ def _create_unified_subagent_tool(
     """Create a unified subagent tool, including SDK internal capabilities."""
     _ensure_configs(configs)
 
-    # Build registry of subagent entries
-    registry = _build_registry(
-        configs,
-        parent_toolset,
-        model=model,
-        model_settings=model_settings,
-        model_cfg=model_cfg,
-        inherit_hooks=inherit_hooks,
-        pre_capabilities=pre_capabilities,
-        capabilities=capabilities,
-        sdk_capabilities=sdk_capabilities,
-    )
-
     # Store references for closure
-    subagent_names = tuple(registry.keys())
-    _registry = registry
+    _configs = tuple(configs)
+    subagent_names = tuple(config.name for config in _configs if config.name != SELF_SUBAGENT_NAME)
+    _registry: dict[str, SubagentEntry] | None = None
     _parent_toolset = parent_toolset
     _self_call_func = create_self_fork_call_func(model_cfg=model_cfg)
+
+    def _get_registry() -> dict[str, SubagentEntry]:
+        nonlocal _registry
+        if _registry is None:
+            _registry = _build_registry(
+                _configs,
+                parent_toolset,
+                model=model,
+                model_settings=model_settings,
+                model_cfg=model_cfg,
+                inherit_hooks=inherit_hooks,
+                pre_capabilities=pre_capabilities,
+                capabilities=capabilities,
+                sdk_capabilities=sdk_capabilities,
+            )
+        return _registry
 
     class UnifiedSubagentTool(BaseTool):
         """Dynamically created unified subagent tool."""
@@ -314,14 +382,12 @@ def _create_unified_subagent_tool(
 
         def is_available(self, ctx: RunContext[AgentContext]) -> bool:
             """Tool is available if self fork or at least one configured subagent is available."""
-            has_available_subagent = any(
-                _is_subagent_available(entry, _parent_toolset, ctx) for entry in _registry.values()
-            )
+            has_available_subagent = any(_is_config_available(config, _parent_toolset, ctx) for config in _configs)
             return _is_self_fork_available(ctx) or has_available_subagent
 
         async def get_instruction(self, ctx: RunContext[AgentContext]) -> str | None:
             """Generate instruction listing available subagents."""
-            return _generate_instruction(_registry, _parent_toolset, ctx)
+            return _generate_instruction_from_configs(_configs, _parent_toolset, ctx)
 
         async def call(
             self,
@@ -336,11 +402,12 @@ def _create_unified_subagent_tool(
                 return await _self_call_func(self, ctx, prompt, agent_id)
 
             # Validate subagent exists
-            if subagent_name not in _registry:
+            if subagent_name not in subagent_names:
                 available = ", ".join((SELF_SUBAGENT_NAME, *subagent_names))
                 return f"Error: Unknown subagent '{subagent_name}'. Available: {available}"
 
-            entry = _registry[subagent_name]
+            registry = _get_registry()
+            entry = registry[subagent_name]
 
             # Check availability
             if not _is_subagent_available(entry, _parent_toolset, ctx):

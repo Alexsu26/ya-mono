@@ -9,7 +9,11 @@
 
 ## Packages
 
+- [`packages/ya-agent-environment`](packages/ya-agent-environment) — Environment abstractions for general agents
 - [`packages/ya-agent-sdk`](packages/ya-agent-sdk) — Python SDK for building AI agents with Pydantic AI
+- [`packages/ya-agent-stream-protocol`](packages/ya-agent-stream-protocol) — shared stream protocol adapters between `ya-agent-sdk` and applications
+- [`packages/ya-oauth`](packages/ya-oauth) — OAuth login, refresh, logout, token storage, and CLI for subscription-backed providers
+- [`packages/ya-oauth-provider`](packages/ya-oauth-provider) — Pydantic AI provider helpers for OAuth-backed model access
 - [`packages/yaacli`](packages/yaacli) — TUI reference implementation built on top of `ya-agent-sdk`
 - [`packages/ya-claw`](packages/ya-claw) — workspace-native single-node runtime web service with `WorkspaceProvider`, in-process runtime state, schedules, bridges, and SQLite-first storage
 - [`packages/ya-agent-platform`](packages/ya-agent-platform) — WIP stateless agent service with TBD scope
@@ -17,6 +21,7 @@
 ## Apps
 
 - [`apps/ya-claw-web`](apps/ya-claw-web) — Vite + React web shell for YA Claw
+- [`apps/yaacli-desktop`](apps/yaacli-desktop) — Tauri + React macOS workspace interface for YAACLI
 
 ## Repository Layout
 
@@ -57,6 +62,15 @@ make install-skills
 
 This installs `agent-builder` and `ya-claw-deploy` for local agent use.
 
+Install published tools with native filesystem search enabled:
+
+```bash
+uv tool install 'yaacli[rs]'
+uv tool install 'ya-claw[rs]'
+```
+
+`uv tool install` accepts extras in the package requirement. The equivalent extra-dependency form is `uv tool install yaacli --with ya-ripgrep-core` or `uv tool install ya-claw --with ya-ripgrep-core`. `ya-ripgrep-core` is a library dependency, so `--with` is the matching uv form; `--with-executables-from` applies to companion packages that also expose CLI executables.
+
 ## Getting Started
 
 ### SDK and CLI
@@ -69,6 +83,16 @@ Recommended starting points:
 - Copy [`packages/ya-agent-sdk/.env.example`](packages/ya-agent-sdk/.env.example) to `packages/ya-agent-sdk/.env` when developing the SDK or configuring SDK/tool variables for workspace apps
 - Copy [`packages/yaacli/.env.example`](packages/yaacli/.env.example) to `packages/yaacli/.env` or your current working directory `.env` when developing YAACLI
 - Run examples from [`examples/`](examples/) for end-to-end usage patterns
+
+### OAuth-backed Codex
+
+Run Codex through your ChatGPT subscription with a local OAuth credential store:
+
+```bash
+uv run --package ya-oauth ya-oauth login codex
+```
+
+Then use `oauth@codex:gpt-5.5` in SDK, YAACLI, or YA Claw profiles. Credentials live in `~/.yaai/auth.json`.
 
 ### YA Claw
 
@@ -129,7 +153,10 @@ make test
 
 ## Package Guides
 
+- [ya-agent-environment README](packages/ya-agent-environment/README.md)
 - [ya-agent-sdk README](packages/ya-agent-sdk/README.md)
+- [ya-oauth README](packages/ya-oauth/README.md)
+- [ya-oauth-provider README](packages/ya-oauth-provider/README.md)
 - [yaacli README](packages/yaacli/README.md)
 - [ya-claw README](packages/ya-claw/README.md)
 - [ya-agent-platform README](packages/ya-agent-platform/README.md)
@@ -145,7 +172,7 @@ make test
 | `make install-skills`              | Install canonical skills into `~/.agents/skills`                    |
 | `make lint`                        | Check lock consistency and run pre-commit hooks                     |
 | `make check`                       | Run lock validation, lint, pyright, deptry, and web checks          |
-| `make test`                        | Run SDK, CLI, and YA Claw tests                                     |
+| `make test`                        | Run environment, SDK, CLI, and YA Claw tests                        |
 | `make run-claw`                    | Run the YA Claw backend                                             |
 | `make web-dev`                     | Run the YA Claw web app                                             |
 | `make build-claw`                  | Build the `ya-claw` distribution                                    |

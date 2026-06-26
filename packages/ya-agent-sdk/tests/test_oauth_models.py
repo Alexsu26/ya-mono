@@ -6,7 +6,6 @@ import types
 import pytest
 from ya_agent_sdk.agents.main import create_agent
 from ya_agent_sdk.agents.models import infer_model
-from ya_agent_sdk.agents.models import utils as model_utils
 from ya_agent_sdk.context import AgentContext, ModelConfig
 
 
@@ -23,11 +22,7 @@ def test_agent_context_model_extra_headers_defaults_to_run_id() -> None:
 
 
 def test_agent_context_model_extra_headers_uses_provider_ids() -> None:
-    ctx = AgentContext(
-        run_id="run-1",
-        provider_session_id="session-1",
-        provider_thread_id="thread-1",
-    )
+    ctx = AgentContext(run_id="run-1", provider_session_id="session-1", provider_thread_id="thread-1")
 
     assert ctx.get_model_extra_headers()["session_id"] == "session-1"
     assert ctx.get_model_extra_headers()["session-id"] == "session-1"
@@ -36,16 +31,11 @@ def test_agent_context_model_extra_headers_uses_provider_ids() -> None:
     assert ctx.get_model_extra_headers()["x-client-request-id"] == "thread-1"
 
 
-def test_infer_oauth_model_lazy_import(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str, dict[str, str] | None]] = []
+def test_infer_oauth_model_lazy_import(monkeypatch) -> None:
+    calls = []
     module = types.ModuleType("ya_oauth_provider")
 
-    def fake_infer(
-        provider_name: str,
-        model_name: str,
-        *,
-        extra_headers: dict[str, str] | None = None,
-    ) -> str:
+    def fake_infer(provider_name: str, model_name: str, *, extra_headers: dict[str, str] | None = None):  # type: ignore[no-untyped-def]
         calls.append((provider_name, model_name, extra_headers))
         return "model"
 
@@ -56,12 +46,10 @@ def test_infer_oauth_model_lazy_import(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == [("codex", "gpt-5.5", {"session_id": "s1"})]
 
 
-def test_create_agent_passes_codex_headers_only_to_oauth_codex(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, dict[str, str] | None]] = []
+def test_create_agent_passes_codex_headers_only_to_oauth_codex(monkeypatch) -> None:
+    calls = []
 
-    def fake_infer(model: str, extra_headers: dict[str, str] | None = None) -> None:
+    def fake_infer(model, extra_headers=None):  # type: ignore[no-untyped-def]
         calls.append((model, extra_headers))
         return None
 
@@ -79,18 +67,6 @@ def test_create_agent_passes_codex_headers_only_to_oauth_codex(
 def test_infer_oauth_model_rejects_invalid_string() -> None:
     with pytest.raises(ValueError, match="oauth@provider:model"):
         infer_model("oauth@codex")
-
-
-async def test_model_http_client_uses_httpx_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
-
-    def fail_if_custom_retry_transport_is_used(*args: object, **kwargs: object) -> None:
-        raise AssertionError("proxy environments should use httpx default transport")
-
-    monkeypatch.setattr(model_utils, "AsyncTenacityTransport", fail_if_custom_retry_transport_is_used)
-
-    client = model_utils.create_async_http_client()
-    await client.aclose()
 
 
 def test_infer_model_rejects_ambiguous_openai_provider() -> None:

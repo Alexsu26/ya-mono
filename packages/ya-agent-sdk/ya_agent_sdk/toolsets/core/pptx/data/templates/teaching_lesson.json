@@ -1,0 +1,66 @@
+{
+  "asset_policy": {
+    "allow_public_image_search": true,
+    "preferred_kinds": [
+      "classroom",
+      "illustration",
+      "background"
+    ]
+  },
+  "id": "teaching_lesson",
+  "keywords": [
+    "\u5b66\u751f",
+    "\u8bfe\u5802",
+    "\u73ed\u7ea7",
+    "\u4efb\u52a1",
+    "\u601d\u8003",
+    "\u8bfe\u4ef6",
+    "\u76ee\u5f55"
+  ],
+  "layouts": [
+    {
+      "description": "Lesson title and class context",
+      "id": "cover",
+      "role": "cover"
+    },
+    {
+      "description": "Class agenda and learning tasks",
+      "id": "agenda",
+      "role": "agenda"
+    },
+    {
+      "description": "Lesson section divider",
+      "id": "section",
+      "role": "section"
+    },
+    {
+      "description": "Editable teaching content",
+      "id": "content",
+      "role": "content"
+    },
+    {
+      "description": "Classroom case discussion",
+      "id": "case",
+      "role": "case"
+    },
+    {
+      "description": "Editable visual placeholder",
+      "id": "image_placeholder",
+      "role": "image_placeholder"
+    },
+    {
+      "description": "Key takeaways and actions",
+      "id": "summary",
+      "role": "summary"
+    }
+  ],
+  "scene": "teaching_lesson",
+  "style": "campus_clean",
+  "theme": {
+    "accentColor": "2D8C7F",
+    "backgroundColor": "F7FBFA",
+    "bodyColor": "233142",
+    "fontFace": "Aptos",
+    "titleColor": "1F3A5F"
+  }
+}

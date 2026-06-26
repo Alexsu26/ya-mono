@@ -54,20 +54,18 @@ class ToolMessage(BaseModel):
         """Convert the tool message to inline Rich Text format (no panel border).
 
         Format:
-            ● tool_name done (0.1s) | Args: {...} | Output: {...}
+            Complete: tool_name (0.1s) | Args: {...} | Output: {...}
         """
         # Check if tool execution failed
         is_error = self.content and self.content.startswith("Tool execution error")
 
         content = Text()
         if is_error:
-            content.append("● ", style="bold red")
-            content.append(self.name, style="red")
-            content.append(" error", style="red")
+            content.append("x Error: ", style="dim")
+            content.append(self.name, style="bold red")
         else:
-            content.append("● ", style="dim")
-            content.append(self.name, style="dim")
-            content.append(" done", style="dim")
+            content.append("Complete: ", style="dim")
+            content.append(self.name, style="bold green")
         content.append(f" ({duration:.1f}s)", style="dim")
 
         # Add args preview (inline, no newline)

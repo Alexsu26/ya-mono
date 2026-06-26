@@ -1,0 +1,96 @@
+name: YAACLI Desktop Release
+
+on:
+  push:
+    tags:
+      - "yaacli-desktop-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Validate release credentials
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_UPDATER_PUBLIC_KEY; do
+            test -n "${!name:-}" || { echo "Missing required secret: $name" >&2; exit 1; }
+          done
+
+      - name: Import Apple signing certificate
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Install dependencies
+        run: |
+          uv sync --package yaacli
+          corepack pnpm install --frozen-lockfile
+
+      - name: Prepare signed updater configuration
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          jq -n --arg pubkey "$TAURI_UPDATER_PUBLIC_KEY" \
+            '{bundle:{createUpdaterArtifacts:true},plugins:{updater:{active:true,pubkey:$pubkey}}}' \
+            > "$RUNNER_TEMP/tauri-release.json"
+
+      - name: Build signed and notarized release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/yaacli-desktop
+          tagName: yaacli-desktop-v__VERSION__
+          releaseName: YAACLI Desktop v__VERSION__
+          releaseDraft: true
+          prerelease: false
+          args: --target aarch64-apple-darwin --config ${{ runner.temp }}/tauri-release.json
+
+      - name: Verify signed and stapled bundles
+        run: |
+          APP="apps/yaacli-desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/YAACLI Desktop.app"
+          DMG="$(find apps/yaacli-desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -name '*.dmg' -print -quit)"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          spctl --assess --type execute --verbose=2 "$APP"
+          xcrun stapler validate "$APP"
+          test -n "$DMG"
+          xcrun stapler validate "$DMG"
+          test -f apps/yaacli-desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/YAACLI\ Desktop.app/Contents/Resources/desktop-version.json
+          find apps/yaacli-desktop/src-tauri/target/aarch64-apple-darwin/release/bundle -name '*.sig' -print -quit | grep -q .

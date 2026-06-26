@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import os
 import socket
+from collections.abc import Callable
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from uuid import uuid4
 
 from dotenv import dotenv_values, load_dotenv
 from pydantic import AliasChoices, Field, PositiveInt, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from ya_agent_sdk.environment.virtual_path import normalize_virtual_path as normalize_agent_virtual_path
 
 from ya_claw.bridge.models import BridgeAdapterType, BridgeDispatchMode
 from ya_claw.workspace import DockerExtraMount
@@ -42,18 +44,31 @@ def _parse_env_var_names(value: str) -> list[str]:
     return names
 
 
+def _split_docker_extra_mount(item: str) -> tuple[str, str, str]:
+    for mode in (":rw", ":ro"):
+        if item.endswith(mode):
+            body = item[: -len(mode)]
+            parsed_mode = mode[1:]
+            break
+    else:
+        body = item
+        parsed_mode = "rw"
+
+    container_marker = body.rfind(":/")
+    if container_marker < 0:
+        raise ValueError("Docker extra mounts must use host_path:container_path[:mode] entries")
+    return body[:container_marker], body[container_marker + 1 :], parsed_mode
+
+
 def _parse_docker_extra_mounts(value: str) -> list[DockerExtraMount]:
     mounts: list[DockerExtraMount] = []
     for raw_item in value.split(","):
         item = raw_item.strip()
         if item == "":
             continue
-        parts = item.split(":")
-        if len(parts) not in (2, 3):
-            raise ValueError("Docker extra mounts must use host_path:container_path[:mode] entries")
-        host_path = Path(parts[0]).expanduser()
-        container_path = Path(parts[1])
-        mode = parts[2].strip() if len(parts) == 3 else "rw"
+        host_path_raw, container_path_raw, mode = _split_docker_extra_mount(item)
+        host_path = Path(host_path_raw).expanduser()
+        container_path = normalize_agent_virtual_path(container_path_raw)
         if str(host_path).strip() == "":
             raise ValueError("Docker extra mount host_path must not be empty")
         if not container_path.is_absolute():
@@ -132,6 +147,21 @@ class ClawSettings(BaseSettings):
     workspace_provider_docker_extra_mounts: str = ""
     workspace_provider_docker_exec_user: str = "auto"
     workspace_provider_docker_home: str = "/home/claw"
+    workspace_provider_docker_retention_policy: Literal["stop_on_idle", "keep_warm"] = "stop_on_idle"
+    workspace_provider_docker_idle_ttl_seconds: PositiveInt = 3600
+    shell_sandbox_enabled: bool = True
+    shell_sandbox_backend: Literal[
+        "auto",
+        "linux_bwrap_seccomp",
+        "macos_seatbelt",
+        "windows_restricted_token",
+        "docker",
+        "podman",
+        "nsjail",
+        "raw_host",
+    ] = "auto"
+    shell_sandbox_network: Literal["blocked", "restricted", "proxy", "full"] = "full"
+    shell_sandbox_allow_raw_host: bool = False
     workspace_env_vars: str = ""
     bridge_dispatch_mode: BridgeDispatchMode = BridgeDispatchMode.EMBEDDED
     bridge_enabled_adapters: str = ""
@@ -140,27 +170,51 @@ class ClawSettings(BaseSettings):
     bridge_lark_app_secret: SecretStr | None = None
     bridge_lark_default_profile: str | None = None
     bridge_lark_event_types: str = (
-        "im.chat.member.bot.added_v1,im.chat.member.user.added_v1,im.message.receive_v1,drive.notice.comment_add_v1"
+        "im.chat.member.bot.added_v1,im.chat.member.user.added_v1,im.message.receive_v1,"
+        "drive.notice.comment_add_v1,card.action.trigger"
     )
     bridge_lark_reply_identity: Literal["bot", "user"] = "bot"
     bridge_lark_domain: str = "https://open.feishu.cn"
+    bridge_lark_previous_messages_enabled: bool = True
+    bridge_lark_previous_messages_limit: PositiveInt = 6
     default_profile: str = "default"
     agent_stream_resume_on_error: bool = True
-    agent_stream_resume_max_attempts: int = 2
+    agent_stream_resume_max_attempts: int = 3
     agent_stream_resume_prompt: str = (
         "The previous streaming model request failed before the agent finished. "
         "Continue the task from the available conversation history. Avoid repeating completed work."
     )
+    oauth_refresh_enabled: bool = True
+    oauth_refresh_interval_seconds: PositiveInt = 1800
+    oauth_refresh_failure_retry_seconds: PositiveInt = 60
+    oauth_refresh_on_startup: bool = True
     profile_seed_file: Path | None = None
     auto_seed_profiles: bool = False
     schedule_dispatch_enabled: bool = True
     schedule_tick_seconds: int = 5
     schedule_max_due_per_tick: int = 20
+    workflow_dispatch_enabled: bool = True
+    workflow_tick_seconds: int = 5
+    workflow_max_runs_per_tick: int = 20
     heartbeat_enabled: bool = False
     heartbeat_interval_seconds: int = 300
     heartbeat_profile: str | None = None
     heartbeat_prompt: str = "Run heartbeat according to HEARTBEAT.md."
     heartbeat_on_active: Literal["skip", "queue"] = "skip"
+    unattended_shell_review_risk_threshold: Literal["low", "medium", "high", "extra_high"] | None = None
+    agency_enabled: bool = False
+    agency_idle_after_seconds: int = 600
+    agency_cooldown_seconds: int = 1800
+    agency_profile: str | None = None
+    agency_timer_interval_seconds: int = 3600
+    agency_fire_batch_limit: int = 20
+    agency_memory_capture_enabled: bool = True
+    agency_context_max_chars: int = 8000
+    agency_recent_files_limit: int = 5
+    agency_index_target_chars: int = 16_000
+    agency_index_max_chars: int = 32_000
+    agency_action_log_recent_chars: int = 32_000
+    agency_unattended_shell_review_risk_threshold: Literal["low", "medium", "high", "extra_high"] | None = "extra_high"
     memory_enabled: bool = True
     memory_extract_every_turns: int = 5
     memory_summary_every_extracts: int = 4
@@ -187,11 +241,12 @@ class ClawSettings(BaseSettings):
     session_prune_generated_sessions_enabled: bool = False
     session_prune_schedule_keep_recent: int = 10
     session_prune_schedule_older_than_days: int = 30
+    session_prune_once_schedules_hide_after_days: int = 7
     session_prune_heartbeat_keep_recent: int = 10
     session_prune_heartbeat_older_than_days: int = 7
     session_prune_fire_records_older_than_days: int = 0
     session_prune_orphans_enabled: bool = True
-    shutdown_timeout_seconds: PositiveInt | None = None
+    shutdown_timeout_seconds: PositiveInt | None = 30
 
     auto_migrate: bool = True
 
@@ -258,13 +313,19 @@ class ClawSettings(BaseSettings):
     def resolved_workspace_provider_docker_uid(self) -> int:
         if isinstance(self.workspace_provider_docker_uid, int):
             return self.workspace_provider_docker_uid
-        return os.getuid()
+        getuid = getattr(os, "getuid", None)
+        if callable(getuid):
+            return cast(Callable[[], int], getuid)()
+        return 1000
 
     @property
     def resolved_workspace_provider_docker_gid(self) -> int:
         if isinstance(self.workspace_provider_docker_gid, int):
             return self.workspace_provider_docker_gid
-        return os.getgid()
+        getgid = getattr(os, "getgid", None)
+        if callable(getgid):
+            return cast(Callable[[], int], getgid)()
+        return 1000
 
     @property
     def resolved_workspace_provider_docker_container_cache_dir(self) -> Path:
@@ -283,6 +344,14 @@ class ClawSettings(BaseSettings):
     @property
     def resolved_workspace_provider_docker_exec_default_env(self) -> dict[str, str]:
         return {"HOME": self.workspace_provider_docker_home.strip() or "/home/claw", "USER": "claw"}
+
+    @property
+    def resolved_workspace_provider_docker_retention_policy(self) -> Literal["stop_on_idle", "keep_warm"]:
+        return self.workspace_provider_docker_retention_policy
+
+    @property
+    def resolved_workspace_provider_docker_idle_ttl_seconds(self) -> int:
+        return int(self.workspace_provider_docker_idle_ttl_seconds)
 
     @property
     def resolved_bridge_enabled_adapters(self) -> set[BridgeAdapterType]:
@@ -306,6 +375,12 @@ class ClawSettings(BaseSettings):
     def resolved_heartbeat_profile(self) -> str:
         if isinstance(self.heartbeat_profile, str) and self.heartbeat_profile.strip() != "":
             return self.heartbeat_profile.strip()
+        return self.default_profile
+
+    @property
+    def resolved_agency_profile(self) -> str:
+        if isinstance(self.agency_profile, str) and self.agency_profile.strip() != "":
+            return self.agency_profile.strip()
         return self.default_profile
 
     @property

@@ -1,40 +1,96 @@
-name: CLI Tests
+name: YAACLI Tests
 
 on:
   push:
     branches:
       - main
     paths:
-      - "packages/yaacli/**"
-      - "packages/ya-agent-sdk/**"
-      - "packages/ya-oauth/**"
-      - "packages/ya-oauth-provider/**"
+      - "packages/yaacli/yaacli/**"
+      - "packages/yaacli/tests/**"
+      - "packages/yaacli/pyproject.toml"
+      - "packages/ya-agent-sdk/ya_agent_sdk/agents/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/context/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/events.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/filters/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/media.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/mcp.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/presets.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/subagents/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/base.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/content/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/context/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/document/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/enhance/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/shell/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/subagent/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/web/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/skills/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/tool_proxy/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/tool_search/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/usage.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/utils.py"
+      - "packages/ya-agent-sdk/pyproject.toml"
+      - "packages/ya-agent-stream-protocol/ya_agent_stream_protocol/**"
+      - "packages/ya-agent-stream-protocol/tests/**"
+      - "packages/ya-agent-stream-protocol/pyproject.toml"
+      - "packages/ya-agent-environment/ya_agent_environment/**"
+      - "packages/ya-agent-environment/pyproject.toml"
       - "skills/**"
       - "scripts/sync-skills.sh"
       - "scripts/check-skills-sync.sh"
       - "scripts/build-skill-zips.py"
-      - "pyproject.toml"
-      - "uv.lock"
       - ".github/workflows/cli-tests.yml"
       - ".github/actions/setup-python-env/**"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - "packages/yaacli/**"
-      - "packages/ya-agent-sdk/**"
-      - "packages/ya-oauth/**"
-      - "packages/ya-oauth-provider/**"
+      - "packages/yaacli/yaacli/**"
+      - "packages/yaacli/tests/**"
+      - "packages/yaacli/pyproject.toml"
+      - "packages/ya-agent-sdk/ya_agent_sdk/agents/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/context/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/events.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/filters/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/media.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/mcp.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/presets.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/subagents/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/base.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/content/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/context/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/document/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/enhance/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/shell/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/subagent/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/core/web/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/skills/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/tool_proxy/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/toolsets/tool_search/**"
+      - "packages/ya-agent-sdk/ya_agent_sdk/usage.py"
+      - "packages/ya-agent-sdk/ya_agent_sdk/utils.py"
+      - "packages/ya-agent-sdk/pyproject.toml"
+      - "packages/ya-agent-stream-protocol/ya_agent_stream_protocol/**"
+      - "packages/ya-agent-stream-protocol/tests/**"
+      - "packages/ya-agent-stream-protocol/pyproject.toml"
+      - "packages/ya-agent-environment/ya_agent_environment/**"
+      - "packages/ya-agent-environment/pyproject.toml"
       - "skills/**"
       - "scripts/sync-skills.sh"
       - "scripts/check-skills-sync.sh"
       - "scripts/build-skill-zips.py"
-      - "pyproject.toml"
-      - "uv.lock"
       - ".github/workflows/cli-tests.yml"
       - ".github/actions/setup-python-env/**"
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: yaacli-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   cli-tests:
+    name: YAACLI Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -47,7 +103,7 @@ jobs:
         shell: bash
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up the environment
         uses: ./.github/actions/setup-python-env
@@ -61,5 +117,5 @@ jobs:
       - name: Check release skill zip build
         run: python scripts/build-skill-zips.py --check
 
-      - name: Run CLI tests
-        run: uv run python -m pytest packages/yaacli/tests packages/ya-oauth/tests packages/ya-oauth-provider/tests -n auto
+      - name: Run stream protocol and CLI tests
+        run: uv run python -m pytest packages/ya-agent-stream-protocol/tests packages/yaacli/tests -n auto

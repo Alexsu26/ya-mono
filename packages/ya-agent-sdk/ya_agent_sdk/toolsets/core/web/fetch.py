@@ -9,7 +9,7 @@ from typing import Annotated, Any
 
 import httpx
 from pydantic import Field
-from pydantic_ai import BinaryContent, RunContext
+from pydantic_ai import BinaryContent, RunContext, ToolReturn
 
 from ya_agent_sdk._logger import get_logger
 from ya_agent_sdk.context import AgentContext
@@ -20,7 +20,7 @@ from ya_agent_sdk.toolsets.core.web._http_client import (
     safe_stream_request,
     verify_url,
 )
-from ya_agent_sdk.utils import detect_image_media_type
+from ya_agent_sdk.utils import compress_image_to_model_limit, detect_image_media_type, raw_bytes_limit_for_base64
 
 logger = get_logger(__name__)
 
@@ -50,7 +50,7 @@ class FetchTool(BaseTool):
             bool,
             Field(description="Only check existence without downloading content", default=False),
         ] = False,
-    ) -> str | dict[str, Any] | BinaryContent:
+    ) -> str | dict[str, Any] | ToolReturn:
         """Fetch web resource or check its existence."""
         skip_verification = ctx.deps.tool_config.skip_url_verification
 
@@ -115,13 +115,61 @@ class FetchTool(BaseTool):
             "error": (f"Resource too large to inline ({size} bytes). Maximum supported size is {max_bytes} bytes."),
         }
 
+    async def _compress_image_for_model_limit(
+        self,
+        ctx: RunContext[AgentContext],
+        image_data: bytes,
+        media_type: str,
+        *,
+        source: str,
+    ) -> tuple[bytes, str] | dict[str, Any]:
+        """Compress fetched image data to the configured model API image limit."""
+        max_encoded_bytes = ctx.deps.model_cfg.max_image_bytes if ctx.deps.model_cfg else 0
+        if max_encoded_bytes <= 0:
+            return image_data, media_type
+
+        max_raw_bytes = raw_bytes_limit_for_base64(max_encoded_bytes)
+        if len(image_data) <= max_raw_bytes:
+            return image_data, media_type
+
+        try:
+            compressed_data, compressed_media_type = await compress_image_to_model_limit(
+                image_data,
+                max_encoded_bytes=max_encoded_bytes,
+                media_type=media_type,
+            )
+        except Exception:
+            logger.exception("Failed to compress fetched image from %s before inlining", source)
+            return {
+                "success": False,
+                "error": "Fetched image could not be compressed for inline model input.",
+            }
+
+        if len(compressed_data) > max_raw_bytes:
+            return {
+                "success": False,
+                "error": (
+                    f"Fetched image could not be compressed below the {max_encoded_bytes} byte API limit "
+                    "after accounting for base64 encoding."
+                ),
+            }
+
+        logger.info(
+            "Compressed fetched image from %s from %d bytes to %d bytes before inlining",
+            source,
+            len(image_data),
+            len(compressed_data),
+        )
+        return compressed_data, compressed_media_type
+
     async def _read_binary_response(
         self,
         ctx: RunContext[AgentContext],
         response: httpx.Response,
         content_type: str,
-    ) -> BinaryContent | dict[str, Any]:
-        """Read a binary response with a hard in-memory size limit."""
+        url: str,
+    ) -> ToolReturn | dict[str, Any]:
+        """Read an image response with a hard in-memory size limit."""
         max_bytes = ctx.deps.tool_config.fetch_max_inline_binary_bytes
         chunk_size = ctx.deps.tool_config.fetch_stream_chunk_size
         content_length = response.headers.get("Content-Length")
@@ -146,7 +194,14 @@ class FetchTool(BaseTool):
             detected = detect_image_media_type(data)
             if detected:
                 content_type = detected
-        return BinaryContent(data=data, media_type=content_type)
+            compressed = await self._compress_image_for_model_limit(ctx, data, content_type, source=url)
+            if isinstance(compressed, dict):
+                return compressed
+            data, content_type = compressed
+        return ToolReturn(
+            return_value="The image is attached in the user message.",
+            content=[BinaryContent(data=data, media_type=content_type)],
+        )
 
     async def _read_text_response(
         self, ctx: RunContext[AgentContext], response: httpx.Response
@@ -197,7 +252,7 @@ class FetchTool(BaseTool):
         ctx: RunContext[AgentContext],
         url: str,
         skip_verification: bool = False,
-    ) -> str | dict[str, Any] | BinaryContent:
+    ) -> str | dict[str, Any] | ToolReturn:
         """Make GET request and return content."""
         try:
             async with safe_stream_request(
@@ -207,7 +262,7 @@ class FetchTool(BaseTool):
 
                 content_type = response.headers.get("Content-Type", "")
                 if "image" in content_type:
-                    return await self._read_binary_response(ctx, response, content_type)
+                    return await self._read_binary_response(ctx, response, content_type, url)
 
                 return await self._read_text_response(ctx, response)
 

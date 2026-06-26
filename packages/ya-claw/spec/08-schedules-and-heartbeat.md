@@ -2,7 +2,7 @@
 
 YA Claw has two time-based ingress surfaces:
 
-- **Schedules** are user or agent managed timer resources that create or steer agent work.
+- **Schedules** are user or agent managed timer resources that create or steer agent work. The same durable schedule model can trigger workflows, and the first-party console manages those workflow-backed schedules from the Workflows column.
 - **Heartbeat** is a runtime-owned internal timer that runs operational workspace checks from `HEARTBEAT.md`.
 
 Both surfaces submit work through the same queued-run execution model. Their ownership, API surface, and guidance loading rules stay separate.
@@ -15,7 +15,9 @@ Both surfaces submit work through the same queued-run execution model. Their own
 - support isolated timer work that creates a clean session each fire
 - keep heartbeat configuration runtime-owned and visible to the console
 - load `HEARTBEAT.md` only for heartbeat-triggered runs
-- keep the single-workspace model: all runs share the configured workspace binding
+- inherit workspace binding from the owning or configured session when a timed run needs workspace files
+- use run-scoped Docker sandboxes for schedule and heartbeat runs and close them at terminal state
+- support periodic workflow triggering through the schedule storage and dispatcher model while presenting workflow recurrence in the Workflows console
 
 ## Time-based Work Types
 
@@ -28,6 +30,7 @@ flowchart TB
     S --> CS[continue_session]
     S --> FS[fork_session]
     S --> IS[isolate_session]
+    S --> WF[workflow]
 
     H --> HI[heartbeat isolate run]
 ```
@@ -83,9 +86,31 @@ Delivery behavior:
 - the first run has `trigger_type="schedule"`
 - the run starts with a clean agent state
 - the run uses the configured workspace binding and regular workspace guidance
+- the run uses a run-scoped Docker sandbox when the workspace backend is Docker
+- the run closes its Docker sandbox at terminal state
 - the run loads schedule input and regular workspace guidance only
 
-This mode is useful for standalone recurring tasks that need workspace access, clean agent state, and durable run history.
+This mode is useful for standalone recurring tasks that need workspace access, clean agent state, durable run history, and a fresh container lifecycle per fire.
+
+### `schedule + workflow`
+
+A schedule fire creates a workflow run from the stored workflow definition. This remains a schedule execution mode in storage and dispatcher code, while the first-party Web UI manages workflow-backed schedules from the selected workflow detail view.
+
+Required execution fields:
+
+- `execution_mode = "workflow"`
+- `workflow_id`
+- `workflow_inputs_template`
+
+Delivery behavior:
+
+- the runtime renders workflow inputs from schedule metadata and fire context
+- the runtime creates a queued workflow run with `trigger_kind="schedule"`
+- the workflow executor dispatches node work through Claw sessions and queued runs
+- the schedule fire stores `last_workflow_run_id`
+- terminal workflow state updates the schedule fire status
+
+This mode is useful for periodic multi-step work where an agent or user wants durable orchestration state, node-level tracking, and Web UI visibility.
 
 ### `heartbeat`
 
@@ -97,6 +122,8 @@ Behavior:
 - each fire creates an isolated queued run
 - the run has `trigger_type="heartbeat"`
 - the runtime loads `HEARTBEAT.md` from the workspace root and injects it as heartbeat guidance
+- the run uses a run-scoped Docker sandbox when the workspace backend is Docker
+- the run closes its Docker sandbox at terminal state
 - heartbeat fires are queryable by the console
 - heartbeat management stays outside the agent schedule toolset
 
@@ -115,6 +142,8 @@ Schedules support cron and one-time triggers.
 Manual fire is an action created through `trigger_schedule` or `/api/v1/schedules/{schedule_id}:trigger`. It records a fire immediately and uses the stored schedule prompt or a prompt override.
 
 The runtime stores `next_fire_at` as an absolute timestamp. Cron and one-time parsing happens in the schedule controller. Dispatcher scans use `next_fire_at` only. A one-time schedule moves to `completed` after terminal delivery and preserves its fire history.
+
+Completed one-time schedules older than `YA_CLAW_SESSION_PRUNE_ONCE_SCHEDULES_HIDE_AFTER_DAYS` are automatically marked `deleted` by the session prune dispatcher. The default threshold is 7 days, and this metadata-only hiding runs independently from run-store pruning. The schedule metadata records `auto_hidden=true`, `auto_hidden_reason="expired_once_schedule"`, and `auto_hidden_at`. Default schedule list APIs and the web console hide deleted schedules, while `include_deleted=true` exposes them for audit and debugging. The automatic hiding step keeps schedule definitions and fire history in the database until explicit fire-record retention applies.
 
 ## Schedule Data Model
 
@@ -135,7 +164,9 @@ Suggested fields:
 - `run_at`
 - `timezone`
 - `next_fire_at`
-- `execution_mode`: `continue_session | fork_session | isolate_session`
+- `execution_mode`: `continue_session | fork_session | isolate_session | workflow`
+- `workflow_id`
+- `workflow_inputs_template`
 - `target_session_id`
 - `source_session_id`
 - `on_active`: `steer | skip | queue`
@@ -145,6 +176,7 @@ Suggested fields:
 - `last_fire_id`
 - `last_session_id`
 - `last_run_id`
+- `last_workflow_run_id`
 - `fire_count`
 - `failure_count`
 - `created_at`
@@ -155,6 +187,8 @@ Suggested fields:
 - `continue_session` requires `target_session_id`
 - `fork_session` requires `source_session_id`
 - `isolate_session` creates a fresh session for each fire and leaves target/source session fields empty
+- `workflow` requires `workflow_id`
+- `workflow_inputs_template` applies to `workflow`
 - `on_active` applies to `continue_session`
 - `cron` schedules require `cron_expr`
 - `once` schedules require `run_at`
@@ -178,6 +212,7 @@ Suggested fields:
 - `created_session_id`
 - `run_id`
 - `active_run_id`
+- `workflow_run_id`
 - `input_parts`
 - `error_message`
 - `metadata`

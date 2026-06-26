@@ -1,0 +1,89 @@
+{
+  "asset_policy": {
+    "allow_public_image_search": true,
+    "preferred_kinds": [
+      "architecture",
+      "urban park",
+      "retail street",
+      "boutique hotel",
+      "healthy cafe"
+    ]
+  },
+  "id": "business_proposal_editorial",
+  "keywords": [
+    "\u5546\u4e1a",
+    "\u627f\u5305",
+    "\u4e1a\u6001",
+    "\u9910\u996e",
+    "\u5496\u5561",
+    "\u9152\u5e97",
+    "\u5065\u8eab",
+    "\u529e\u516c",
+    "\u89c4\u5212",
+    "\u516c\u56ed",
+    "\u793e\u533a",
+    "\u6539\u9020"
+  ],
+  "layouts": [
+    {
+      "description": "Editorial cover with dark brand panel and large image",
+      "id": "hero_image",
+      "role": "cover"
+    },
+    {
+      "description": "Two-column editorial agenda",
+      "id": "agenda",
+      "role": "agenda"
+    },
+    {
+      "description": "Dark chapter divider",
+      "id": "section",
+      "role": "section"
+    },
+    {
+      "description": "Editorial metric cards",
+      "id": "metric_cards",
+      "role": "content"
+    },
+    {
+      "description": "Four-quadrant strategy matrix",
+      "id": "matrix_2x2",
+      "role": "content"
+    },
+    {
+      "description": "Risk table with brand header",
+      "id": "risk_grid",
+      "role": "content"
+    },
+    {
+      "description": "Milestone roadmap",
+      "id": "timeline",
+      "role": "content"
+    },
+    {
+      "description": "Editorial two-column evidence split",
+      "id": "two_column",
+      "role": "content"
+    },
+    {
+      "description": "Decision summary",
+      "id": "summary",
+      "role": "summary"
+    }
+  ],
+  "scene": "business_proposal",
+  "style": "editorial_park",
+  "theme": {
+    "accentColor": "C47A32",
+    "backgroundColor": "10251E",
+    "bodyColor": "D8D0C2",
+    "bodyFontFace": "Aptos",
+    "cardColor": "F4EFE6",
+    "cardTextColor": "17241E",
+    "fontFace": "Aptos",
+    "secondaryAccentColor": "8FB8A6",
+    "surfaceColor": "18352B",
+    "titleColor": "F4EFE6",
+    "titleFontFace": "Georgia"
+  }
+}

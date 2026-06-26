@@ -13,6 +13,7 @@ from ya_claw.config import ClawSettings
 from ya_claw.controller.memory import MemoryController
 from ya_claw.controller.models import MemoryActionRequest, MemoryJobKind, TriggerType, memory_state_summary_from_record
 from ya_claw.db.engine import create_engine, create_session_factory
+from ya_claw.memory.extract_prompt import MEMORY_EXTRACT_SYSTEM_PROMPT
 from ya_claw.memory.lifecycle import (
     AUTO_TASK_CONTEXT_TAGS,
     MEMORY_CONTEXT_TAG,
@@ -22,6 +23,7 @@ from ya_claw.memory.lifecycle import (
     MemoryLifecycle,
 )
 from ya_claw.memory.store import WorkspaceMemoryStore
+from ya_claw.memory.summary_prompt import MEMORY_SUMMARY_SYSTEM_PROMPT
 from ya_claw.orm.base import Base
 from ya_claw.orm.tables import RunRecord, SessionMemoryStateRecord, SessionRecord
 from ya_claw.runtime_state import create_runtime_state
@@ -33,8 +35,32 @@ async def test_memory_lifecycle_queues_extract_for_context_handoff(
     db_engine: AsyncEngine,
     settings: ClawSettings,
 ) -> None:
-    session = SessionRecord(id="session-1", profile_name="general", session_metadata={})
+    session = SessionRecord(
+        id="session-1",
+        profile_name="general",
+        session_metadata={
+            "bridge": {
+                "adapter": "lark",
+                "tenant_key": "tenant-1",
+                "chat_id": "chat-1",
+                "chat_type": "group",
+            }
+        },
+    )
     run = _completed_run("run-1", "session-1", 1)
+    run.run_metadata = {
+        "bridge": {
+            "adapter": "lark",
+            "tenant_key": "tenant-1",
+            "chat_id": "chat-1",
+            "chat_type": "group",
+            "sender_id": "user-1",
+            "sender_type": "user",
+            "message_id": "message-1",
+            "event_id": "event-1",
+            "thread_id": "thread-1",
+        }
+    }
     db_session.add_all([session, run])
     await db_session.commit()
 
@@ -70,6 +96,13 @@ async def test_memory_lifecycle_queues_extract_for_context_handoff(
     assert memory_run.trigger_type == "memory"
     assert memory_run.run_metadata["memory"]["kind"] == "extract"
     assert memory_run.run_metadata["memory"]["context_handoff"]["source"] == "summarize_tool"
+    source_identity = memory_run.run_metadata["memory"]["source_identity"]
+    assert source_identity["bridge"]["conversation"]["chat_id"] == "chat-1"
+    assert source_identity["bridge"]["latest_message"]["sender_id"] == "user-1"
+    assert source_identity["bridge"]["latest_message"]["message_id"] == "message-1"
+    payload = _memory_job_payload(memory_run)
+    assert payload["source_identity"]["bridge"]["latest_message"]["thread_id"] == "thread-1"
+    assert payload["source_runs"][0]["source_identity"]["bridge"]["sender_id"] == "user-1"
     assert "memory/MEMORY.md" in memory_run.input_parts[0]["text"]
 
 
@@ -524,6 +557,45 @@ async def test_memory_controller_enqueues_extract(
     assert response.kind == MemoryJobKind.EXTRACT
 
 
+async def test_memory_agent_prompts_keep_memory_md_compact() -> None:
+    combined_prompt = "\n".join([MEMORY_EXTRACT_SYSTEM_PROMPT, MEMORY_SUMMARY_SYSTEM_PROMPT])
+
+    normalized_prompt = combined_prompt.lower()
+
+    assert "compact durable memory brief" in normalized_prompt
+    assert "keep memory.md short, stable" in normalized_prompt
+    assert "owner scope, subject id, and provenance" in normalized_prompt
+    assert "workspace" in normalized_prompt
+    assert "conversation" in normalized_prompt
+    assert "participant" in normalized_prompt
+    assert "file catalogs, event lists, transcript details, and chronological narration" in combined_prompt
+    assert "event file frontmatter as the discovery surface" in combined_prompt
+    assert "Primary memory index" not in combined_prompt
+    assert "main index" not in combined_prompt
+    assert '<index path="memory/MEMORY.md">' not in combined_prompt
+
+
+async def test_workspace_memory_store_uses_workspace_level_agency_files(settings: ClawSettings) -> None:
+    provider = LocalWorkspaceProvider(settings.resolved_workspace_dir, virtual_workspace_path=Path("/workspace"))
+    binding = provider.resolve({"session_id": "session-1"})
+    store = WorkspaceMemoryStore(binding)
+
+    store.ensure_agency()
+
+    assert store.memory_md_path == binding.host_path / "memory" / "MEMORY.md"
+    assert store.agency_md_path == binding.host_path / "AGENCY.md"
+    assert store.agency_action_log_path == binding.host_path / "agency" / "ACTION_LOG.md"
+    assert (binding.host_path / "agency" / "episodes").is_dir()
+    assert (binding.host_path / "agency" / "intentions").is_dir()
+    assert (binding.host_path / "agency" / "archive").is_dir()
+    assert store.build_agency_index_context(max_chars=1000) is not None
+    assert '<agency-index-context path="/workspace/AGENCY.md">' in store.build_agency_index_context(max_chars=1000)
+    assert (
+        '<agency-action-log-context path="/workspace/agency/ACTION_LOG.md">'
+        in store.build_agency_action_log_context(max_chars=1000)
+    )
+
+
 async def test_workspace_memory_store_rejects_symlinked_memory_files(settings: ClawSettings, tmp_path: Path) -> None:
     provider = LocalWorkspaceProvider(settings.resolved_workspace_dir, virtual_workspace_path=Path("/workspace"))
     binding = provider.resolve({"session_id": "session-1"})
@@ -891,7 +963,6 @@ def _completed_run(
         input_parts=[{"type": "text", "text": f"hello {sequence_no}"}],
         run_metadata={},
         output_text=f"completed {run_id}",
-        output_summary=f"completed {run_id}",
         started_at=now,
         finished_at=now,
         committed_at=now,

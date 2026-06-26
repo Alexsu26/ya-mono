@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import copy
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, Unpack
 
 from ya_agent_sdk.context import ModelCapability
 
@@ -143,10 +143,21 @@ def build_context_management(
     return {"edits": edits}
 
 
+class ContextManagementOptions(TypedDict, total=False):
+    clear_tool_uses: bool
+    tool_use_trigger_tokens: int
+    tool_use_keep: int
+    tool_use_clear_at_least: int | None
+    tool_use_clear_inputs: bool
+    tool_use_exclude_tools: list[str] | None
+    clear_thinking: bool
+    thinking_keep_turns: int | Literal["all"]
+
+
 def with_context_management(
     settings: dict[str, Any],
     context_management: dict[str, Any] | None = None,
-    **kwargs: Any,
+    **kwargs: Unpack[ContextManagementOptions],
 ) -> dict[str, Any]:
     """Add Anthropic context management to existing model settings.
 
@@ -306,6 +317,11 @@ class ModelSettingsPreset(StrEnum):
     OPENAI_RESPONSES_HIGH = "openai_responses_high"
     OPENAI_RESPONSES_MEDIUM = "openai_responses_medium"
     OPENAI_RESPONSES_LOW = "openai_responses_low"
+    OPENAI_RESPONSES_DEFAULT_FAST = "openai_responses_default_fast"
+    OPENAI_RESPONSES_XHIGH_FAST = "openai_responses_xhigh_fast"
+    OPENAI_RESPONSES_HIGH_FAST = "openai_responses_high_fast"
+    OPENAI_RESPONSES_MEDIUM_FAST = "openai_responses_medium_fast"
+    OPENAI_RESPONSES_LOW_FAST = "openai_responses_low_fast"
 
     # DeepSeek V4 presets (OpenAI-compatible API)
     DEEPSEEK_V4_DEFAULT = "deepseek_v4_default"
@@ -372,7 +388,7 @@ def _anthropic_adaptive_settings(
         },
         "anthropic_effort": effort,
         "anthropic_cache_instructions": True,
-        "anthropic_cache_response": True,
+        "anthropic_cache_tool_definitions": True,
         "anthropic_cache_messages": True,
     }
     # Adaptive thinking does NOT need interleaved thinking beta (it's automatic)
@@ -412,7 +428,7 @@ def _anthropic_off_settings(
             "type": "disabled",
         },
         "anthropic_cache_instructions": True,
-        "anthropic_cache_response": True,
+        "anthropic_cache_tool_definitions": True,
         "anthropic_cache_messages": True,
     }
     extra_headers = build_anthropic_betas(
@@ -695,6 +711,7 @@ def _openai_responses_settings(
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"],
     reasoning_summary: Literal["detailed", "concise", "auto"] = "auto",
     max_tokens: int | None = None,
+    openai_service_tier: Literal["auto", "default", "flex", "priority"] | None = None,
 ) -> dict[str, Any]:
     """Create OpenAI Responses API settings for reasoning models.
 
@@ -702,6 +719,7 @@ def _openai_responses_settings(
         reasoning_effort: Reasoning intensity. GPT-5.5 supports 'none', 'low', 'medium', 'high', and 'xhigh'.
         reasoning_summary: Summary level of reasoning process.
         max_tokens: Maximum output tokens (None for model default).
+        openai_service_tier: OpenAI service tier for the model request.
 
     Returns:
         Dict suitable for OpenAIResponsesModelSettings.
@@ -712,7 +730,9 @@ def _openai_responses_settings(
         "openai_reasoning_summary": reasoning_summary,
     }
     if max_tokens is not None:
-        settings["max_output_tokens"] = max_tokens
+        settings["max_tokens"] = max_tokens
+    if openai_service_tier is not None:
+        settings["openai_service_tier"] = openai_service_tier
     return settings
 
 
@@ -750,6 +770,46 @@ OPENAI_RESPONSES_LOW: dict[str, Any] = _openai_responses_settings(
     max_tokens=8 * K_TOKENS,
 )
 """OpenAI Responses low: Minimal reasoning, faster responses."""
+
+OPENAI_RESPONSES_DEFAULT_FAST: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="medium",
+    reasoning_summary="auto",
+    max_tokens=16 * K_TOKENS,
+    openai_service_tier="priority",
+)
+"""OpenAI Responses default fast: Balanced reasoning on the priority service tier."""
+
+OPENAI_RESPONSES_XHIGH_FAST: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="xhigh",
+    reasoning_summary="detailed",
+    max_tokens=64 * K_TOKENS,
+    openai_service_tier="priority",
+)
+"""OpenAI Responses xhigh fast: Highest reasoning effort on the priority service tier."""
+
+OPENAI_RESPONSES_HIGH_FAST: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="high",
+    reasoning_summary="detailed",
+    max_tokens=32 * K_TOKENS,
+    openai_service_tier="priority",
+)
+"""OpenAI Responses high fast: Strong reasoning effort on the priority service tier."""
+
+OPENAI_RESPONSES_MEDIUM_FAST: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="medium",
+    reasoning_summary="auto",
+    max_tokens=16 * K_TOKENS,
+    openai_service_tier="priority",
+)
+"""OpenAI Responses medium fast: Balanced reasoning on the priority service tier."""
+
+OPENAI_RESPONSES_LOW_FAST: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="low",
+    reasoning_summary="concise",
+    max_tokens=8 * K_TOKENS,
+    openai_service_tier="priority",
+)
+"""OpenAI Responses low fast: Minimal reasoning on the priority service tier."""
 
 
 # =============================================================================
@@ -881,28 +941,28 @@ def _gemini_thinking_budget_settings(
 GEMINI_THINKING_BUDGET_DEFAULT: dict[str, Any] = _gemini_thinking_budget_settings(
     thinking_budget=16 * K_TOKENS,
     max_tokens=16 * K_TOKENS,
-    include_thoughts=False,
+    include_thoughts=True,
 )
 """Gemini 2.5 default: 16K thinking budget, balanced reasoning."""
 
 GEMINI_THINKING_BUDGET_HIGH: dict[str, Any] = _gemini_thinking_budget_settings(
     thinking_budget=32 * K_TOKENS,
     max_tokens=21 * K_TOKENS,
-    include_thoughts=False,
+    include_thoughts=True,
 )
 """Gemini 2.5 high: 32K thinking budget, maximum reasoning depth."""
 
 GEMINI_THINKING_BUDGET_MEDIUM: dict[str, Any] = _gemini_thinking_budget_settings(
     thinking_budget=16 * K_TOKENS,
     max_tokens=16 * K_TOKENS,
-    include_thoughts=False,
+    include_thoughts=True,
 )
 """Gemini 2.5 medium: 16K thinking budget, balanced reasoning."""
 
 GEMINI_THINKING_BUDGET_LOW: dict[str, Any] = _gemini_thinking_budget_settings(
     thinking_budget=4 * K_TOKENS,
     max_tokens=8 * K_TOKENS,
-    include_thoughts=False,
+    include_thoughts=True,
 )
 """Gemini 2.5 low: 4K thinking budget, minimal reasoning overhead."""
 
@@ -941,35 +1001,35 @@ def _gemini_thinking_level_settings(
 GEMINI_THINKING_LEVEL_DEFAULT: dict[str, Any] = _gemini_thinking_level_settings(
     thinking_level="LOW",
     max_tokens=16 * K_TOKENS,
-    include_thoughts=False,
+    include_thoughts=True,
 )
 """Gemini 3 default: MEDIUM thinking level, balanced reasoning."""
 
 GEMINI_THINKING_LEVEL_HIGH: dict[str, Any] = _gemini_thinking_level_settings(
     thinking_level="HIGH",
     max_tokens=21 * K_TOKENS,
-    include_thoughts=False,
+    include_thoughts=True,
 )
 """Gemini 3 high: HIGH thinking level, maximum reasoning depth."""
 
 GEMINI_THINKING_LEVEL_MEDIUM: dict[str, Any] = _gemini_thinking_level_settings(
     thinking_level="MEDIUM",
     max_tokens=16 * K_TOKENS,
-    include_thoughts=False,
+    include_thoughts=True,
 )
 """Gemini 3 medium: MEDIUM thinking level, balanced reasoning."""
 
 GEMINI_THINKING_LEVEL_LOW: dict[str, Any] = _gemini_thinking_level_settings(
     thinking_level="LOW",
     max_tokens=8 * K_TOKENS,
-    include_thoughts=False,
+    include_thoughts=True,
 )
 """Gemini 3 low: LOW thinking level, minimal reasoning overhead."""
 
 GEMINI_THINKING_LEVEL_MINIMAL: dict[str, Any] = _gemini_thinking_level_settings(
     thinking_level="MINIMAL",
     max_tokens=4 * K_TOKENS,
-    include_thoughts=False,
+    include_thoughts=True,
 )
 """Gemini 3 minimal: MINIMAL thinking level (Flash only, may still think for complex tasks)."""
 
@@ -1063,6 +1123,11 @@ _PRESET_REGISTRY: dict[str, dict[str, Any]] = {
     ModelSettingsPreset.OPENAI_RESPONSES_HIGH.value: OPENAI_RESPONSES_HIGH,
     ModelSettingsPreset.OPENAI_RESPONSES_MEDIUM.value: OPENAI_RESPONSES_MEDIUM,
     ModelSettingsPreset.OPENAI_RESPONSES_LOW.value: OPENAI_RESPONSES_LOW,
+    ModelSettingsPreset.OPENAI_RESPONSES_DEFAULT_FAST.value: OPENAI_RESPONSES_DEFAULT_FAST,
+    ModelSettingsPreset.OPENAI_RESPONSES_XHIGH_FAST.value: OPENAI_RESPONSES_XHIGH_FAST,
+    ModelSettingsPreset.OPENAI_RESPONSES_HIGH_FAST.value: OPENAI_RESPONSES_HIGH_FAST,
+    ModelSettingsPreset.OPENAI_RESPONSES_MEDIUM_FAST.value: OPENAI_RESPONSES_MEDIUM_FAST,
+    ModelSettingsPreset.OPENAI_RESPONSES_LOW_FAST.value: OPENAI_RESPONSES_LOW_FAST,
     # DeepSeek V4
     ModelSettingsPreset.DEEPSEEK_V4_DEFAULT.value: DEEPSEEK_V4_DEFAULT,
     ModelSettingsPreset.DEEPSEEK_V4_HIGH.value: DEEPSEEK_V4_HIGH,

@@ -3,12 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from sqlalchemy.ext.asyncio import AsyncEngine
 from ya_claw.config import ClawSettings
 from ya_claw.db.engine import create_engine, create_session_factory
 from ya_claw.execution.profile import ProfileResolver
 from ya_claw.orm.base import Base
 from ya_claw.orm.tables import ProfileRecord
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture
@@ -31,6 +34,14 @@ profiles:
     model: gateway@openai-responses:gpt-5.5
     model_settings_preset: openai_responses_high
     model_config_preset: gpt5_270k
+    security:
+      shell_review:
+        enabled: true
+        model: gateway@openai-responses:gpt-5.5-mini
+        model_settings: openai_responses_low
+        on_needs_approval: deny
+        risk_threshold: extra_high
+        unattended_risk_threshold: high
     system_prompt: |
       You are the profile-scoped execution agent.
     builtin_toolsets: [filesystem, shell]
@@ -84,6 +95,13 @@ profiles:
 
     assert seeded_names == ["default"]
     assert resolved_profile.model == "gateway@openai-responses:gpt-5.5"
+    assert resolved_profile.shell_review is not None
+    assert resolved_profile.shell_review.enabled is True
+    assert resolved_profile.shell_review.model == "gateway@openai-responses:gpt-5.5-mini"
+    assert isinstance(resolved_profile.shell_review.model_settings, dict)
+    assert resolved_profile.shell_review.model_settings["openai_reasoning_effort"] == "low"
+    assert resolved_profile.shell_review.risk_threshold == "extra_high"
+    assert resolved_profile.shell_review.unattended_risk_threshold == "high"
     assert resolved_profile.system_prompt == "You are the profile-scoped execution agent."
     assert resolved_profile.builtin_toolsets == ["filesystem", "shell"]
     assert resolved_profile.need_user_approve_mcps == ["context7"]
@@ -124,6 +142,10 @@ profiles:
         record = await db_session.get(ProfileRecord, "default")
         assert isinstance(record, ProfileRecord)
         assert record.source_checksum is not None
+        assert record.model_config_override is not None
+        assert record.model_config_override["security"]["shell_review"]["model_settings"] == "openai_responses_low"
+        assert record.model_config_override["security"]["shell_review"]["risk_threshold"] == "extra_high"
+        assert record.model_config_override["security"]["shell_review"]["unattended_risk_threshold"] == "high"
         assert record.builtin_toolsets == ["filesystem", "shell"]
         assert record.need_user_approve_mcps == ["context7"]
         assert record.enabled_mcps == ["context7", "github"]
@@ -131,6 +153,62 @@ profiles:
         assert record.mcp_servers["context7"]["transport"] == "streamable_http"
         assert record.unified_subagents is True
         assert [item["name"] for item in record.subagents] == ["explorer", "searcher", "executor"]
+
+
+async def test_profile_resolver_seeds_ppt_agent_from_yaml(tmp_path: Path, db_engine: AsyncEngine) -> None:
+    seed_file = tmp_path / "profiles.yaml"
+    seed_file.write_text(
+        """
+profiles:
+  - name: ppt-agent
+    model: gateway@openai-responses:gpt-5.5
+    model_settings_preset: openai_responses_high
+    model_config_preset: gpt5_270k
+    system_prompt: |
+      You are a PPT Agent for internal use.
+    builtin_toolsets:
+      - filesystem
+      - shell
+      - document
+      - web
+      - pptx
+""".strip(),
+        encoding="utf-8",
+    )
+    settings = ClawSettings(
+        api_token="test-token",  # noqa: S106
+        data_dir=tmp_path / "runtime-data",
+        workspace_dir=tmp_path / "workspace",
+        profile_seed_file=seed_file,
+    )
+    session_factory = create_session_factory(db_engine)
+    resolver = ProfileResolver(settings=settings, session_factory=session_factory)
+
+    seeded_names = await resolver.seed_profiles()
+    resolved_profile = await resolver.resolve("ppt-agent")
+
+    assert seeded_names == ["ppt-agent"]
+    assert resolved_profile.name == "ppt-agent"
+    assert resolved_profile.builtin_toolsets == ["filesystem", "shell", "document", "web", "pptx"]
+
+
+def test_ppt_agent_seed_profile_contains_ppt_quality_gates() -> None:
+    seed_data = yaml.safe_load((REPO_ROOT / "packages" / "ya-claw" / "profiles.yaml").read_text(encoding="utf-8"))
+    ppt_profile = next(profile for profile in seed_data["profiles"] if profile["name"] == "ppt-agent")
+    prompt = ppt_profile["system_prompt"]
+
+    assert ppt_profile["model"] == "oauth@codex:gpt-5.5"
+    assert ppt_profile["model_settings_preset"] == "openai_responses_high"
+    assert ppt_profile["model_config_preset"] == "gpt5_270k"
+    assert "Never call pptx_render with title-only business slides" in prompt
+    assert "blue-green cooperation proposal template grammar" in prompt
+    assert "section slide" in prompt
+    assert "hub_spoke" in prompt
+    assert "party_roles" in prompt
+    assert "matrix_2x2" in prompt
+    assert "risk_grid" in prompt
+    assert "metric_cards" in prompt
+    assert ppt_profile["builtin_toolsets"] == ["filesystem", "shell", "document", "web", "pptx"]
 
 
 async def test_profile_resolver_updates_existing_seeded_profile_and_subagents(

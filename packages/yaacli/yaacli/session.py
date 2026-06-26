@@ -1,6 +1,6 @@
 """TUI session management.
 
-TUIContext extends AgentContext with TUI-specific state such as loop mode.
+TUIContext extends AgentContext with TUI-specific state such as goal mode.
 
 The message bus (inherited from AgentContext) is used for injecting user
 guidance during agent execution:
@@ -11,37 +11,64 @@ guidance during agent execution:
 
 from __future__ import annotations
 
-from typing import Any
-
 from ya_agent_sdk.context import AgentContext
 
 
 class TUIContext(AgentContext):
-    """TUI context extending AgentContext with loop mode support.
+    """TUI context extending AgentContext with goal mode support.
 
-    Loop mode fields are set by the /loop command and read by the
-    loop output guard to drive autonomous task iteration.
+    Goal mode fields are set by the /goal command and read by the
+    goal output guard to drive autonomous task iteration.
 
     Attributes:
-        loop_task: Original task description when loop is active. None when inactive.
-        loop_iteration: Current iteration count (0-based, incremented by guard).
-        loop_max_iterations: Maximum iterations allowed before stopping.
+        goal_task: Original task description when goal mode is active. None when inactive.
+        goal_iteration: Current iteration count (0-based, incremented by guard).
+        goal_max_iterations: Maximum iterations allowed before stopping.
+        goal_needs_post_restore_audit: Whether a context restore happened during the active goal.
+        goal_last_context_handoff_source: Source of the most recent goal-time context restore.
     """
 
-    loop_task: str | None = None
-    loop_iteration: int = 0
-    loop_max_iterations: int = 10
+    goal_task: str | None = None
+    goal_iteration: int = 0
+    goal_max_iterations: int = 10
+    goal_needs_post_restore_audit: bool = False
+    goal_last_context_handoff_source: str | None = None
 
-    def __init__(self, **data: Any) -> None:
+    def __init__(self, **data: object) -> None:
         """Initialize TUIContext."""
         super().__init__(**data)
 
     @property
-    def loop_active(self) -> bool:
-        """Whether loop mode is currently active."""
-        return self.loop_task is not None
+    def goal_active(self) -> bool:
+        """Whether goal mode is currently active."""
+        return self.goal_task is not None
 
-    def reset_loop(self) -> None:
-        """Reset all loop state."""
-        self.loop_task = None
-        self.loop_iteration = 0
+    def reset_goal(self) -> None:
+        """Reset all goal state."""
+        self.goal_task = None
+        self.goal_iteration = 0
+        self.goal_needs_post_restore_audit = False
+        self.goal_last_context_handoff_source = None
+
+    def mark_goal_context_restored(self, source: str) -> None:
+        """Record that active goal state crossed a context handoff boundary.
+
+        The SDK owns compact/handoff mechanics, while YAACLI owns goal-mode
+        completion. When history is replaced during an active goal, YAACLI
+        requires one explicit post-restore audit before accepting a completion
+        marker.
+        """
+        if not self.goal_active:
+            return
+        self.goal_needs_post_restore_audit = True
+        self.goal_last_context_handoff_source = source
+
+    def consume_goal_context_restore_audit(self) -> tuple[bool, str | None]:
+        """Return and clear the pending post-restore goal audit flag."""
+        if not self.goal_needs_post_restore_audit:
+            return False, None
+
+        source = self.goal_last_context_handoff_source
+        self.goal_needs_post_restore_audit = False
+        self.goal_last_context_handoff_source = None
+        return True, source

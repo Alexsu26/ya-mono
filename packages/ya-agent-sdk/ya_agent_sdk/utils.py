@@ -4,15 +4,15 @@ import functools
 import io
 import socket
 import typing
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import anyio.to_thread
 from PIL import Image
-from pydantic_ai import AbstractToolset, Agent, ModelMessage, ModelResponse, RequestUsage, RunContext, ToolCallPart
+from pydantic_ai import AbstractToolset, Agent, ModelMessage, ModelResponse, RequestUsage, ToolCallPart
 from pydantic_ai.messages import BinaryContent
 from pydantic_ai.output import OutputDataT
 from typing_extensions import TypeVar
-from y_agent_environment import Environment
+from ya_agent_environment import Environment
 
 from ya_agent_sdk._logger import get_logger
 
@@ -35,6 +35,17 @@ _PIL_FORMAT_TO_MEDIA_TYPE: dict[str, ImageMediaType] = {
     "GIF": "image/gif",
     "WEBP": "image/webp",
 }
+_SUPPORTED_IMAGE_MEDIA_TYPES = frozenset(_PIL_FORMAT_TO_MEDIA_TYPE.values())
+
+
+def normalize_image_media_type(data: bytes, media_type: str | None = None) -> ImageMediaType:
+    """Return a supported image media type using content detection first."""
+    detected = detect_image_media_type(data)
+    if detected:
+        return detected
+    if media_type in _SUPPORTED_IMAGE_MEDIA_TYPES:
+        return cast(ImageMediaType, media_type)
+    return "image/jpeg"
 
 
 def detect_image_media_type(data: bytes) -> ImageMediaType | None:
@@ -99,55 +110,19 @@ def get_latest_request_usage(message_history: list[ModelMessage]) -> RequestUsag
     return None
 
 
-def _pydantic_ai_has_native_toolset_instructions() -> bool:
-    """Check if pydantic-ai natively supports AbstractToolset.get_instructions().
-
-    This was added in pydantic-ai v1.74.0 via https://github.com/pydantic/pydantic-ai/pull/4123.
-    When available, the agent graph automatically collects toolset instructions,
-    so we don't need to inject them manually via @agent.instructions.
-    """
-    from importlib.metadata import version
-
-    try:
-        v = version("pydantic-ai-slim")
-        major, minor = (int(x) for x in v.split(".")[:2])
-        return (major, minor) >= (1, 74)
-    except Exception:
-        return False
-
-
-_HAS_NATIVE_TOOLSET_INSTRUCTIONS = _pydantic_ai_has_native_toolset_instructions()
-
-
 def add_toolset_instructions(
     agent: Agent[AgentDepsT, OutputDataT], toolsets: list[AbstractToolset]
 ) -> Agent[AgentDepsT, OutputDataT]:
-    """Add instructions from toolsets to the agent.
+    """Return *agent* unchanged; Pydantic AI owns toolset instruction collection.
 
-    Works with any toolset that implements InstructableToolset protocol
-    (has get_instructions method), including Toolset and BrowserUseToolset.
-
-    Since pydantic-ai v1.74.0, AbstractToolset.get_instructions() is natively
-    supported and the agent graph collects toolset instructions automatically.
-    In that case, this function is a no-op to avoid duplicate injection.
+    ``ya-agent-sdk`` depends on Pydantic AI versions where
+    ``AbstractToolset.get_instructions()`` is native. Keeping this small helper
+    preserves the existing factory call sites without re-injecting or flattening
+    toolset instructions through ``@agent.instructions``. This lets toolsets
+    return ``InstructionPart`` objects directly so static/dynamic cache metadata
+    reaches providers such as Anthropic and Bedrock.
     """
-    if _HAS_NATIVE_TOOLSET_INSTRUCTIONS:
-        return agent
-
-    from ya_agent_sdk.toolsets.base import InstructableToolset, collect_instruction_parts
-
-    @agent.instructions
-    async def _(ctx: RunContext[AgentDepsT]) -> str | None:
-        parts: list[str] = []
-        for toolset in toolsets:
-            if isinstance(toolset, InstructableToolset):
-                instructions = await toolset.get_instructions(ctx)  # type: ignore[arg-type]
-                if instructions:
-                    collect_instruction_parts(instructions, parts)
-        if not parts:
-            return None
-        return "\n".join(parts)
-
+    _ = toolsets
     return agent
 
 
@@ -198,6 +173,28 @@ async def compress_image_data(
         type if the image was already small enough.
     """
     return await run_in_threadpool(_compress_image_data_sync, image_bytes, max_bytes, media_type)
+
+
+async def compress_image_to_model_limit(
+    image_bytes: bytes,
+    max_encoded_bytes: int,
+    media_type: str | None = "image/jpeg",
+) -> tuple[bytes, ImageMediaType]:
+    """Compress an image so its base64-encoded payload fits a model API limit."""
+    normalized_media_type = normalize_image_media_type(image_bytes, media_type)
+    if max_encoded_bytes <= 0:
+        return image_bytes, normalized_media_type
+
+    return await compress_image_data(
+        image_bytes=image_bytes,
+        max_bytes=raw_bytes_limit_for_base64(max_encoded_bytes),
+        media_type=normalized_media_type,
+    )
+
+
+def raw_bytes_limit_for_base64(max_encoded_bytes: int) -> int:
+    """Return the raw-byte budget for a base64-encoded byte limit."""
+    return (max_encoded_bytes // 4) * 3
 
 
 def _compress_image_data_sync(

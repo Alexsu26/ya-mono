@@ -9,6 +9,8 @@ from ya_agent_sdk.context import AgentContext
 from ya_agent_sdk.environment.local import LocalEnvironment
 from ya_agent_sdk.toolsets.skills.toolset import SHARED_SKILLS_DIR_NAME, SkillToolset
 
+from ._instruction_helpers import instruction_text as _instruction_text
+
 
 def _write_skill(skill_dir: Path, name: str, description: str) -> None:
     """Helper to create a SKILL.md file in a skill directory."""
@@ -41,10 +43,11 @@ async def test_extra_dir_names_discovers_shared_skills(tmp_path: Path):
 
             toolset = SkillToolset(extra_dir_names=[SHARED_SKILLS_DIR_NAME])
             instructions = await toolset.get_instructions(mock_ctx)
+            instruction_text = _instruction_text(instructions)
 
             assert instructions is not None
-            assert "shared-tool" in instructions
-            assert "A shared skill" in instructions
+            assert "shared-tool" in instruction_text
+            assert "A shared skill" in instruction_text
 
 
 @pytest.mark.asyncio
@@ -68,7 +71,6 @@ async def test_no_extra_dir_names_ignores_shared_skills(tmp_path: Path):
 
             toolset = SkillToolset()  # No extra_dir_names
             instructions = await toolset.get_instructions(mock_ctx)
-
             assert instructions is None  # No skills found
 
 
@@ -97,10 +99,11 @@ async def test_tool_specific_overrides_shared_within_same_path(tmp_path: Path):
 
             toolset = SkillToolset(extra_dir_names=[SHARED_SKILLS_DIR_NAME])
             instructions = await toolset.get_instructions(mock_ctx)
+            instruction_text = _instruction_text(instructions)
 
             assert instructions is not None
-            assert "Tool-specific version" in instructions
-            assert "Shared version" not in instructions
+            assert "Tool-specific version" in instruction_text
+            assert "Shared version" not in instruction_text
 
 
 @pytest.mark.asyncio
@@ -131,10 +134,11 @@ async def test_project_overrides_user_skills(tmp_path: Path):
 
             toolset = SkillToolset()
             instructions = await toolset.get_instructions(mock_ctx)
+            instruction_text = _instruction_text(instructions)
 
             assert instructions is not None
-            assert "Project version" in instructions
-            assert "User version" not in instructions
+            assert "Project version" in instruction_text
+            assert "User version" not in instruction_text
 
 
 @pytest.mark.asyncio
@@ -171,17 +175,18 @@ async def test_full_priority_chain(tmp_path: Path):
 
             toolset = SkillToolset(extra_dir_names=[SHARED_SKILLS_DIR_NAME])
             instructions = await toolset.get_instructions(mock_ctx)
+            instruction_text = _instruction_text(instructions)
 
             assert instructions is not None
 
             # "alpha" should come from yaacli_user (overrides shared_user)
-            assert "YAACLI user alpha" in instructions
-            assert "Shared user alpha" not in instructions
+            assert "YAACLI user alpha" in instruction_text
+            assert "Shared user alpha" not in instruction_text
 
             # "beta" should come from yaacli_project (highest priority)
-            assert "YAACLI project beta" in instructions
-            assert "Shared project beta" not in instructions
-            assert "YAACLI user beta" not in instructions
+            assert "YAACLI project beta" in instruction_text
+            assert "Shared project beta" not in instruction_text
+            assert "YAACLI user beta" not in instruction_text
 
 
 @pytest.mark.asyncio
@@ -207,15 +212,50 @@ async def test_shared_and_specific_coexist(tmp_path: Path):
 
             toolset = SkillToolset(extra_dir_names=[SHARED_SKILLS_DIR_NAME])
             instructions = await toolset.get_instructions(mock_ctx)
+            instruction_text = _instruction_text(instructions)
 
             assert instructions is not None
-            assert "shared-only" in instructions
-            assert "Only in shared" in instructions
-            assert "specific-only" in instructions
-            assert "Only in specific" in instructions
+            assert "shared-only" in instruction_text
+            assert "Only in shared" in instruction_text
+            assert "specific-only" in instruction_text
+            assert "Only in specific" in instruction_text
 
 
 @pytest.mark.asyncio
 async def test_shared_skills_dir_name_constant():
     """SHARED_SKILLS_DIR_NAME matches the expected convention."""
     assert SHARED_SKILLS_DIR_NAME == ".agents/skills"
+
+
+@pytest.mark.asyncio
+async def test_shared_skill_registers_view_relaxed_patterns(tmp_path: Path):
+    """Shared skill dirs should also register relaxed Markdown view patterns."""
+    from ya_agent_sdk.context import ToolConfig
+    from ya_agent_sdk.toolsets.core.filesystem.view import ViewTool
+
+    project_dir = tmp_path / "project"
+    shared_skill_dir = project_dir / ".agents" / "skills" / "shared-doc"
+    _write_skill(shared_skill_dir, "shared-doc", "Shared docs")
+    (shared_skill_dir / "README.md").write_text("\n".join(f"Line {i}" for i in range(350)), encoding="utf-8")
+
+    async with LocalEnvironment(
+        allowed_paths=[project_dir],
+        default_path=project_dir,
+        tmp_base_dir=tmp_path,
+    ) as env:
+        async with AgentContext(
+            env=env,
+            tool_config=ToolConfig(view_relaxed_line_limit=500, view_relaxed_max_content_chars=100_000),
+        ) as ctx:
+            mock_ctx = MagicMock(spec=RunContext)
+            mock_ctx.deps = ctx
+
+            toolset = SkillToolset(extra_dir_names=[SHARED_SKILLS_DIR_NAME])
+            instructions = await toolset.get_instructions(mock_ctx)
+            assert instructions is not None
+            assert ctx.tool_config.view_relaxed_text_dynamic_patterns
+
+            view_tool = ViewTool()
+            result = await view_tool.call(mock_ctx, file_path=".agents/skills/shared-doc/README.md")
+            assert isinstance(result, str)
+            assert "Line 349" in result

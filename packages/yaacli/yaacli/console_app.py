@@ -13,21 +13,21 @@ import json
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import TracebackType
+from typing import Any, cast
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import FormattedText
-from pydantic_ai import DeferredToolRequests, DeferredToolResults, ToolDenied, UsageLimits
+from pydantic_ai import DeferredToolRequests, DeferredToolResults, ToolDenied
 from rich.table import Table
-from ya_agent_sdk.agents.main import stream_agent
 
-from yaacli.browser import BrowserManager
 from yaacli.config import ConfigManager, YaacliConfig
 from yaacli.console.adapter import ConsoleSession
 from yaacli.console.app import ConsoleApp
 from yaacli.console.prompt import ConsolePrompt
-from yaacli.hooks import emit_context_update
+from yaacli.execution import open_runtime_stream
 from yaacli.logging import get_logger
+from yaacli.model_profiles import build_model_profiles, get_startup_model_profile
 from yaacli.runtime import create_tui_runtime
 
 logger = get_logger(__name__)
@@ -46,7 +46,6 @@ class ConsoleTUI:
     prompt: ConsolePrompt = field(init=False)
     _exit_stack: AsyncExitStack = field(default_factory=AsyncExitStack, init=False)
     _runtime: Any = field(default=None, init=False)
-    _browser: Any = field(default=None, init=False)
     _message_history: list[Any] = field(default_factory=list, init=False)
     _mode: str = field(default="ACT", init=False)
     _approval_session_grants: set[str] = field(default_factory=set, init=False)
@@ -54,14 +53,10 @@ class ConsoleTUI:
     async def __aenter__(self) -> ConsoleTUI:
         await self._exit_stack.__aenter__()
 
-        self._browser = BrowserManager(self.config.browser)
-        await self._exit_stack.enter_async_context(self._browser)
-
         mcp_config = self.config_manager.load_mcp_config()
         self._runtime = create_tui_runtime(
             config=self.config,
             mcp_config=mcp_config,
-            browser_manager=self._browser,
             working_dir=self.working_dir,
             config_dir=self.config_manager.config_dir,
         )
@@ -70,11 +65,9 @@ class ConsoleTUI:
         # Pull active model name for header
         model_name = "(unset)"
         try:
-            from yaacli.runtime import resolve_startup_model_profile
-
-            active_name, _ = resolve_startup_model_profile(self.config)
-            profile = self.config.get_model_profile(active_name)
-            model_name = f"{active_name} ({getattr(profile, 'model', '?')})"
+            profile = get_startup_model_profile(self.config, self.config_manager.config_dir)
+            if profile is not None:
+                model_name = f"{profile.label} ({profile.model})"
         except Exception:
             logger.debug("Could not resolve current model profile for header", exc_info=True)
 
@@ -90,7 +83,7 @@ class ConsoleTUI:
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
-        exc_tb: object,
+        exc_tb: TracebackType | None,
     ) -> None:
         await self._exit_stack.__aexit__(exc_type, exc_val, exc_tb)
 
@@ -183,7 +176,7 @@ class ConsoleTUI:
 
         if name == "model":
             self.app.show_user_prompt(command)
-            profiles = getattr(self.config, "models", None) or {}
+            profiles = {profile.id: profile for profile in build_model_profiles(self.config)}
             grid = Table.grid(padding=(0, 2))
             grid.add_column(style="bold cyan")
             grid.add_column()
@@ -204,7 +197,7 @@ class ConsoleTUI:
             return
 
         self.app.open_turn()
-        session = ConsoleSession(sink=self.app)
+        session = ConsoleSession(sink=cast(Any, self.app))
         try:
             await self._execute_with_hitl(user_prompt, session)
         except asyncio.CancelledError:
@@ -228,22 +221,18 @@ class ConsoleTUI:
         first = True
         result = None
         while True:
-            async with stream_agent(
+            async with open_runtime_stream(
                 self._runtime,
+                self.config,
                 user_prompt=next_input if (first and isinstance(next_input, str)) else None,
                 message_history=self._message_history if first else None,
                 deferred_tool_results=next_input if not isinstance(next_input, str) else None,
-                usage_limits=UsageLimits(request_limit=self.config.general.max_requests),
-                post_node_hook=emit_context_update,
-                resume_on_error=self.config.general.agent_stream_resume_on_error,
-                resume_max_attempts=self.config.general.agent_stream_resume_max_attempts,
-                resume_prompt=self.config.general.agent_stream_resume_prompt,
             ) as stream:
                 await session.stream(stream)
                 # Persist message history once per turn
                 try:
                     if hasattr(stream, "all_messages") and callable(stream.all_messages):
-                        self._message_history = list(stream.all_messages())
+                        self._message_history = list(cast(Any, stream.all_messages()))
                 except Exception:
                     logger.debug("Could not persist message history", exc_info=True)
                 # Final structured output, if any

@@ -56,7 +56,7 @@ def mock_openai_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def clean_env() -> Generator[None, None, None]:
-    """Clean YAACLI_* environment variables."""
+    """Clean YAACLI_* environment variables before and after test."""
     saved_vars: dict[str, str] = {}
     for key in list(os.environ.keys()):
         if key.startswith("YAACLI_"):

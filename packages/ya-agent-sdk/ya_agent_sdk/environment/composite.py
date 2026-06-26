@@ -35,15 +35,16 @@ Example:
 """
 
 import contextlib
-import os
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from y_agent_environment import FileOperationError, FileOperator, FileStat, PathNotAllowedError, TmpFileOperator
-from y_agent_environment.file_operator import DEFAULT_CHUNK_SIZE
+from ya_agent_environment import FileOperationError, FileOperator, FileStat, PathNotAllowedError, TmpFileOperator
+from ya_agent_environment.file_operator import DEFAULT_CHUNK_SIZE
+
+from ya_agent_sdk.environment.virtual_path import VirtualPath, as_virtual_path, normalize_virtual_path
 
 
 class MountBackend(ABC):
@@ -124,15 +125,17 @@ class Mount:
         read_only: If True, write/delete/move/copy-to operations raise errors.
     """
 
-    virtual_path: Path
+    virtual_path: Path | VirtualPath
     backend: MountBackend | FileOperator
     label: str = ""
     read_only: bool = False
     _resolved_backend: MountBackend = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not self.virtual_path.is_absolute():
+        virtual_path = normalize_virtual_path(self.virtual_path)
+        if not virtual_path.is_absolute():
             raise ValueError(f"virtual_path must be absolute, got: {self.virtual_path}")
+        object.__setattr__(self, "virtual_path", virtual_path)
         # Auto-wrap plain FileOperator in LocalMountBackend
         if isinstance(self.backend, MountBackend):
             object.__setattr__(self, "_resolved_backend", self.backend)
@@ -165,7 +168,7 @@ class CompositeFileOperator(FileOperator):
     def __init__(
         self,
         mounts: list[Mount],
-        default_mount: Path | None = None,
+        default_mount: Path | VirtualPath | None = None,
         tmp_dir: Path | None = None,
         tmp_file_operator: TmpFileOperator | None = None,
         instructions_skip_dirs: frozenset[str] | None = None,
@@ -192,7 +195,7 @@ class CompositeFileOperator(FileOperator):
             raise ValueError("At least one mount is required")
 
         self._mounts = mounts
-        default_path = default_mount or mounts[0].virtual_path
+        default_path = normalize_virtual_path(default_mount) if default_mount is not None else mounts[0].virtual_path
 
         super().__init__(
             default_path=default_path,
@@ -210,7 +213,7 @@ class CompositeFileOperator(FileOperator):
         """Return the list of mounts."""
         return list(self._mounts)
 
-    def _find_mount(self, normalized: Path) -> Mount:
+    def _find_mount(self, normalized: VirtualPath) -> Mount:
         """Find mount with longest-prefix match.
 
         Args:
@@ -259,10 +262,10 @@ class CompositeFileOperator(FileOperator):
         if self._default_path is None:
             raise PathNotAllowedError(path, [])
 
-        target = Path(path)
+        target = as_virtual_path(path)
         if not target.is_absolute():
-            target = self._default_path / target
-        normalized = Path(os.path.normpath(target))
+            target = as_virtual_path(self._default_path) / target
+        normalized = normalize_virtual_path(target)
 
         mount = self._find_mount(normalized)
         rel = normalized.relative_to(mount.virtual_path)
@@ -422,35 +425,6 @@ class CompositeFileOperator(FileOperator):
             stream = await src_mount.file_operator.read_bytes_stream(src_rel, chunk_size=self._default_chunk_size)
             await dst_mount.file_operator.write_bytes_stream(dst_rel, stream)
 
-    async def _glob_impl(self, pattern: str) -> list[str]:
-        """Find files matching glob pattern.
-
-        Relative patterns are globbed against the default mount's backend.
-        Absolute patterns are matched to the appropriate mount and globbed there.
-        Results are returned as relative paths for relative patterns, or absolute
-        virtual paths for absolute patterns.
-        """
-        if self._default_path is None:
-            return []
-
-        pattern_path = Path(pattern)
-
-        if pattern_path.is_absolute():
-            # Find mount for absolute pattern
-            normalized = Path(os.path.normpath(pattern_path))
-            try:
-                mount = self._find_mount(normalized)
-            except PathNotAllowedError:
-                return []
-            rel_pattern = str(normalized.relative_to(mount.virtual_path))
-            results = await mount.file_operator.glob(rel_pattern)
-            # Convert backend-relative results to absolute virtual paths
-            return [str(mount.virtual_path / r) for r in results]
-        else:
-            # Relative pattern: glob against default mount only
-            mount = self._find_mount(self._default_path)
-            return await mount.file_operator.glob(pattern)
-
     # --- Streaming overrides ---
 
     async def _read_bytes_stream_impl(
@@ -519,7 +493,7 @@ class CompositeFileOperator(FileOperator):
 
     async def _build_mount_instructions(self, parent: ET.Element, mount: Mount) -> None:
         """Add a single mount's information to context instructions."""
-        from y_agent_environment.utils import generate_filetree
+        from ya_agent_environment.utils import generate_filetree
 
         mb = mount.mount_backend
         mount_elem = ET.SubElement(parent, "mount")

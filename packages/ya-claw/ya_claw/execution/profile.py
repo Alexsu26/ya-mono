@@ -9,6 +9,8 @@ from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from ya_agent_sdk.context import ShellReviewConfig, ShellReviewRiskLevel
+from ya_agent_sdk.environment import ShellSandboxConfig
 from ya_agent_sdk.presets import INHERIT, resolve_model_cfg, resolve_model_settings
 from ya_agent_sdk.subagents.config import SubagentConfig
 
@@ -20,10 +22,16 @@ _DEFAULT_BUILTIN_TOOLSETS = ["core"]
 _DEFAULT_PROFILE_NAME = "default"
 
 
+class ClawShellReviewConfig(ShellReviewConfig):
+    unattended_risk_threshold: ShellReviewRiskLevel | None = None
+
+
 class InlineSubagentDefinition(BaseModel):
     name: str
     description: str
     system_prompt: str
+    tools: list[str] | None = None
+    optional_tools: list[str] | None = None
     model: str | None = None
     model_settings_preset: str | None = None
     model_settings_override: dict[str, Any] | None = None
@@ -39,11 +47,14 @@ class ResolvedProfile:
     model_config: dict[str, Any] | None
     system_prompt: str | None = None
     builtin_toolsets: list[str] = field(default_factory=lambda: list(_DEFAULT_BUILTIN_TOOLSETS))
+    builtin_tool_allowlist: list[str] | None = None
     subagent_configs: list[SubagentConfig] = field(default_factory=list)
     include_builtin_subagents: bool = False
     unified_subagents: bool = False
     need_user_approve_tools: list[str] = field(default_factory=list)
     need_user_approve_mcps: list[str] = field(default_factory=list)
+    shell_review: ClawShellReviewConfig | None = None
+    shell_sandbox: ShellSandboxConfig | None = None
     enabled_mcps: list[str] = field(default_factory=list)
     disabled_mcps: list[str] = field(default_factory=list)
     mcp_servers: dict[str, Any] = field(default_factory=dict)
@@ -103,6 +114,11 @@ class ProfileResolver:
         logger.info("Execution profiles seeded count={} names={}", len(seeded_names), seeded_names)
         return seeded_names
 
+    async def list_enabled_models(self) -> list[str]:
+        async with self._session_factory() as db_session:
+            result = await db_session.execute(select(ProfileRecord.model).where(ProfileRecord.enabled.is_(True)))
+            return [model for model in result.scalars().all() if isinstance(model, str) and model.strip()]
+
     async def _load_profile_record(self, profile_name: str) -> ProfileRecord | None:
         async with self._session_factory() as db_session:
             record = await db_session.get(ProfileRecord, profile_name)
@@ -129,6 +145,8 @@ class ProfileResolver:
             unified_subagents=bool(record.unified_subagents),
             need_user_approve_tools=list(record.need_user_approve_tools or []),
             need_user_approve_mcps=list(record.need_user_approve_mcps or []),
+            shell_review=_resolve_shell_review(record.model_config_override),
+            shell_sandbox=_resolve_shell_sandbox(record.model_config_override),
             enabled_mcps=list(record.enabled_mcps or []),
             disabled_mcps=list(record.disabled_mcps or []),
             mcp_servers=normalize_profile_mcp_servers(record.mcp_servers),
@@ -162,11 +180,41 @@ class ProfileResolver:
                         resolve_model_cfg(inline.model_config_preset),
                         inline.model_config_override,
                     ),
-                    tools=None,
-                    optional_tools=None,
+                    tools=inline.tools,
+                    optional_tools=inline.optional_tools,
                 )
             )
         return resolved_configs
+
+
+def _resolve_shell_review(model_config_override: dict[str, Any] | None) -> ClawShellReviewConfig | None:
+    if not isinstance(model_config_override, dict):
+        return None
+    raw_security = model_config_override.get("security")
+    if isinstance(raw_security, dict) and isinstance(raw_security.get("shell_review"), dict):
+        return _resolve_claw_shell_review_config(raw_security["shell_review"])
+    raw_legacy = model_config_override.get("shell_review")
+    if isinstance(raw_legacy, dict):
+        return _resolve_claw_shell_review_config(raw_legacy)
+    return None
+
+
+def _resolve_shell_sandbox(model_config_override: dict[str, Any] | None) -> ShellSandboxConfig | None:
+    if not isinstance(model_config_override, dict):
+        return None
+    raw_security = model_config_override.get("security")
+    if isinstance(raw_security, dict) and isinstance(raw_security.get("shell_sandbox"), dict):
+        return ShellSandboxConfig.model_validate(raw_security["shell_sandbox"])
+    raw_legacy = model_config_override.get("shell_sandbox")
+    if isinstance(raw_legacy, dict):
+        return ShellSandboxConfig.model_validate(raw_legacy)
+    return None
+
+
+def _resolve_claw_shell_review_config(raw: dict[str, Any]) -> ClawShellReviewConfig:
+    config = dict(raw)
+    config.setdefault("risk_threshold", "extra_high")
+    return ClawShellReviewConfig.model_validate(config)
 
 
 def _resolve_inheritable_model_settings(preset_or_dict: str | dict[str, Any] | None) -> dict[str, Any] | None:
@@ -211,7 +259,7 @@ def _apply_seed_row(record: ProfileRecord, row: dict[str, Any], *, source_checks
     record.model_settings_preset = _normalize_optional_str(row.get("model_settings_preset"))
     record.model_settings_override = _normalize_optional_dict(row.get("model_settings_override"))
     record.model_config_preset = _normalize_optional_str(row.get("model_config_preset"))
-    record.model_config_override = _normalize_optional_dict(row.get("model_config_override"))
+    record.model_config_override = _resolve_seed_model_config_override(row)
     record.system_prompt = _normalize_optional_str(row.get("system_prompt"))
     record.builtin_toolsets = _resolve_seed_builtin_toolsets(row)
     record.subagents = _normalize_optional_dict_list(row.get("subagents")) or []
@@ -229,10 +277,20 @@ def _apply_seed_row(record: ProfileRecord, row: dict[str, Any], *, source_checks
     record.source_checksum = _normalize_optional_str(row.get("source_checksum")) or source_checksum
 
 
-def _resolve_builtin_toolsets(value: Any) -> list[str]:
+def _resolve_builtin_toolsets(value: object) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip() != ""]
     return list(_DEFAULT_BUILTIN_TOOLSETS)
+
+
+def _resolve_seed_model_config_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    override = _normalize_optional_dict(row.get("model_config_override")) or {}
+    security = _normalize_optional_dict(row.get("security"))
+    if security is not None:
+        merged_security = dict(override.get("security") or {}) if isinstance(override.get("security"), dict) else {}
+        merged_security.update(security)
+        override["security"] = merged_security
+    return override or None
 
 
 def _resolve_seed_builtin_toolsets(row: dict[str, Any]) -> list[str]:
@@ -243,20 +301,20 @@ def _resolve_seed_builtin_toolsets(row: dict[str, Any]) -> list[str]:
     return list(_DEFAULT_BUILTIN_TOOLSETS)
 
 
-def _normalize_optional_str(value: Any) -> str | None:
+def _normalize_optional_str(value: object) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip()
     return normalized or None
 
 
-def _normalize_optional_dict(value: Any) -> dict[str, Any] | None:
+def _normalize_optional_dict(value: object) -> dict[str, Any] | None:
     if isinstance(value, dict):
         return dict(value)
     return None
 
 
-def _normalize_optional_str_list(value: Any, *, allow_empty: bool = False) -> list[str] | None:
+def _normalize_optional_str_list(value: object, *, allow_empty: bool = False) -> list[str] | None:
     if not isinstance(value, list):
         return None
     values = [str(item).strip() for item in value if str(item).strip() != ""]
@@ -265,7 +323,7 @@ def _normalize_optional_str_list(value: Any, *, allow_empty: bool = False) -> li
     return None
 
 
-def _normalize_optional_dict_list(value: Any) -> list[dict[str, Any]] | None:
+def _normalize_optional_dict_list(value: object) -> list[dict[str, Any]] | None:
     if not isinstance(value, list):
         return None
     rows = [dict(item) for item in value if isinstance(item, dict)]

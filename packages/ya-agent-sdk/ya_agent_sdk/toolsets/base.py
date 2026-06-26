@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, runtime_checkable
 
 from pydantic import BaseModel
 from pydantic_ai import RunContext
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     pass
 
 AgentDepsT = TypeVar("AgentDepsT", bound=AgentContext, default=AgentContext, contravariant=True)
+ToolCallDynamic: TypeAlias = Any
 
 
 class UserInputPreprocessResult(BaseModel):
@@ -62,8 +63,7 @@ class Instruction(BaseModel):
 class InstructableToolset(Protocol):
     """Protocol for toolsets that provide instructions.
 
-    This enables duck typing for any toolset that has a get_instructions method,
-    allowing add_toolset_instructions() to work with both Toolset and BrowserUseToolset.
+    This enables duck typing for any toolset that has a get_instructions method.
     """
 
     async def get_instructions(
@@ -75,24 +75,24 @@ class InstructableToolset(Protocol):
 
 def collect_instruction_parts(
     instructions: str | InstructionPart | Sequence[str | InstructionPart],
-    parts: list[str],
+    parts: list[str | InstructionPart],
 ) -> None:
-    """Normalize instruction results into a flat list of strings.
+    """Append instruction results without flattening away Pydantic AI metadata.
 
-    Handles the various return types of ``get_instructions`` (plain ``str``,
-    ``InstructionPart``, or a sequence of either) and appends string content
-    to *parts* in place.
+    This mirrors Pydantic AI's ``AbstractToolset.get_instructions`` return
+    contract. Strings stay strings so Pydantic AI can apply its own default
+    semantics, while ``InstructionPart`` objects are appended unchanged so
+    static/dynamic cache metadata survives through wrapper toolsets.
     """
     if isinstance(instructions, str):
-        parts.append(instructions)
+        if instructions.strip():
+            parts.append(instructions)
     elif isinstance(instructions, InstructionPart):
-        parts.append(instructions.content)
+        if instructions.content.strip():
+            parts.append(instructions)
     else:
         for item in instructions:
-            if isinstance(item, InstructionPart):
-                parts.append(item.content)
-            else:
-                parts.append(item)
+            collect_instruction_parts(item, parts)
 
 
 class BaseTool(ABC):
@@ -100,7 +100,7 @@ class BaseTool(ABC):
 
     Subclasses define name, description as class attributes, implement
     the `call` method, and optionally override `get_instruction()` for
-    dynamic instruction generation.
+    instruction generation.
 
     Example:
         class ReadFileTool(BaseTool):
@@ -182,11 +182,11 @@ class BaseTool(ABC):
     async def get_instruction(self, ctx: RunContext[AgentContext]) -> str | Instruction | None:
         """Get instruction for this tool.
 
-        Override this method to provide dynamic instructions based on context.
-        Default implementation returns None (no instruction).
+        Override this method to provide instructions. Default implementation
+        returns None (no instruction).
 
         Returns:
-            - str: Plain instruction text (uses tool name as group)
+            - str: Plain static instruction text (uses tool name as group)
             - Instruction: Instruction with explicit group for deduplication
             - None: No instruction for this tool
 
@@ -208,7 +208,13 @@ class BaseTool(ABC):
         return None
 
     @abstractmethod
-    async def call(self, ctx: RunContext[AgentContext], /, *args: Any, **kwargs: Any) -> Any:
+    async def call(
+        self,
+        ctx: RunContext[AgentContext],
+        /,
+        *args: ToolCallDynamic,
+        **kwargs: ToolCallDynamic,
+    ) -> ToolCallDynamic:
         """Execute the tool logic.
 
         Subclasses should override this method with their specific parameter signature.
@@ -227,7 +233,7 @@ class BaseTool(ABC):
     async def process_user_input(
         self,
         ctx: AgentContext,
-        user_input: Any,
+        user_input: object,
     ) -> UserInputPreprocessResult | None:
         """Process user input for HITL scenarios.
 
@@ -247,7 +253,7 @@ class BaseTool(ABC):
         """
         return None
 
-    def get_deferred_metadata(self, ctx: RunContext[AgentContext]) -> Any:
+    def get_deferred_metadata(self, ctx: RunContext[AgentContext]) -> object:
         """Get HITL metadata for the tool call, if applicable."""
         return ctx.tool_call_metadata
 
@@ -259,9 +265,11 @@ class BaseToolset(AbstractToolset[AgentDepsT], ABC):
 
     Example:
         class MyToolset(BaseToolset):
-            async def get_instructions(self, ctx: RunContext[AgentContext]) -> str | list[str] | None:
+            async def get_instructions(
+                self, ctx: RunContext[AgentContext]
+            ) -> str | InstructionPart | Sequence[str | InstructionPart] | None:
                 content = await self._load_instructions(ctx)
-                return content
+                return InstructionPart(content=content, dynamic=False)
     """
 
     @property
@@ -276,15 +284,20 @@ class BaseToolset(AbstractToolset[AgentDepsT], ABC):
         """
         return None
 
-    async def get_instructions(self, ctx: RunContext[AgentDepsT]) -> str | list[str] | None:
+    async def get_instructions(
+        self, ctx: RunContext[AgentDepsT]
+    ) -> str | InstructionPart | Sequence[str | InstructionPart] | None:
         """Get instructions to inject into the system prompt.
 
-        Override this method to provide tool-specific instructions.
+        This matches Pydantic AI's ``AbstractToolset.get_instructions`` return
+        type. Plain strings are treated as dynamic by Pydantic AI; return
+        ``InstructionPart(content=..., dynamic=False)`` for cacheable static
+        instruction blocks.
 
         Args:
             ctx: The run context containing runtime information.
 
         Returns:
-            Instruction string, list of strings, or None.
+            Instruction string, ``InstructionPart``, sequence of either, or None.
         """
         return None

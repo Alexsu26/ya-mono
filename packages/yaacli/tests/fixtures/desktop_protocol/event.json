@@ -1,0 +1,12 @@
+{
+  "event": "text.delta",
+  "payload": {
+    "delta": "hello"
+  },
+  "protocol_version": 1,
+  "run_id": "run-1",
+  "sequence": 4,
+  "session_id": "session-1",
+  "type": "event",
+  "workspace_id": "workspace-1"
+}

@@ -5,6 +5,7 @@ All file operations use the FileOperator abstraction for remote filesystem suppo
 """
 
 import inspect
+import re
 from functools import cache
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
@@ -12,11 +13,13 @@ from typing import Annotated, Any, Literal, cast
 from pydantic import Field
 from pydantic_ai import BinaryContent, ImageUrl, RunContext, ToolReturn, VideoUrl
 from pydantic_ai.messages import AudioUrl
-from y_agent_environment import FileOperator
+from ya_agent_environment import FileOperator
 
 from ya_agent_sdk._logger import get_logger
 from ya_agent_sdk.context import AgentContext
+from ya_agent_sdk.context.agent import MediaToUrlHook
 from ya_agent_sdk.toolsets.core.base import BaseTool
+from ya_agent_sdk.toolsets.core.filesystem._search import match_glob
 from ya_agent_sdk.toolsets.core.filesystem._types import (
     ViewMetadata,
     ViewReadingParams,
@@ -24,7 +27,12 @@ from ya_agent_sdk.toolsets.core.filesystem._types import (
     ViewTruncationInfo,
 )
 from ya_agent_sdk.toolsets.core.filesystem._utils import is_binary_file
-from ya_agent_sdk.utils import detect_image_media_type, run_in_threadpool
+from ya_agent_sdk.utils import (
+    compress_image_to_model_limit,
+    detect_image_media_type,
+    raw_bytes_limit_for_base64,
+    run_in_threadpool,
+)
 
 logger = get_logger(__name__)
 
@@ -125,7 +133,9 @@ class ViewTool(BaseTool):
     name = "view"
     description = (
         "Read files from local filesystem. Supports text, images (PNG/JPEG/WebP), videos (MP4/WebM/MOV), "
-        "and audio (MP3/WAV/OGG). For PDF files, use `pdf_convert` tool instead."
+        "and audio (MP3/WAV/OGG). Use `instructions` for focused image, video, or audio analysis. "
+        "Call again with narrower instructions to inspect unclear, omitted, or high-detail media regions. "
+        "For PDF files, use `pdf_convert` tool instead."
     )
 
     def is_available(self, ctx: RunContext[AgentContext]) -> bool:
@@ -182,6 +192,47 @@ class ViewTool(BaseTool):
     # --- File reading methods (async, using FileOperator) ---
 
     @staticmethod
+    def _normalize_match_path(path: str) -> str:
+        """Normalize an agent-facing path for pattern matching without resolving it."""
+        normalized = path.replace("\\", "/")
+        while "//" in normalized:
+            normalized = normalized.replace("//", "/")
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized.rstrip("/")
+
+    @classmethod
+    def _matches_relaxed_text_pattern(cls, match_paths: tuple[str, ...], pattern: str) -> bool:
+        """Return True if any normalized path candidate matches a relaxed text view pattern."""
+        pattern = pattern.strip()
+        if not pattern:
+            return False
+
+        if pattern.startswith("re:"):
+            try:
+                regex = re.compile(pattern[3:])
+            except re.error:
+                logger.warning("Invalid view relaxed text regex pattern ignored: %s", pattern)
+                return False
+            return any(regex.search(match_path) is not None for match_path in match_paths)
+
+        return any(match_glob(match_path, pattern) for match_path in match_paths)
+
+    @classmethod
+    def _uses_relaxed_text_limits(
+        cls,
+        ctx: RunContext[AgentContext],
+        file_operator: FileOperator,
+        file_path: str,
+    ) -> bool:
+        """Check whether a text file should use relaxed view limits."""
+        match_paths = file_operator.get_path_match_candidates(file_path)
+        return any(
+            cls._matches_relaxed_text_pattern(match_paths, pattern)
+            for pattern in ctx.deps.tool_config.iter_view_relaxed_text_patterns()
+        )
+
+    @staticmethod
     def _format_size(size_bytes: int) -> str:
         """Format byte size into a human-readable string."""
         if size_bytes < 1024:
@@ -210,7 +261,7 @@ class ViewTool(BaseTool):
 
     async def _maybe_convert_media_to_url(
         self,
-        hook: Any,
+        hook: MediaToUrlHook,
         ctx: RunContext[AgentContext],
         data: bytes,
         media_type: str,
@@ -236,6 +287,7 @@ class ViewTool(BaseTool):
         image_data: bytes,
         media_type: str,
         image_url: str | None,
+        instructions: str | None,
     ) -> str:
         """Describe an image via the fallback image-understanding agent."""
         try:
@@ -248,10 +300,11 @@ class ViewTool(BaseTool):
                 model = tool_config.image_understanding_model
                 model_settings = tool_config.image_understanding_model_settings
 
-            description, internal_usage = await get_image_description(
+            description, model_id, usage = await get_image_description(
                 image_url=image_url,
                 image_data=None if image_url else image_data,
                 media_type=media_type,
+                instruction=instructions,
                 model=model,
                 model_settings=model_settings,
                 model_wrapper=ctx.deps.model_wrapper,
@@ -259,8 +312,14 @@ class ViewTool(BaseTool):
             )
 
             if ctx.tool_call_id:
-                ctx.deps.add_extra_usage(
-                    agent="image_understanding", internal_usage=internal_usage, uuid=ctx.tool_call_id
+                ctx.deps.update_usage_snapshot_entry(
+                    agent_id="image_understanding",
+                    agent_name="image_understanding",
+                    model_id=model_id,
+                    usage=usage,
+                    source="image_understanding",
+                    usage_id=ctx.tool_call_id,
+                    ledger_key=ctx.tool_call_id,
                 )
 
             return f"Image description (via image analysis):\n{description}"
@@ -275,6 +334,7 @@ class ViewTool(BaseTool):
         video_data: bytes,
         media_type: str,
         video_url: str | None,
+        instructions: str | None,
     ) -> str:
         """Describe a video via the fallback video-understanding agent."""
         try:
@@ -287,10 +347,11 @@ class ViewTool(BaseTool):
                 model = tool_config.video_understanding_model
                 model_settings = tool_config.video_understanding_model_settings
 
-            description, internal_usage = await get_video_description(
+            description, model_id, usage = await get_video_description(
                 video_url=video_url,
                 video_data=None if video_url else video_data,
                 media_type=media_type,
+                instruction=instructions,
                 model=model,
                 model_settings=model_settings,
                 model_wrapper=ctx.deps.model_wrapper,
@@ -298,8 +359,14 @@ class ViewTool(BaseTool):
             )
 
             if ctx.tool_call_id:
-                ctx.deps.add_extra_usage(
-                    agent="video_understanding", internal_usage=internal_usage, uuid=ctx.tool_call_id
+                ctx.deps.update_usage_snapshot_entry(
+                    agent_id="video_understanding",
+                    agent_name="video_understanding",
+                    model_id=model_id,
+                    usage=usage,
+                    source="video_understanding",
+                    usage_id=ctx.tool_call_id,
+                    ledger_key=ctx.tool_call_id,
                 )
 
             return f"Video description (via video understanding agent):\n{description}"
@@ -314,6 +381,7 @@ class ViewTool(BaseTool):
         audio_data: bytes,
         media_type: str,
         audio_url: str | None,
+        instructions: str | None,
     ) -> str:
         """Describe audio via the fallback audio-understanding agent."""
         try:
@@ -326,10 +394,11 @@ class ViewTool(BaseTool):
                 model = tool_config.audio_understanding_model
                 model_settings = tool_config.audio_understanding_model_settings
 
-            description, internal_usage = await get_audio_description(
+            description, model_id, usage = await get_audio_description(
                 audio_url=audio_url,
                 audio_data=None if audio_url else audio_data,
                 media_type=media_type,
+                instruction=instructions,
                 model=model,
                 model_settings=model_settings,
                 model_wrapper=ctx.deps.model_wrapper,
@@ -337,8 +406,14 @@ class ViewTool(BaseTool):
             )
 
             if ctx.tool_call_id:
-                ctx.deps.add_extra_usage(
-                    agent="audio_understanding", internal_usage=internal_usage, uuid=ctx.tool_call_id
+                ctx.deps.update_usage_snapshot_entry(
+                    agent_id="audio_understanding",
+                    agent_name="audio_understanding",
+                    model_id=model_id,
+                    usage=usage,
+                    source="audio_understanding",
+                    usage_id=ctx.tool_call_id,
+                    ledger_key=ctx.tool_call_id,
                 )
 
             return f"Audio description (via audio understanding agent):\n{description}"
@@ -353,24 +428,74 @@ class ViewTool(BaseTool):
         media_url: str | None,
         data: bytes,
         media_type: str,
+        instructions: str | None,
     ) -> ToolReturn:
         """Build the ToolReturn payload for inline media."""
+        return_value = f"The {kind} is attached in the user message."
+        if instructions and instructions.strip():
+            return_value = f"{return_value}\n\nAnalysis instructions:\n{instructions.strip()}"
+
         if kind == "image":
             content = [ImageUrl(url=media_url)] if media_url else [BinaryContent(data=data, media_type=media_type)]
-            return ToolReturn(return_value="The image is attached in the user message.", content=content)
+            return ToolReturn(return_value=return_value, content=content)
 
         if kind == "audio":
             content = [AudioUrl(url=media_url)] if media_url else [BinaryContent(data=data, media_type=media_type)]
-            return ToolReturn(return_value="The audio is attached in the user message.", content=content)
+            return ToolReturn(return_value=return_value, content=content)
 
         content = [VideoUrl(url=media_url)] if media_url else [BinaryContent(data=data, media_type=media_type)]
-        return ToolReturn(return_value="The video is attached in the user message.", content=content)
+        return ToolReturn(return_value=return_value, content=content)
+
+    async def _compress_image_for_model_limit(
+        self,
+        ctx: RunContext[AgentContext],
+        image_data: bytes,
+        media_type: str,
+        *,
+        source: str,
+    ) -> tuple[bytes, str] | str:
+        """Compress inline image data to the configured model API image limit."""
+        max_encoded_bytes = ctx.deps.model_cfg.max_image_bytes if ctx.deps.model_cfg else 0
+        if max_encoded_bytes <= 0:
+            return image_data, media_type
+
+        max_raw_bytes = raw_bytes_limit_for_base64(max_encoded_bytes)
+        if len(image_data) <= max_raw_bytes:
+            return image_data, media_type
+
+        try:
+            compressed_data, compressed_media_type = await compress_image_to_model_limit(
+                image_data,
+                max_encoded_bytes=max_encoded_bytes,
+                media_type=media_type,
+            )
+        except Exception:
+            logger.exception("Failed to compress image from %s before inlining", source)
+            return (
+                f"Error: Image from {source} could not be compressed for inline model input. "
+                "Try resizing or converting it to a smaller format first."
+            )
+
+        if len(compressed_data) > max_raw_bytes:
+            return (
+                f"Error: Image from {source} could not be compressed below the {max_encoded_bytes} byte API limit "
+                "after accounting for base64 encoding. Try resizing or converting it to a smaller format first."
+            )
+
+        logger.info(
+            "Compressed image from %s from %d bytes to %d bytes before inlining",
+            source,
+            len(image_data),
+            len(compressed_data),
+        )
+        return compressed_data, compressed_media_type
 
     async def _read_image_with_fallback(
         self,
         file_operator: FileOperator,
         file_path: str,
         ctx: RunContext[AgentContext],
+        instructions: str | None,
     ) -> str | ToolReturn:
         """Read image file, falling back to description if vision not supported."""
         if error := await self._check_inline_size(
@@ -399,21 +524,31 @@ class ViewTool(BaseTool):
                 log_name="image_to_url_hook",
             )
 
+        inline_data = image_data
+        inline_media_type = media_type
+        if image_url is None:
+            compressed = await self._compress_image_for_model_limit(ctx, image_data, media_type, source=file_path)
+            if isinstance(compressed, str):
+                return compressed
+            inline_data, inline_media_type = compressed
+
         if ctx.deps.model_cfg.has_vision:
             return self._build_inline_media_return(
                 kind="image",
                 media_url=image_url,
-                data=image_data,
-                media_type=media_type,
+                data=inline_data,
+                media_type=inline_media_type,
+                instructions=instructions,
             )
 
-        return await self._describe_image(ctx, file_path, image_data, media_type, image_url)
+        return await self._describe_image(ctx, file_path, inline_data, inline_media_type, image_url, instructions)
 
     async def _read_video_with_fallback(
         self,
         file_operator: FileOperator,
         file_path: str,
         ctx: RunContext[AgentContext],
+        instructions: str | None,
     ) -> str | ToolReturn:
         """Read video file, falling back to video understanding agent if not supported."""
         if error := await self._check_inline_size(
@@ -443,15 +578,17 @@ class ViewTool(BaseTool):
                 media_url=video_url,
                 data=video_data,
                 media_type=media_type,
+                instructions=instructions,
             )
 
-        return await self._describe_video(ctx, file_path, video_data, media_type, video_url)
+        return await self._describe_video(ctx, file_path, video_data, media_type, video_url, instructions)
 
     async def _read_audio_with_fallback(
         self,
         file_operator: FileOperator,
         file_path: str,
         ctx: RunContext[AgentContext],
+        instructions: str | None,
     ) -> str | ToolReturn:
         """Read audio file, falling back to audio understanding agent if not supported."""
         if error := await self._check_inline_size(
@@ -481,9 +618,10 @@ class ViewTool(BaseTool):
                 media_url=audio_url,
                 data=audio_data,
                 media_type=media_type,
+                instructions=instructions,
             )
 
-        return await self._describe_audio(ctx, file_path, audio_data, media_type, audio_url)
+        return await self._describe_audio(ctx, file_path, audio_data, media_type, audio_url, instructions)
 
     def _build_text_metadata_response(
         self,
@@ -546,7 +684,31 @@ class ViewTool(BaseTool):
         """Read text file with pagination and truncation support."""
         stat = await file_operator.stat(file_path)
         file_size = stat["size"]
-        max_text_file_size = ctx.deps.tool_config.view_max_text_file_size
+
+        # Binary/media payloads must never receive relaxed text limits. This check
+        # is intentionally before relaxed limit selection; it only reads a small
+        # prefix and keeps pattern-based relaxation text-only.
+        if await is_binary_file(file_operator, file_path):
+            return (
+                f"Error: {file_path} appears to be a binary file. "
+                f"Use appropriate tools (e.g. `pdf_convert` for PDFs, `xxd` for hex dumps) instead."
+            )
+
+        relaxed_limits = self._uses_relaxed_text_limits(ctx, file_operator, file_path)
+        max_text_file_size = (
+            ctx.deps.tool_config.view_relaxed_text_file_size
+            if relaxed_limits
+            else ctx.deps.tool_config.view_max_text_file_size
+        )
+        if relaxed_limits and line_limit == 300:
+            line_limit = ctx.deps.tool_config.view_relaxed_line_limit
+        if relaxed_limits and max_line_length == 2000:
+            max_line_length = ctx.deps.tool_config.view_relaxed_max_line_length
+        max_content_chars = (
+            ctx.deps.tool_config.view_relaxed_max_content_chars
+            if relaxed_limits
+            else ctx.deps.tool_config.view_max_content_chars
+        )
 
         if file_size > max_text_file_size:
             return {
@@ -559,13 +721,13 @@ class ViewTool(BaseTool):
             }
 
         # Safe to read in one shot: stat check above guarantees bounded size
-        if await is_binary_file(file_operator, file_path):
+        try:
+            full_content = await file_operator.read_file(file_path)
+        except UnicodeDecodeError:
             return (
-                f"Error: {file_path} appears to be a binary file. "
+                f"Error: {file_path} could not be decoded as text. "
                 f"Use appropriate tools (e.g. `pdf_convert` for PDFs, `xxd` for hex dumps) instead."
             )
-
-        full_content = await file_operator.read_file(file_path)
         all_lines = full_content.splitlines(keepends=True)
         total_lines = len(all_lines)
         total_chars = len(full_content)
@@ -584,8 +746,8 @@ class ViewTool(BaseTool):
             processed_lines.append(line)
 
         content = "".join(processed_lines)
-        if len(content) > 60000:
-            content = content[:60000] + "\n... (content truncated)"
+        if len(content) > max_content_chars:
+            content = content[:max_content_chars] + "\n... (content truncated)"
             content_truncated = True
 
         line_offset = start_index
@@ -638,6 +800,17 @@ class ViewTool(BaseTool):
                 default=2000,
             ),
         ] = 2000,
+        instructions: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional analysis instructions for image, video, or audio files. Use this for focused OCR, "
+                    "UI review, transcription, timestamped summaries, speaker identification, or similar media analysis. "
+                    "Call view again with narrower instructions to inspect unclear, omitted, or high-detail media regions."
+                ),
+                default=None,
+            ),
+        ] = None,
     ) -> str | dict[str, Any] | ToolReturn:
         """Read a file from the filesystem."""
         file_operator = cast(FileOperator, ctx.deps.file_operator)
@@ -649,13 +822,13 @@ class ViewTool(BaseTool):
             return f"Error: Path is a directory, not a file: {file_path}"
 
         if self._is_image_file(file_path):
-            return await self._read_image_with_fallback(file_operator, file_path, ctx)
+            return await self._read_image_with_fallback(file_operator, file_path, ctx, instructions)
 
         if self._is_video_file(file_path):
-            return await self._read_video_with_fallback(file_operator, file_path, ctx)
+            return await self._read_video_with_fallback(file_operator, file_path, ctx, instructions)
 
         if self._is_audio_file(file_path):
-            return await self._read_audio_with_fallback(file_operator, file_path, ctx)
+            return await self._read_audio_with_fallback(file_operator, file_path, ctx, instructions)
 
         return await self._read_text_file(ctx, file_operator, file_path, line_offset, line_limit, max_line_length)
 

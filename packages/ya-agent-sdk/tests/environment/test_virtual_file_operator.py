@@ -6,8 +6,9 @@ These tests do NOT require Docker and should run in all CI environments.
 from pathlib import Path
 
 import pytest
-from y_agent_environment import FileOperationError, PathNotAllowedError
+from ya_agent_environment import FileOperationError, PathNotAllowedError
 from ya_agent_sdk.environment.local import VirtualLocalFileOperator, VirtualMount
+from ya_agent_sdk.environment.virtual_path import normalize_virtual_path
 
 # --- VirtualMount Tests ---
 
@@ -34,8 +35,8 @@ def test_virtual_file_operator_init(tmp_path: Path) -> None:
         mounts=[VirtualMount(tmp_path, Path("/workspace"))],
     )
     assert op._mounts[0].host_path == tmp_path
-    assert op._mounts[0].virtual_path == Path("/workspace")
-    assert op._default_path == Path("/workspace")
+    assert op._mounts[0].virtual_path == normalize_virtual_path("/workspace")
+    assert op._default_path == normalize_virtual_path("/workspace")
 
 
 def test_virtual_file_operator_empty_mounts() -> None:
@@ -63,7 +64,7 @@ def test_virtual_file_operator_custom_default_path(tmp_path: Path) -> None:
         ],
         default_virtual_path=Path("/workspace/b"),
     )
-    assert op._default_path == Path("/workspace/b")
+    assert op._default_path == normalize_virtual_path("/workspace/b")
 
 
 async def test_virtual_file_operator_read_write(tmp_path: Path) -> None:
@@ -166,29 +167,6 @@ async def test_virtual_file_operator_copytree_preserves_symlinks(tmp_path: Path)
     assert (dst_dir / "escape_link").is_symlink()
 
 
-async def test_virtual_file_operator_glob_filters_unmapped_symlinks(tmp_path: Path) -> None:
-    """Should filter out glob results that resolve outside mount boundaries."""
-    mount_root = tmp_path / "workspace"
-    mount_root.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (outside / "leaked.py").write_text("secret")
-
-    # Create normal file and a symlink pointing outside
-    (mount_root / "normal.py").write_text("ok")
-    (mount_root / "escape_link").symlink_to(outside)
-
-    op = VirtualLocalFileOperator(
-        mounts=[VirtualMount(mount_root, Path("/workspace"))],
-    )
-
-    results = await op.glob("*.py")
-    names = {Path(r).name for r in results}
-    assert "normal.py" in names
-    # Should NOT contain files from outside the mount
-    assert "leaked.py" not in names
-
-
 async def test_virtual_file_operator_exists(tmp_path: Path) -> None:
     """Should check existence through virtual paths."""
     op = VirtualLocalFileOperator(
@@ -216,22 +194,6 @@ async def test_virtual_file_operator_list_dir(tmp_path: Path) -> None:
     assert "a.txt" in entries
     assert "b.txt" in entries
     assert "subdir" in entries
-
-
-async def test_virtual_file_operator_glob(tmp_path: Path) -> None:
-    """Should glob against host filesystem, return relative paths."""
-    op = VirtualLocalFileOperator(
-        mounts=[VirtualMount(tmp_path, Path("/workspace"))],
-    )
-
-    (tmp_path / "file1.py").write_text("x")
-    (tmp_path / "file2.py").write_text("y")
-    (tmp_path / "file3.txt").write_text("z")
-
-    results = await op.glob("*.py")
-    assert len(results) == 2
-    names = {Path(r).name for r in results}
-    assert names == {"file1.py", "file2.py"}
 
 
 async def test_virtual_file_operator_stat(tmp_path: Path) -> None:
@@ -399,26 +361,3 @@ async def test_virtual_file_operator_multi_mount_longest_prefix(tmp_path: Path) 
     # /workspace/other.txt should go to host_root
     await op.write_file("/workspace/other.txt", "root mount")
     assert (host_root / "other.txt").read_text() == "root mount"
-
-
-async def test_virtual_file_operator_multi_mount_glob(tmp_path: Path) -> None:
-    """Should glob within the default mount for relative patterns."""
-    host_a = tmp_path / "a"
-    host_b = tmp_path / "b"
-    host_a.mkdir()
-    host_b.mkdir()
-    (host_a / "file1.py").write_text("a")
-    (host_b / "file2.py").write_text("b")
-
-    op = VirtualLocalFileOperator(
-        mounts=[
-            VirtualMount(host_a, Path("/workspace/a")),
-            VirtualMount(host_b, Path("/workspace/b")),
-        ],
-        default_virtual_path=Path("/workspace/a"),
-    )
-
-    # Relative glob searches default mount
-    results = await op.glob("*.py")
-    assert len(results) == 1
-    assert "file1.py" in results[0]

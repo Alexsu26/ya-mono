@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import urllib.request
 from typing import Any
 
-from y_agent_environment import Environment
+from ya_agent_environment import Environment
 from ya_agent_sdk.context import AgentContext
 from ya_claw.toolsets.session import (
     CLAW_SELF_CLIENT_KEY,
     ClawSelfClient,
     GetRunTraceTool,
     ListSessionTurnsTool,
+    SelfSessionClient,
 )
 
 
@@ -41,8 +43,14 @@ class FakeSelfClient:
     def get_toolsets(self) -> list[Any]:
         return []
 
-    async def list_session_turns(self, *, limit: int, before_sequence_no: int | None) -> dict[str, Any]:
-        self.turn_calls.append({"limit": limit, "before_sequence_no": before_sequence_no})
+    async def list_session_turns(
+        self,
+        *,
+        limit: int,
+        before_sequence_no: int | None,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        self.turn_calls.append({"limit": limit, "before_sequence_no": before_sequence_no, "cursor": cursor})
         return {
             "session_id": self.session_id,
             "limit": limit,
@@ -66,7 +74,6 @@ class FakeSelfClient:
                         },
                     ],
                     "output_text": "o" * 5000,
-                    "output_summary": "summary",
                     "created_at": "2026-04-25T00:00:00Z",
                     "committed_at": "2026-04-25T00:00:01Z",
                 }
@@ -99,7 +106,7 @@ class FakeSelfClient:
         }
 
 
-def _context_with_client(client: Any) -> FakeRunContext:
+def _context_with_client(client: SelfSessionClient) -> FakeRunContext:
     env = EmptyEnvironment()
     ctx = AgentContext(agent_id="main", env=env)
     assert ctx.resources is not None
@@ -127,7 +134,7 @@ async def test_list_session_turns_trims_output_and_omits_binary_data() -> None:
     )
 
     payload = json.loads(result)
-    assert client.turn_calls == [{"limit": 50, "before_sequence_no": 4}]
+    assert client.turn_calls == [{"limit": 50, "before_sequence_no": 4, "cursor": None}]
     assert payload["session_id"] == "session-1"
     turn = payload["turns"][0]
     assert turn["run_id"] == "run-1"
@@ -201,7 +208,7 @@ def test_claw_self_client_builds_session_scoped_authorized_requests(monkeypatch)
         def read(self) -> bytes:
             return json.dumps({"session_id": "session-1", "turns": []}).encode("utf-8")
 
-    def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
+    def fake_urlopen(request: urllib.request.Request, timeout: float) -> FakeResponse:
         seen["url"] = request.full_url
         seen["authorization"] = request.headers.get("Authorization")
         seen["timeout"] = timeout

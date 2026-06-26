@@ -13,7 +13,7 @@ from rich.cells import cell_len
 from rich.console import Console as RichConsole
 from rich.console import Group, RenderableType
 from rich.segment import Segments
-from rich.text import Text
+from rich.text import Span, Text
 from textual.app import ComposeResult
 from textual.containers import Container
 from textual.reactive import reactive
@@ -22,7 +22,7 @@ from textual.widgets import Static, TextArea
 from yaacli.console.design import pad_cells, truncate_cells
 from yaacli.console.glyphs import GLYPHS, SPINNER_FRAMES
 from yaacli.console.header import HeaderInfo, render_header
-from yaacli.console.theme import build_theme
+from yaacli.console.theme import ThemeName, build_theme
 
 _IGNORED_PATH_NAMES = {
     ".git",
@@ -115,7 +115,12 @@ class SlashArgumentItem:
     completion_only: bool = True
 
 
-def _render_themed(renderable: RenderableType, *, width: int = 200) -> Segments:
+def _render_themed(
+    renderable: RenderableType,
+    *,
+    width: int = 200,
+    theme_name: ThemeName = "dark",
+) -> Segments:
     """Resolve theme styles by rendering through a private Rich Console.
 
     Textual's ``Static.update()`` parses style names as colors, which breaks
@@ -124,12 +129,33 @@ def _render_themed(renderable: RenderableType, *, width: int = 200) -> Segments:
     Segments — Textual treats Segments as opaque and renders them verbatim.
     """
     console = RichConsole(
-        theme=build_theme(),
+        theme=build_theme(theme_name),
         force_terminal=True,
         color_system="truecolor",
         width=width,
     )
     return Segments(list(console.render(renderable)))
+
+
+def _resolve_themed_text(
+    text: Text,
+    *,
+    theme_name: ThemeName = "dark",
+) -> Text:
+    """Resolve semantic Rich styles while preserving a Text renderable."""
+    console = RichConsole(theme=build_theme(theme_name), color_system="truecolor")
+    resolved = text.copy()
+    if isinstance(resolved.style, str):
+        resolved.style = console.get_style(resolved.style)
+    resolved.spans = [
+        Span(
+            span.start,
+            span.end,
+            console.get_style(span.style) if isinstance(span.style, str) else span.style,
+        )
+        for span in resolved.spans
+    ]
+    return resolved
 
 
 class HeaderBar(Static):
@@ -140,18 +166,28 @@ class HeaderBar(Static):
         dock: top;
         height: 1;
         padding: 0 1;
-        background: #171a23;
-        color: #d8dee9;
+        background: $surface;
+        color: $foreground;
     }
     """
 
     info: reactive[HeaderInfo | None] = reactive(None)
+    theme_name: reactive[ThemeName] = reactive("dark")
 
     def watch_info(self, info: HeaderInfo | None) -> None:
         if info is None:
             self.update(Text(""))
         else:
-            self.update(_render_themed(render_header(info), width=self.size.width or 200))
+            self.update(
+                _render_themed(
+                    render_header(info),
+                    width=self.size.width or 200,
+                    theme_name=self.theme_name,
+                )
+            )
+
+    def watch_theme_name(self, _value: ThemeName) -> None:
+        self.watch_info(self.info)
 
 
 class FooterHint(Static):
@@ -169,8 +205,8 @@ class FooterHint(Static):
         dock: bottom;
         height: 1;
         padding: 0 1;
-        background: #171a23;
-        color: #6f778a;
+        background: $surface;
+        color: $foreground-muted;
     }
     """
 
@@ -180,6 +216,7 @@ class FooterHint(Static):
     context_pct: reactive[float] = reactive(0.0)
     cost_str: reactive[str] = reactive("")
     spinner_frame: reactive[int] = reactive(0)
+    theme_name: reactive[ThemeName] = reactive("dark")
 
     def watch_mode(self, _value: str) -> None:
         self.refresh_text()
@@ -201,6 +238,9 @@ class FooterHint(Static):
         if self.state == "working":
             self.refresh_text()
 
+    def watch_theme_name(self, _value: ThemeName) -> None:
+        self.refresh_text()
+
     def on_mount(self) -> None:
         self.refresh_text()
         # 10 Hz spinner tick when working.
@@ -214,22 +254,22 @@ class FooterHint(Static):
         # Build left and right halves; pad between with spaces sized to fill.
         right = Text()
         if self.model_label:
-            right.append(truncate_cells(self.model_label, 28), style="bold #aeb6c8")
-            right.append("  ·  ", style="#6f778a")
+            right.append(truncate_cells(self.model_label, 28), style="console.header.model")
+            right.append("  ·  ", style="console.meta")
         if self.context_pct > 0:
-            right.append(f"{self.context_pct:.0f}%", style="#6f778a")
-            right.append("  ·  ", style="#6f778a")
+            right.append(f"{self.context_pct:.0f}%", style="console.meta")
+            right.append("  ·  ", style="console.meta")
         if self.cost_str:
-            right.append(self.cost_str, style="#6f778a")
-            right.append("  ·  ", style="#6f778a")
-        mode_style = "bold #8bd5a4" if self.mode.upper() == "ACT" else "bold #7aa2f7"
+            right.append(self.cost_str, style="console.meta")
+            right.append("  ·  ", style="console.meta")
+        mode_style = "console.mode.act" if self.mode.upper() == "ACT" else "console.mode.plan"
         right.append(self.mode.upper(), style=mode_style)
-        right.append(" · ", style="#6f778a")
+        right.append(" · ", style="console.meta")
         if self.state == "working":
             spin = SPINNER_FRAMES[self.spinner_frame % len(SPINNER_FRAMES)]
-            right.append(f"working {spin}", style="#7dcfff")
+            right.append(f"working {spin}", style="console.footer.working")
         else:
-            right.append("ready", style="#9ece6a")
+            right.append("ready", style="console.footer.ready")
 
         width = self.size.width or 80
         right_len = right.cell_len
@@ -243,7 +283,7 @@ class FooterHint(Static):
             (option for option in hint_options if cell_len(option) <= available_left),
             truncate_cells(hint_options[-1], available_left),
         )
-        left = Text(hint, style="#6f778a")
+        left = Text(hint, style="console.footer.hint")
 
         # Compute padding to push right half to the far edge.
         left_len = left.cell_len
@@ -252,7 +292,7 @@ class FooterHint(Static):
         out.append_text(left)
         out.append(" " * gap)
         out.append_text(right)
-        self.update(out)
+        self.update(_resolve_themed_text(out, theme_name=self.theme_name))
 
 
 class ScrollIndicator(Static):
@@ -300,8 +340,8 @@ class SteeringList(Static):
         height: auto;
         max-height: 5;
         padding: 0 1;
-        background: #171a23;
-        color: #d8dee9;
+        background: $surface;
+        color: $foreground;
         display: none;
     }
     SteeringList.has-items {
@@ -310,6 +350,7 @@ class SteeringList(Static):
     """
 
     items: reactive[tuple[str, ...]] = reactive(())
+    theme_name: reactive[ThemeName] = reactive("dark")
 
     def watch_items(self, items: tuple[str, ...]) -> None:
         if not items:
@@ -323,7 +364,10 @@ class SteeringList(Static):
                 out.append("\n")
             out.append(f"{GLYPHS.DIAMOND} ", style="bold magenta")
             out.append(item.splitlines()[0][:120] if item else "")
-        self.update(_render_themed(out, width=self.size.width or 120))
+        self.update(_resolve_themed_text(out, theme_name=self.theme_name))
+
+    def watch_theme_name(self, _value: ThemeName) -> None:
+        self.watch_items(self.items)
 
     def add(self, message: str) -> None:
         self.items = (*self.items, message)
@@ -347,10 +391,10 @@ class SlashMenu(Static):
         height: auto;
         max-height: 20;
         padding: 0 1;
-        background: #1d2130;
-        color: #d8dee9;
+        background: $panel;
+        color: $foreground;
         display: none;
-        border-top: solid #7aa2f7;
+        border-top: solid $primary;
         overflow-y: auto;
         scrollbar-size-vertical: 1;
     }
@@ -361,6 +405,7 @@ class SlashMenu(Static):
 
     selected_index: reactive[int] = reactive(0)
     visible_commands: reactive[tuple[Any, ...]] = reactive(())
+    theme_name: reactive[ThemeName] = reactive("dark")
     MAX_RENDERED_ROWS: ClassVar[int] = 19
 
     def __init__(self) -> None:
@@ -469,6 +514,9 @@ class SlashMenu(Static):
         if self.visible_commands:
             self._repaint()
 
+    def watch_theme_name(self, _value: ThemeName) -> None:
+        self._repaint()
+
     def move_up(self) -> None:
         if not self.visible_commands:
             return
@@ -547,25 +595,28 @@ class SlashMenu(Static):
             is_sel = i == selected
             prefix = "▸ " if is_sel else "  "
             row_style = "bold reverse" if is_sel else ""
-            out.append(prefix, style="bold #7aa2f7" if is_sel else "#6f778a")
+            out.append(prefix, style="console.border.active" if is_sel else "console.meta")
             out.append(
                 pad_cells(self._usage_for(cmd), 24),
-                style=("bold #9aa5ce" if is_sel else "#89ddff"),
+                style=("console.heading.block" if is_sel else "console.tool.name"),
             )
             group = getattr(cmd, "group", "")
             if group:
-                out.append(pad_cells(group, 10), style="#6f778a")
-            out.append(truncate_cells(cmd.description, 80), style=row_style or "#d8dee9")
+                out.append(pad_cells(group, 10), style="console.meta")
+            out.append(
+                truncate_cells(cmd.description, 80),
+                style=row_style or "console.text.primary",
+            )
             shortcut = getattr(cmd, "shortcut", None)
             if shortcut:
-                out.append(f"  {shortcut}", style="#6f778a italic")
+                out.append(f"  {shortcut}", style="console.tool.tag")
             if i == start and start > 0:
-                out.append(f"  ↑ {start}", style="#6f778a")
+                out.append(f"  ↑ {start}", style="console.meta")
             if i == end - 1 and end < len(self.visible_commands):
-                out.append(f"  ↓ {len(self.visible_commands) - end}", style="#6f778a")
+                out.append(f"  ↓ {len(self.visible_commands) - end}", style="console.meta")
             if i < end - 1:
                 out.append("\n")
-        self.update(out)
+        self.update(_resolve_themed_text(out, theme_name=self.theme_name))
 
     def _render_window(self, selected: int) -> tuple[int, int]:
         total = len(self.visible_commands)
@@ -587,10 +638,10 @@ class PathMentionMenu(Static):
         height: auto;
         max-height: 12;
         padding: 0 1;
-        background: #1d2130;
-        color: #d8dee9;
+        background: $panel;
+        color: $foreground;
         display: none;
-        border-top: solid #7aa2f7;
+        border-top: solid $primary;
         overflow-y: auto;
         scrollbar-size-vertical: 1;
     }
@@ -601,6 +652,7 @@ class PathMentionMenu(Static):
 
     selected_index: reactive[int] = reactive(0)
     visible_items: reactive[tuple[PathMentionItem, ...]] = reactive(())
+    theme_name: reactive[ThemeName] = reactive("dark")
 
     def __init__(self) -> None:
         super().__init__("")
@@ -680,6 +732,9 @@ class PathMentionMenu(Static):
         if self.visible_items:
             self._repaint()
 
+    def watch_theme_name(self, _value: ThemeName) -> None:
+        self._repaint()
+
     def move_up(self) -> None:
         if not self.visible_items:
             return
@@ -708,15 +763,21 @@ class PathMentionMenu(Static):
         for i, item in enumerate(self.visible_items):
             is_sel = i == self.selected_index % len(self.visible_items)
             prefix = "▸ " if is_sel else "  "
-            out.append(prefix, style="bold #7aa2f7" if is_sel else "#6f778a")
+            out.append(prefix, style="console.border.active" if is_sel else "console.meta")
             out.append(
                 pad_cells(f"@{item.display}", 52),
-                style="bold #89ddff" if is_sel else "#aeb6c8",
+                style="console.tool.name" if is_sel else "console.text.secondary",
             )
-            out.append("dir" if item.is_dir else "file", style="#6f778a")
+            out.append("dir" if item.is_dir else "file", style="console.meta")
             if i < len(self.visible_items) - 1:
                 out.append("\n")
-        self.update(out)
+        self.update(
+            _render_themed(
+                out,
+                width=self.size.width or 120,
+                theme_name=self.theme_name,
+            )
+        )
 
 
 class StatusBar(Static):
@@ -738,12 +799,12 @@ class StatusBar(Static):
         dock: bottom;
         height: 1;
         padding: 0 1;
-        background: #171a23;
-        color: #d8dee9;
+        background: $background;
+        color: $foreground;
     }
     StatusBar.idle {
-        background: #11131a;
-        color: #6f778a;
+        background: $background;
+        color: $foreground-muted;
     }
     """
 
@@ -752,6 +813,7 @@ class StatusBar(Static):
     started_at: reactive[float] = reactive(0.0)
     spinner_frame: reactive[int] = reactive(0)
     context_pct: reactive[float] = reactive(0.0)
+    theme_name: reactive[ThemeName] = reactive("dark")
 
     def on_mount(self) -> None:
         self._sync_class()
@@ -779,6 +841,9 @@ class StatusBar(Static):
         self._repaint()
 
     def watch_context_pct(self, _value: float) -> None:
+        self._repaint()
+
+    def watch_theme_name(self, _value: ThemeName) -> None:
         self._repaint()
 
     def _sync_class(self) -> None:
@@ -818,58 +883,45 @@ class StatusBar(Static):
         pct = max(0.0, float(self.context_pct or 0.0))
         if pct <= 0:
             return Text()
-        out = Text(f"{pct:.0f}% ctx", style=self.context_style_for_pct(pct))
+        style = "console.state.error" if pct > 85 else "console.state.warning" if pct >= 70 else "console.meta"
+        out = Text(f"{pct:.0f}% ctx", style=style)
         if pct > 85:
-            out.append(" · compact soon", style="#f7768e")
+            out.append(" · compact soon", style="console.state.error")
         return out
 
     def _status_label(self, label: str, *, base_style: str) -> Text:
         out = Text(label, style=base_style)
         ctx = self._context_text()
         if ctx.plain:
-            out.append(" · ", style="#6f778a")
+            out.append(" · ", style="console.meta")
             out.append_text(ctx)
         return out
 
     def _repaint(self) -> None:
-        width = max(20, self.size.width or 80)
         text = Text()
         if self.state == "idle":
-            label = self._status_label("ready", base_style="#6f778a")
-            label.pad_left(1)
-            label.pad_right(1)
-            dash_total = max(0, width - label.cell_len - 2)
-            left = dash_total // 2
-            right = dash_total - left
-            text.append("─" * left, style="#3b4252")
+            label = self._status_label("ready", base_style="console.meta")
+            text.append("● ", style="console.meta")
             text.append_text(label)
-            text.append("─" * right, style="#3b4252")
         else:
             spin = SPINNER_FRAMES[self.spinner_frame % len(SPINNER_FRAMES)]
             label = self._label()
             elapsed = max(0.0, time.monotonic() - self.started_at) if self.started_at else 0.0
-            hint = " esc cancel "
             style = {
-                "thinking": "#e0af68",
-                "waiting": "#e0af68",
-                "tool": "#7dcfff",
-                "text": "#7dcfff",
-            }.get(self.state, "#7dcfff")
-            middle = Text(f" {spin} ", style=style)
+                "thinking": "console.state.waiting",
+                "waiting": "console.state.waiting",
+                "tool": "console.state.running",
+                "text": "console.state.running",
+            }.get(self.state, "console.state.running")
+            middle = Text(f"{spin} ", style=style)
             status_label = self._status_label(label, base_style=style)
             middle.append_text(status_label)
             if self.detail:
-                middle.append(" · ", style="#6f778a")
+                middle.append(" · ", style="console.meta")
                 middle.append(self.detail, style=style)
-            middle.append(f" · {elapsed:.1f}s ", style=style)
-            dash_total = max(0, width - middle.cell_len - cell_len(hint) - 2)
-            left = max(2, dash_total // 2)
-            right = max(2, dash_total - left)
-            text.append("─" * left, style="#3b4252")
+            middle.append(f" · {elapsed:.1f}s", style=style)
             text.append_text(middle)
-            text.append("─" * right, style="#3b4252")
-            text.append(hint, style="#6f778a")
-        self.update(text)
+        self.update(_resolve_themed_text(text, theme_name=self.theme_name))
 
 
 class LivePane(Static):
@@ -889,8 +941,8 @@ class LivePane(Static):
         height: auto;
         max-height: 30;
         padding: 0 1;
-        background: #11131a;
-        color: #d8dee9;
+        background: $background;
+        color: $foreground;
     }
     LivePane.empty {
         display: none;
@@ -898,6 +950,7 @@ class LivePane(Static):
     """
 
     REFRESH_HZ: float = 10.0
+    theme_name: reactive[ThemeName] = reactive("dark")
 
     def __init__(self) -> None:
         super().__init__("")
@@ -914,6 +967,9 @@ class LivePane(Static):
         self._frame = (self._frame + 1) % 1_000_000
         if self._blocks:
             self._repaint()
+
+    def watch_theme_name(self, _value: ThemeName) -> None:
+        self._repaint()
 
     @property
     def has_blocks(self) -> bool:
@@ -952,7 +1008,7 @@ class LivePane(Static):
                 # A bad renderer shouldn't crash the whole live pane.
                 renderables.append(Text("(render error)", style="red"))
         group = Group(*renderables)
-        self.update(_render_themed(group, width=width))
+        self.update(_render_themed(group, width=width, theme_name=self.theme_name))
 
 
 class PromptArea(TextArea):
@@ -972,15 +1028,15 @@ class PromptArea(TextArea):
         max-height: 10;
         border: none;
         padding: 0 1;
-        background: #171a23;
-        color: #d8dee9;
+        background: $surface;
+        color: $foreground;
         scrollbar-size-vertical: 0;
     }
     PromptArea:focus {
         border: none;
     }
     PromptArea > .text-area--cursor {
-        background: #7aa2f7;
+        background: $primary;
     }
     """
 

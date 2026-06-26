@@ -107,9 +107,8 @@ class EventRenderer:
     def render_tool_call_start(self, name: str, tool_call_id: str) -> str:
         """Render tool call start indicator."""
         text = Text()
-        text.append("● ", style="bold cyan")
+        text.append("Calling: ", style="dim")
         text.append(name, style="bold cyan")
-        text.append(" running", style="cyan")
         return self._renderer.render(text)
 
     def render_tool_call_complete(

@@ -19,24 +19,17 @@ Example::
 """
 
 import json
-from typing import Any
 
-import pydantic_ai.messages as pydantic_messages
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ToolCallPart,
+    ToolSearchCallPart,
 )
 from pydantic_ai.tools import RunContext
 
 from ya_agent_sdk._logger import logger
 from ya_agent_sdk.context import AgentContext
-
-ToolSearchCallPart: type[Any] = getattr(
-    pydantic_messages,
-    "ToolSearchCallPart",
-    pydantic_messages.BuiltinToolCallPart,
-)
 
 
 async def fix_truncated_tool_args(

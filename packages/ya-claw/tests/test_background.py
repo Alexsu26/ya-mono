@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
 import pytest
 from pydantic_ai import RunContext
-from y_agent_environment import Environment
+from ya_agent_environment import Environment
 from ya_agent_sdk.context import AgentContext
 from ya_agent_sdk.toolsets.core.base import BaseTool
 from ya_claw.execution.background import BackgroundMonitor, BackgroundTaskAlreadyActiveError
@@ -30,7 +29,7 @@ class FakeDelegateTool(BaseTool):
     name = "delegate"
     description = "fake delegate"
 
-    async def call(self, ctx: RunContext[AgentContext], /, *args: Any, **kwargs: Any) -> str:
+    async def call(self, ctx: RunContext[AgentContext], /, *args: object, **kwargs: object) -> str:
         await asyncio.sleep(0)
         return "delegate result"
 
@@ -39,7 +38,7 @@ class FailingDelegateTool(BaseTool):
     name = "delegate"
     description = "failing delegate"
 
-    async def call(self, ctx: RunContext[AgentContext], /, *args: Any, **kwargs: Any) -> str:
+    async def call(self, ctx: RunContext[AgentContext], /, *args: object, **kwargs: object) -> str:
         raise RuntimeError("delegate boom")
 
 

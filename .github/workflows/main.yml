@@ -1,4 +1,4 @@
-name: Main
+name: CI
 
 on:
   push:
@@ -7,25 +7,33 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality:
+    name: Quality Checks
     runs-on: ubuntu-latest
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 10
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: 'pnpm'
@@ -40,18 +48,41 @@ jobs:
         run: make check
 
   tests-and-type-check:
-    runs-on: ubuntu-latest
+    name: Tests and Type Checks (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.11"
             extras: "all"
-          - python-version: "3.12"
+            coverage: false
+            type_check: false
+          - os: ubuntu-latest
+            python-version: "3.12"
             extras: "all"
-          - python-version: "3.13"
+            coverage: false
+            type_check: false
+          - os: ubuntu-latest
+            python-version: "3.13"
             extras: "all"
-          - python-version: "3.13"
+            coverage: true
+            type_check: true
+          - os: ubuntu-latest
+            python-version: "3.13"
             extras: ""
+            coverage: false
+            type_check: false
+          - os: macos-latest
+            python-version: "3.13"
+            extras: "all"
+            coverage: false
+            type_check: false
+          - os: windows-latest
+            python-version: "3.13"
+            extras: "all"
+            coverage: false
+            type_check: true
       fail-fast: false
     env:
       UV_PYTHON: ${{ matrix.python-version }}
@@ -60,7 +91,7 @@ jobs:
         shell: bash
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up the environment
         uses: ./.github/actions/setup-python-env
@@ -69,14 +100,35 @@ jobs:
           extras: ${{ matrix.extras }}
 
       - name: Run tests
-        run: make test
+        run: >-
+          uv run python -m pytest
+          packages/ya-agent-environment/tests
+          packages/ya-ripgrep-core/tests
+          packages/ya-agent-sdk/tests
+          packages/ya-agent-stream-protocol/tests
+          packages/ya-oauth/tests
+          packages/ya-oauth-provider/tests
+          packages/yaacli/tests
+          packages/ya-claw/tests
+          -n 4 -vv --inline-snapshot=disable
+          ${{ matrix.coverage && '--cov --cov-config=pyproject.toml --cov-report term-missing' || '' }}
 
       - name: Check typing
+        if: ${{ matrix.type_check }}
         run: uv run python -m pyright
 
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: wh1isper/ya-mono
-        if: ${{ matrix.python-version == '3.13' && matrix.extras == 'all' }}
+        if: ${{ matrix.coverage }}
+
+  desktop-rust:
+    runs-on: macos-14
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Check the YAACLI Desktop Rust host
+        run: make desktop-rust-check

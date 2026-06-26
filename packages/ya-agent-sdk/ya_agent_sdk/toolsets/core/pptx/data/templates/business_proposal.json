@@ -1,0 +1,68 @@
+{
+  "asset_policy": {
+    "allow_public_image_search": true,
+    "preferred_kinds": [
+      "architecture",
+      "park",
+      "retail"
+    ]
+  },
+  "id": "business_proposal",
+  "keywords": [
+    "\u5546\u4e1a",
+    "\u627f\u5305",
+    "\u4e1a\u6001",
+    "\u9910\u996e",
+    "\u5496\u5561",
+    "\u9152\u5e97",
+    "\u5065\u8eab",
+    "\u529e\u516c",
+    "\u89c4\u5212"
+  ],
+  "layouts": [
+    {
+      "description": "Proposal title and client context",
+      "id": "cover",
+      "role": "cover"
+    },
+    {
+      "description": "Proposal agenda",
+      "id": "agenda",
+      "role": "agenda"
+    },
+    {
+      "description": "Proposal section divider",
+      "id": "section",
+      "role": "section"
+    },
+    {
+      "description": "Editable proposal content",
+      "id": "content",
+      "role": "content"
+    },
+    {
+      "description": "Business zone or operating model case",
+      "id": "case",
+      "role": "case"
+    },
+    {
+      "description": "Site or concept placeholder",
+      "id": "image_placeholder",
+      "role": "image_placeholder"
+    },
+    {
+      "description": "Decision summary and next steps",
+      "id": "summary",
+      "role": "summary"
+    }
+  ],
+  "scene": "business_proposal",
+  "style": "legacy_consulting_report",
+  "theme": {
+    "accentColor": "B7791F",
+    "backgroundColor": "FBFAF7",
+    "bodyColor": "2B3440",
+    "fontFace": "Aptos",
+    "titleColor": "172033"
+  }
+}

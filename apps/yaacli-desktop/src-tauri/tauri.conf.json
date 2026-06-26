@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "macOSPrivateApi": true,
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+    },
+    "windows": [
+      {
+        "center": true,
+        "decorations": true,
+        "height": 820,
+        "hiddenTitle": true,
+        "minHeight": 560,
+        "minWidth": 680,
+        "title": "YAACLI Desktop",
+        "titleBarStyle": "Overlay",
+        "width": 1280
+      }
+    ]
+  },
+  "build": {
+    "beforeBuildCommand": "make -C ../.. desktop-sidecar-build && corepack pnpm build",
+    "beforeDevCommand": "corepack pnpm dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "bundle": {
+    "active": true,
+    "category": "DeveloperTool",
+    "copyright": "Copyright \u00a9 2026 wh1isper",
+    "externalBin": [
+      "binaries/yaacli-desktop-sidecar"
+    ],
+    "longDescription": "A local-first macOS workspace interface for YAACLI.",
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    },
+    "resources": [
+      "desktop-version.json"
+    ],
+    "shortDescription": "Local workspace agent for macOS",
+    "targets": [
+      "app",
+      "dmg"
+    ]
+  },
+  "identifier": "com.wh1isper.yaacli.desktop",
+  "plugins": {
+    "updater": {
+      "active": false,
+      "endpoints": [
+        "https://github.com/wh1isper/ya-mono/releases/latest/download/latest.json"
+      ],
+      "pubkey": ""
+    }
+  },
+  "productName": "YAACLI Desktop",
+  "version": "0.1.0"
+}

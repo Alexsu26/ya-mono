@@ -8,6 +8,8 @@ from ya_claw.config import ClawSettings
 from ya_claw.controller.models import (
     ControlResponse,
     DispatchMode,
+    InteractionRespondRequest,
+    InteractionRespondResponse,
     RunCreateRequest,
     RunDetail,
     RunGetResponse,
@@ -96,6 +98,34 @@ async def steer_run(request: Request, run_id: str, payload: SteerRequest) -> Con
         return await controller.steer(db_session, runtime_state, run_id, payload)
 
 
+@router.post("/{run_id}/interactions/{interaction_id}:respond", response_model=InteractionRespondResponse)
+async def respond_run_interaction(
+    request: Request,
+    run_id: str,
+    interaction_id: str,
+    payload: InteractionRespondRequest,
+) -> InteractionRespondResponse:
+    runtime_state = _get_runtime_state(request)
+    session_factory = _get_session_factory(request)
+    async with session_factory() as db_session:
+        response = await controller.respond_interaction(db_session, runtime_state, run_id, interaction_id, payload)
+    notification_hub = _get_notification_hub(request)
+    await notification_hub.publish(
+        "run.hitl.responded",
+        {
+            "session_id": response.session_id,
+            "run_id": response.run_id,
+            "interaction_id": response.interaction_id,
+            "status": response.status,
+            "remaining_interaction_count": response.remaining_interaction_count,
+            "current_interaction": response.current_interaction.model_dump(mode="json")
+            if response.current_interaction is not None
+            else None,
+        },
+    )
+    return response
+
+
 @router.post("/{run_id}/interrupt", response_model=RunDetail)
 async def interrupt_run(request: Request, run_id: str) -> RunDetail:
     settings = _get_settings(request)
@@ -132,6 +162,8 @@ async def stream_run_events(
 
 async def _publish_run_notification(request: Request, event_type: str, run: RunDetail) -> None:
     notification_hub = _get_notification_hub(request)
+    session_status_reason = _session_status_reason_from_run(run)
+    session_status_detail = _session_status_detail_from_run(run)
     await notification_hub.publish(
         event_type,
         {
@@ -142,8 +174,61 @@ async def _publish_run_notification(request: Request, event_type: str, run: RunD
             "profile_name": run.profile_name,
             "termination_reason": run.termination_reason,
             "error_message": run.error_message,
+            "session_status": run.status,
+            "session_status_reason": session_status_reason,
+            "session_status_detail": session_status_detail,
         },
     )
+    if event_type != "session.updated":
+        await notification_hub.publish(
+            "session.updated",
+            {
+                "session_id": run.session_id,
+                "status": run.status,
+                "status_reason": session_status_reason,
+                "status_detail": session_status_detail,
+                "profile_name": run.profile_name,
+                "head_run_id": run.id,
+                "active_run_id": run.id if run.status in {"queued", "running"} else None,
+                "latest_run_id": run.id,
+                "latest_run_sequence_no": run.sequence_no,
+                "latest_run_status": run.status,
+            },
+        )
+
+
+def _session_status_reason_from_run(run: RunDetail) -> str:
+    if run.status == "queued":
+        return "run_queued"
+    if run.status == "running":
+        active_interactions = run.metadata.get("active_interactions")
+        if isinstance(active_interactions, list) and active_interactions:
+            return "hitl_pending"
+        return "run_running"
+    if run.status == "completed":
+        return "run_completed"
+    if run.status == "failed":
+        return "run_failed"
+    if run.status == "cancelled":
+        return "run_cancelled"
+    return "idle"
+
+
+def _session_status_detail_from_run(run: RunDetail) -> dict[str, object]:
+    detail: dict[str, object] = {
+        "run_id": run.id,
+        "sequence_no": run.sequence_no,
+        "trigger_type": run.trigger_type,
+    }
+    if run.termination_reason is not None:
+        detail["termination_reason"] = run.termination_reason
+    if run.error_message is not None:
+        detail["error_message"] = run.error_message
+    active_interactions = run.metadata.get("active_interactions")
+    if isinstance(active_interactions, list) and active_interactions:
+        detail["active_interactions"] = active_interactions
+        detail["active_interaction_count"] = len(active_interactions)
+    return detail
 
 
 def _dispatch_run(request: Request, run_id: str, mode: DispatchMode, *, require_submission: bool) -> None:

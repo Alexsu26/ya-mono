@@ -49,7 +49,7 @@ def pad_cells(value: object, width: int) -> str:
 
 def compact_meta(parts: Iterable[object]) -> str:
     """Join non-empty metadata parts with the TUI's compact separator."""
-    return "  ".join(str(part) for part in parts if str(part or "").strip())
+    return " · ".join(str(part) for part in parts if str(part or "").strip())
 
 
 def turn_header(
@@ -108,18 +108,18 @@ def timeline_line(
 ) -> Text:
     """One compact child event row in the transcript timeline."""
     out = Text()
-    out.append(f"  {branch} ", style="console.border.subtle")
+    out.append("  ", style="console.border.subtle")
     if marker:
         out.append(f"{marker} ", style=status_style)
     out.append(label, style=label_style)
     if status:
-        out.append("  ", style="console.meta")
+        out.append("   ", style="console.meta")
         out.append(status, style=status_style)
     meta_text = compact_meta(meta)
     if meta_text:
-        out.append("  ", style="console.meta")
+        out.append("   ", style="console.meta")
         out.append(meta_text, style="console.meta")
     if summary:
-        out.append("  ", style="console.meta")
+        out.append(" · " if meta_text else "  ", style="console.meta")
         out.append(summary, style="console.text.secondary")
     return out

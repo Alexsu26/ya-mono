@@ -3,7 +3,7 @@ Fast FileOperator-backed file discovery with ripgrep-style glob semantics.
 Results are sorted by modification time (newest first) and limited to 500 by default.
 
 <semantics>
-- Traversal uses FileOperator directory primitives, so it works across local, sandboxed, and remote environments.
+- Traversal uses FileOperator.walk_files, so it works across local, sandboxed, and remote environments.
 - Pattern matching uses the native ripgrep core when available, with Python fallback for portability.
 - Bare file patterns like `*.py` match recursively at any depth.
 - `**/*.py` matches root-level and nested Python files.

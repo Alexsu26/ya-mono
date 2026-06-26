@@ -10,7 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncEngine
+from ya_oauth_provider import OAuthRefreshSupervisor, create_oauth_refresh_supervisor_for_models
 
+from ya_claw.agency.dispatcher import AgencyDispatcher
+from ya_claw.api.agency import router as agency_router
 from ya_claw.api.bridges import router as bridges_router
 from ya_claw.api.claw import router as claw_router
 from ya_claw.api.health import router as health_router
@@ -19,12 +22,15 @@ from ya_claw.api.profiles import router as profiles_router
 from ya_claw.api.runs import router as runs_router
 from ya_claw.api.schedules import router as schedules_router
 from ya_claw.api.sessions import router as sessions_router
+from ya_claw.api.workflows import router as workflows_router
+from ya_claw.api.workspace import router as workspace_router
 from ya_claw.bridge import BridgeDispatchMode
 from ya_claw.bridge.service import BridgeSupervisor, build_bridge_supervisor
 from ya_claw.config import ClawSettings, get_settings
 from ya_claw.db.engine import create_engine, create_session_factory
 from ya_claw.execution import (
     ClawRuntimeBuilder,
+    DockerSandboxTtlDispatcher,
     ExecutionSupervisor,
     ProfileResolver,
     RunDispatcher,
@@ -33,6 +39,7 @@ from ya_claw.execution import (
 )
 from ya_claw.execution.heartbeat import HeartbeatDispatcher
 from ya_claw.execution.schedule import ScheduleDispatcher
+from ya_claw.execution.workflow import WorkflowExecutor
 from ya_claw.logging import configure_claw_logging, redact_url
 from ya_claw.notifications import NotificationHub, create_notification_hub
 from ya_claw.runtime_state import InMemoryRuntimeState, create_runtime_state
@@ -75,8 +82,12 @@ class ClawApplication:
         app.state.runtime_instance_manager = None
         app.state.bridge_supervisor = None
         app.state.schedule_dispatcher = None
+        app.state.workflow_executor = None
         app.state.heartbeat_dispatcher = None
+        app.state.agency_dispatcher = None
         app.state.session_prune_dispatcher = None
+        app.state.docker_sandbox_ttl_dispatcher = None
+        app.state.oauth_refresh_supervisor = None
 
         self.register_api_token_middleware(app)
         app.add_middleware(
@@ -88,12 +99,15 @@ class ClawApplication:
         )
         app.include_router(health_router)
         app.include_router(claw_router, prefix="/api/v1")
+        app.include_router(agency_router, prefix="/api/v1")
         app.include_router(profiles_router, prefix="/api/v1")
         app.include_router(sessions_router, prefix="/api/v1")
         app.include_router(runs_router, prefix="/api/v1")
         app.include_router(schedules_router, prefix="/api/v1")
+        app.include_router(workflows_router, prefix="/api/v1")
         app.include_router(heartbeat_router, prefix="/api/v1")
         app.include_router(bridges_router, prefix="/api/v1")
+        app.include_router(workspace_router, prefix="/api/v1")
 
         frontend_registered = self.register_frontend(app)
         if not frontend_registered:
@@ -141,6 +155,12 @@ class ClawApplication:
             docker_extra_mounts=self.settings.resolved_workspace_provider_docker_extra_mounts,
             docker_exec_user=self.settings.resolved_workspace_provider_docker_exec_user,
             docker_exec_default_env=self.settings.resolved_workspace_provider_docker_exec_default_env,
+            docker_retention_policy=self.settings.resolved_workspace_provider_docker_retention_policy,
+            docker_idle_ttl_seconds=self.settings.resolved_workspace_provider_docker_idle_ttl_seconds,
+            shell_sandbox_enabled=self.settings.shell_sandbox_enabled,
+            shell_sandbox_backend=self.settings.shell_sandbox_backend,
+            shell_sandbox_network=self.settings.shell_sandbox_network,
+            shell_sandbox_allow_raw_host=self.settings.shell_sandbox_allow_raw_host,
         )
 
         if app.state.db_session_factory is not None:
@@ -190,6 +210,15 @@ class ClawApplication:
             )
             app.state.schedule_dispatcher = schedule_dispatcher
             await schedule_dispatcher.startup()
+            workflow_executor = WorkflowExecutor(
+                settings=self.settings,
+                session_factory=app.state.db_session_factory,
+                runtime_state=app.state.runtime_state,
+                run_dispatcher=RunDispatcher(supervisor),
+                notification_hub=app.state.notification_hub,
+            )
+            app.state.workflow_executor = workflow_executor
+            await workflow_executor.startup()
             heartbeat_dispatcher = HeartbeatDispatcher(
                 settings=self.settings,
                 session_factory=app.state.db_session_factory,
@@ -199,18 +228,42 @@ class ClawApplication:
             )
             app.state.heartbeat_dispatcher = heartbeat_dispatcher
             await heartbeat_dispatcher.startup()
+            agency_dispatcher = AgencyDispatcher(
+                settings=self.settings,
+                session_factory=app.state.db_session_factory,
+                runtime_state=app.state.runtime_state,
+                run_dispatcher=RunDispatcher(supervisor),
+                notification_hub=app.state.notification_hub,
+            )
+            app.state.agency_dispatcher = agency_dispatcher
+            await agency_dispatcher.startup()
             session_prune_dispatcher = SessionPruneDispatcher(
                 settings=self.settings,
                 session_factory=app.state.db_session_factory,
             )
             app.state.session_prune_dispatcher = session_prune_dispatcher
             await session_prune_dispatcher.startup()
+            docker_sandbox_ttl_dispatcher = DockerSandboxTtlDispatcher(
+                settings=self.settings,
+                session_factory=app.state.db_session_factory,
+            )
+            app.state.docker_sandbox_ttl_dispatcher = docker_sandbox_ttl_dispatcher
+            await docker_sandbox_ttl_dispatcher.startup()
+            oauth_refresh_supervisor = await self.create_oauth_refresh_supervisor(app.state.profile_resolver)
+            if oauth_refresh_supervisor is not None:
+                app.state.oauth_refresh_supervisor = oauth_refresh_supervisor
+                await oauth_refresh_supervisor.start()
+                logger.info(
+                    "OAuth refresh supervisor started providers={}", sorted(oauth_refresh_supervisor.provider_names)
+                )
+
             if self.settings.bridge_dispatch_mode == BridgeDispatchMode.EMBEDDED:
                 bridge_supervisor = build_bridge_supervisor(
                     settings=self.settings,
                     session_factory=app.state.db_session_factory,
                     runtime_state=app.state.runtime_state,
                     run_dispatcher=RunDispatcher(supervisor),
+                    notification_hub=app.state.notification_hub,
                 )
                 app.state.bridge_supervisor = bridge_supervisor
                 await bridge_supervisor.startup()
@@ -228,8 +281,12 @@ class ClawApplication:
             notification_hub = app.state.notification_hub
             bridge_supervisor = app.state.bridge_supervisor
             schedule_dispatcher = app.state.schedule_dispatcher
+            workflow_executor = app.state.workflow_executor
             heartbeat_dispatcher = app.state.heartbeat_dispatcher
+            agency_dispatcher = app.state.agency_dispatcher
             session_prune_dispatcher = app.state.session_prune_dispatcher
+            docker_sandbox_ttl_dispatcher = app.state.docker_sandbox_ttl_dispatcher
+            oauth_refresh_supervisor = app.state.oauth_refresh_supervisor
             execution_supervisor = app.state.execution_supervisor
 
             app.state.db_session_factory = None
@@ -243,14 +300,30 @@ class ClawApplication:
             app.state.runtime_instance_manager = None
             app.state.bridge_supervisor = None
             app.state.schedule_dispatcher = None
+            app.state.workflow_executor = None
             app.state.heartbeat_dispatcher = None
+            app.state.agency_dispatcher = None
             app.state.session_prune_dispatcher = None
+            app.state.docker_sandbox_ttl_dispatcher = None
+            app.state.oauth_refresh_supervisor = None
+
+            if isinstance(oauth_refresh_supervisor, OAuthRefreshSupervisor):
+                await oauth_refresh_supervisor.shutdown()
+
+            if isinstance(docker_sandbox_ttl_dispatcher, DockerSandboxTtlDispatcher):
+                await docker_sandbox_ttl_dispatcher.shutdown()
 
             if isinstance(session_prune_dispatcher, SessionPruneDispatcher):
                 await session_prune_dispatcher.shutdown()
 
+            if isinstance(agency_dispatcher, AgencyDispatcher):
+                await agency_dispatcher.shutdown()
+
             if isinstance(heartbeat_dispatcher, HeartbeatDispatcher):
                 await heartbeat_dispatcher.shutdown()
+
+            if isinstance(workflow_executor, WorkflowExecutor):
+                await workflow_executor.shutdown()
 
             if isinstance(schedule_dispatcher, ScheduleDispatcher):
                 await schedule_dispatcher.shutdown()
@@ -273,6 +346,33 @@ class ClawApplication:
             if isinstance(db_engine, AsyncEngine):
                 await db_engine.dispose()
 
+    async def create_oauth_refresh_supervisor(
+        self,
+        profile_resolver: ProfileResolver | None,
+    ) -> OAuthRefreshSupervisor | None:
+        if not self.settings.oauth_refresh_enabled or profile_resolver is None:
+            return None
+        models: set[str] = set()
+        for profile_name in {self.settings.default_profile, self.settings.bridge_lark_default_profile}:
+            if profile_name is None or profile_name.strip() == "":
+                continue
+            try:
+                profile = await profile_resolver.resolve(profile_name)
+            except Exception as exc:
+                logger.warning("OAuth refresh profile resolution skipped profile={} error={}", profile_name, exc)
+                continue
+            models.add(profile.model)
+        try:
+            models.update(await profile_resolver.list_enabled_models())
+        except Exception as exc:
+            logger.warning("OAuth refresh enabled profile scan skipped error={}", exc)
+        return create_oauth_refresh_supervisor_for_models(
+            models,
+            interval_seconds=self.settings.oauth_refresh_interval_seconds,
+            failure_retry_seconds=self.settings.oauth_refresh_failure_retry_seconds,
+            refresh_on_startup=self.settings.oauth_refresh_on_startup,
+        )
+
     def create_workspace_provider(self) -> WorkspaceProvider:
         if self.settings.workspace_provider_backend == "docker":
             logger.info(
@@ -291,6 +391,8 @@ class ClawApplication:
                 image=self.settings.workspace_provider_docker_image,
                 docker_host_workspace_dir=self.settings.resolved_workspace_provider_docker_host_workspace_dir,
                 extra_mounts=self.settings.resolved_workspace_provider_docker_extra_mounts,
+                workspace_uid=self.settings.resolved_workspace_provider_docker_uid,
+                workspace_gid=self.settings.resolved_workspace_provider_docker_gid,
             )
         logger.info("Configuring local workspace provider workspace_dir={}", self.settings.resolved_workspace_dir)
         return LocalWorkspaceProvider(self.settings.resolved_workspace_dir)
@@ -393,7 +495,7 @@ class ClawApplication:
                 "environment": self.settings.environment,
                 "docs_url": "/docs",
                 "spec_path": "packages/ya-claw/spec",
-                "surfaces": ["profiles", "sessions", "runs", "schedules", "bridges"],
+                "surfaces": ["profiles", "sessions", "runs", "schedules", "workflows", "bridges"],
             }
 
 

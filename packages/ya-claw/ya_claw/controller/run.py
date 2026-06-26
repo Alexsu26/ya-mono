@@ -8,11 +8,14 @@ from fastapi import HTTPException
 from loguru import logger
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from ya_agent_stream_protocol.sdk import AguiAdapterConfig, AguiEventAdapter
 
-from ya_claw.agui_adapter import AguiEventAdapter
 from ya_claw.config import ClawSettings
+from ya_claw.controller.hitl import HitlController
 from ya_claw.controller.models import (
     ControlResponse,
+    InteractionRespondRequest,
+    InteractionRespondResponse,
     RunCreateRequest,
     RunDetail,
     RunGetResponse,
@@ -23,6 +26,7 @@ from ya_claw.controller.models import (
     SessionSummary,
     SteerRequest,
     TerminationReason,
+    active_interactions_from_run_record,
     run_detail_from_record,
     run_summary_from_record,
     session_summary_from_record,
@@ -35,11 +39,16 @@ from ya_claw.controller.store import (
 from ya_claw.execution.state_machine import cancel_run, interrupt_run, queue_run
 from ya_claw.orm.tables import RunRecord, SessionRecord
 from ya_claw.runtime_state import InMemoryRuntimeState
+from ya_claw.workspace.models import metadata_with_workspace
 
 _ACTIVE_RUN_STATUSES = frozenset({RunStatus.QUEUED, RunStatus.RUNNING})
+CLAW_AGUI_ADAPTER_CONFIG = AguiAdapterConfig(run_event_prefix="ya_claw")
 
 
 class RunController:
+    def __init__(self) -> None:
+        self._hitl_controller = HitlController()
+
     async def create(
         self,
         db_session: AsyncSession,
@@ -59,7 +68,7 @@ class RunController:
             session_record = SessionRecord(
                 id=session_id,
                 profile_name=request.profile_name,
-                session_metadata={},
+                session_metadata=metadata_with_workspace({}, request.workspace),
                 session_type="conversation",
             )
             db_session.add(session_record)
@@ -94,7 +103,7 @@ class RunController:
             restore_from_run_id,
             request.reset_state,
         )
-        run_metadata = dict(request.metadata)
+        run_metadata = metadata_with_workspace(request.metadata, request.workspace)
         if request.reset_state:
             run_metadata["restore_state"] = False
 
@@ -119,16 +128,19 @@ class RunController:
 
         ensure_run_dir(settings, run_id)
         runtime_state.register_run(session_id, run_id, dispatch_mode=request.dispatch_mode)
-        agui_adapter = AguiEventAdapter(session_id=session_id, run_id=run_id)
+        agui_adapter = AguiEventAdapter(session_id=session_id, run_id=run_id, config=CLAW_AGUI_ADAPTER_CONFIG)
         await runtime_state.append_run_event(
             run_id,
-            agui_adapter.build_run_queued_event({
-                "run_id": run_id,
-                "session_id": session_id,
-                "status": run_record.status,
-                "sequence_no": sequence_no,
-                "dispatch_mode": request.dispatch_mode,
-            }),
+            agui_adapter.build_run_custom_event(
+                "run_queued",
+                {
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "status": run_record.status,
+                    "sequence_no": sequence_no,
+                    "dispatch_mode": request.dispatch_mode,
+                },
+            ),
         )
 
         logger.info(
@@ -278,14 +290,19 @@ class RunController:
         input_payload = [part.model_dump(mode="json") for part in request.input_parts]
         try:
             await runtime_state.record_steering(run_id, input_payload)
-            agui_adapter = AguiEventAdapter(session_id=run_record.session_id, run_id=run_id)
+            agui_adapter = AguiEventAdapter(
+                session_id=run_record.session_id, run_id=run_id, config=CLAW_AGUI_ADAPTER_CONFIG
+            )
             await runtime_state.append_run_event(
                 run_id,
-                agui_adapter.build_run_steered_event({
-                    "run_id": run_id,
-                    "session_id": run_record.session_id,
-                    "input_parts": input_payload,
-                }),
+                agui_adapter.build_run_custom_event(
+                    "run_steered",
+                    {
+                        "run_id": run_id,
+                        "session_id": run_record.session_id,
+                        "input_parts": input_payload,
+                    },
+                ),
             )
         except KeyError as exc:
             raise HTTPException(status_code=409, detail=f"Run '{run_id}' is not active in runtime state.") from exc
@@ -295,6 +312,24 @@ class RunController:
             run_id=run_id,
             status=RunStatus(run_record.status),
         )
+
+    async def respond_interaction(
+        self,
+        db_session: AsyncSession,
+        runtime_state: InMemoryRuntimeState,
+        run_id: str,
+        interaction_id: str,
+        request: InteractionRespondRequest,
+    ) -> InteractionRespondResponse:
+        response = await self._hitl_controller.respond_interaction(
+            db_session,
+            runtime_state,
+            run_id,
+            interaction_id,
+            request,
+        )
+        await db_session.commit()
+        return response
 
     async def _stop_run(
         self,
@@ -348,7 +383,9 @@ class RunController:
         run_record: RunRecord,
         event_type: str,
     ) -> None:
-        agui_adapter = AguiEventAdapter(session_id=run_record.session_id, run_id=run_record.id)
+        agui_adapter = AguiEventAdapter(
+            session_id=run_record.session_id, run_id=run_record.id, config=CLAW_AGUI_ADAPTER_CONFIG
+        )
         event_payload = {
             "run_id": run_record.id,
             "session_id": run_record.session_id,
@@ -356,9 +393,9 @@ class RunController:
             "termination_reason": run_record.termination_reason,
         }
         mapped_event = (
-            agui_adapter.build_run_interrupted_event(event_payload)
+            agui_adapter.build_run_custom_event("run_interrupted", event_payload)
             if event_type == "run.interrupted"
-            else agui_adapter.build_run_cancelled_event(event_payload)
+            else agui_adapter.build_run_custom_event("run_cancelled", event_payload)
         )
         try:
             await runtime_state.append_run_event(
@@ -412,10 +449,14 @@ class RunController:
         latest_run_result = await db_session.execute(latest_run_statement)
         latest_run_record = latest_run_result.scalar_one_or_none()
         latest_run = run_summary_from_record(latest_run_record) if isinstance(latest_run_record, RunRecord) else None
+        active_interactions = (
+            active_interactions_from_run_record(latest_run_record) if isinstance(latest_run_record, RunRecord) else None
+        )
         return session_summary_from_record(
             session_record,
             run_count=run_count,
             latest_run=latest_run,
+            active_interactions=active_interactions,
         )
 
     async def _next_sequence_no(self, db_session: AsyncSession, session_id: str) -> int:

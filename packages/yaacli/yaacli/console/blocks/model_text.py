@@ -6,12 +6,15 @@ from dataclasses import dataclass, field
 
 from rich.console import Group, RenderableType
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.text import Text
 
 from yaacli.console.blocks.base import BaseBlock, BlockKind
-from yaacli.console.design import rail_renderable, turn_header
+from yaacli.console.design import turn_header
+from yaacli.console.theme import ThemeName, code_theme_for
 
 _MAX_MARKDOWN_RENDER_CHARS = 80_000
+ASSISTANT_MARKDOWN_CODE_THEME = "github-dark"
 
 
 @dataclass
@@ -19,6 +22,8 @@ class ModelTextBlock(BaseBlock):
     """Markdown response from the model. Mutable while streaming."""
 
     chunks: list[str] = field(default_factory=list)
+    theme_name: ThemeName = "dark"
+    show_header: bool = True
 
     def __post_init__(self) -> None:
         self.kind = BlockKind.MODEL_TEXT
@@ -41,6 +46,16 @@ class ModelTextBlock(BaseBlock):
                 text[:_MAX_MARKDOWN_RENDER_CHARS]
                 + f"\n\n[output clipped: {hidden} chars hidden; use /export to show more]"
             )
+        body = Padding(
+            Markdown(
+                text,
+                code_theme=code_theme_for(self.theme_name),
+                style="console.text.primary",
+            ),
+            (0, 0, 0, 4),
+        )
+        if not self.show_header:
+            return body
         return Group(
             turn_header(
                 "●",
@@ -48,5 +63,5 @@ class ModelTextBlock(BaseBlock):
                 glyph_style="console.accent.assistant",
                 label_style="console.heading.turn",
             ),
-            rail_renderable(Markdown(text, code_theme="monokai")),
+            body,
         )

@@ -4,21 +4,23 @@ This module provides local file system and shell implementations
 using standard library functions.
 """
 
+from __future__ import annotations
+
 import asyncio
-import contextlib
-import glob as glob_module
 import os
 import shutil
-import signal
+import sys
 import tempfile
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from pathlib import Path, PurePath
+from typing import TYPE_CHECKING
 
 import anyio
-from y_agent_environment import (
+from ya_agent_environment import (
     Environment,
     ExecutionHandle,
+    FileEntry,
     FileOperationError,
     FileOperator,
     FileStat,
@@ -32,59 +34,66 @@ from y_agent_environment import (
     TmpFileOperator,
 )
 
+from ya_agent_sdk.environment.process import (
+    kill_process_tree,
+    process_group_kwargs,
+    send_process_tree_signal,
+    terminate_process_tree,
+)
+from ya_agent_sdk.environment.virtual_path import (
+    VirtualPath,
+    as_virtual_path,
+    normalize_virtual_path,
+)
+
 if TYPE_CHECKING:
-    pass
+    from ya_agent_sdk.environment.shell_sandbox.policy import ShellSandboxRuntimePolicy
 
 
-def _process_group_kwargs() -> dict[str, Any]:
-    """Return subprocess kwargs that isolate a command tree for lifecycle control."""
-    if os.name == "posix":
-        return {"start_new_session": True}
-    return {}
+def _default_shell_executable() -> str | None:
+    """Return the default local shell executable for create_subprocess_shell."""
+    if os.name != "posix":
+        return None
+
+    bash_path = Path("/bin/bash")
+    if bash_path.exists():
+        return str(bash_path)
+
+    return shutil.which("bash")
 
 
-def _send_process_tree_signal(process: asyncio.subprocess.Process, sig: int) -> None:
-    """Send a signal to the whole process tree when process groups are available."""
-    if process.pid is None:
-        return
+def _resolve_shell_executable(shell_executable: str | None) -> str | None:
+    """Resolve the configured shell executable.
 
-    if os.name == "posix":
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(os.getpgid(process.pid), sig)
-            return
-
-    with contextlib.suppress(ProcessLookupError, OSError):
-        process.send_signal(sig)
-
-
-async def _terminate_process_tree(
-    process: asyncio.subprocess.Process,
-    *,
-    timeout: float = 5.0,
-) -> None:
-    """Terminate a process tree gracefully, then force kill if it keeps running."""
-    if process.returncode is not None:
-        return
-
-    _send_process_tree_signal(process, signal.SIGTERM)
-    try:
-        await asyncio.wait_for(process.wait(), timeout=timeout)
-        return
-    except TimeoutError:
-        pass
-
-    await _kill_process_tree(process)
+    None selects the YA Agent SDK platform default. An empty string delegates
+    shell selection to Python's platform default.
+    """
+    if shell_executable == "":
+        return None
+    if shell_executable is None:
+        return _default_shell_executable()
+    return shell_executable
 
 
-async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
-    """Force kill a process tree and wait for the root process to be reaped."""
-    if process.returncode is None:
-        _send_process_tree_signal(process, signal.SIGKILL)
-        if os.name != "posix":
-            with contextlib.suppress(ProcessLookupError, OSError):
-                process.kill()
-    with contextlib.suppress(ProcessLookupError, OSError):
-        await process.wait()
+def _read_path_bytes(path: Path, *, offset: int = 0, length: int | None = None) -> bytes:
+    """Read bytes from a local path using seek for bounded reads."""
+    with path.open("rb") as stream:
+        if offset > 0:
+            stream.seek(offset)
+        if length is not None:
+            return stream.read(length)
+        return stream.read()
+
+
+def _shell_type_from_executable(shell_executable: str | None) -> str:
+    """Return a shell type label for context instructions."""
+    if shell_executable is None:
+        return "platform-default"
+
+    shell_name = Path(shell_executable).name
+    if shell_name.endswith(".exe"):
+        shell_name = shell_name[:-4]
+    return shell_name or "custom"
 
 
 class LocalFileOperator(FileOperator):
@@ -101,7 +110,7 @@ class LocalFileOperator(FileOperator):
     def __init__(
         self,
         default_path: Path | None = None,
-        allowed_paths: list[Path] | None = None,
+        allowed_paths: Sequence[Path | PurePath] | None = None,
         instructions_skip_dirs: frozenset[str] | None = None,
         instructions_max_depth: int = 3,
         tmp_dir: Path | None = None,
@@ -121,7 +130,8 @@ class LocalFileOperator(FileOperator):
         """
         # Fallback: use first allowed_path as default when only allowed_paths is provided
         if default_path is None and allowed_paths:
-            default_path = allowed_paths[0]
+            first_allowed_path = allowed_paths[0]
+            default_path = first_allowed_path if isinstance(first_allowed_path, Path) else None
 
         super().__init__(
             default_path=default_path,
@@ -132,24 +142,32 @@ class LocalFileOperator(FileOperator):
             tmp_file_operator=tmp_file_operator,
         )
 
+    def _local_default_path(self) -> Path | None:
+        default_path = self._default_path
+        return default_path if isinstance(default_path, Path) else None
+
+    def _local_allowed_paths(self) -> list[Path]:
+        return [path for path in self._allowed_paths if isinstance(path, Path)]
+
     def _resolve_path(self, path: str) -> Path:
         """Resolve path and validate against allowed directories."""
-        if self._default_path is None:
+        default_path = self._local_default_path()
+        if default_path is None:
             raise PathNotAllowedError(path, [])
         target = Path(path)
         if not target.is_absolute():
-            target = self._default_path / target
+            target = default_path / target
         resolved = target.resolve()
         if not self._is_path_allowed(resolved):
             raise PathNotAllowedError(
                 path,
-                [str(p) for p in self._allowed_paths],
+                [str(p) for p in self._local_allowed_paths()],
             )
         return resolved
 
     def _is_path_allowed(self, resolved: Path) -> bool:
         """Check if resolved path is within allowed directories."""
-        for allowed in self._allowed_paths:
+        for allowed in self._local_allowed_paths():
             try:
                 resolved.relative_to(allowed)
                 return True
@@ -209,11 +227,9 @@ class LocalFileOperator(FileOperator):
         """
         resolved = self._resolve_path(path)
         try:
-            content = await anyio.Path(resolved).read_bytes()
-            if offset > 0 or length is not None:
-                end = None if length is None else offset + length
-                content = content[offset:end]
-            return content
+            return await anyio.to_thread.run_sync(  # type: ignore[reportAttributeAccessIssue]
+                lambda: _read_path_bytes(resolved, offset=offset, length=length)
+            )
         except FileNotFoundError as e:
             raise FileOperationError("read", path, "file not found") from e
         except PermissionError as e:
@@ -370,42 +386,77 @@ class LocalFileOperator(FileOperator):
         except OSError as e:
             raise FileOperationError("stat", path, str(e)) from e
 
-    async def _glob_impl(self, pattern: str) -> list[str]:
-        """Find files matching glob pattern."""
-        if self._default_path is None:
-            return []
+    async def _walk_files_impl(  # noqa: C901
+        self,
+        root: str = ".",
+        *,
+        max_depth: int | None = None,
+        include_hidden: bool = False,
+        follow_symlinks: bool = False,
+    ) -> AsyncIterator[FileEntry]:
+        """Walk files and directories under the local default path."""
+        default_path = self._local_default_path()
+        if default_path is None:
+            return
+        resolved_root = self._resolve_path(root)
+        if not await anyio.Path(resolved_root).exists():
+            return
 
-        matches = []
-        pattern_path = Path(pattern)
-        default_path = self._default_path
+        def _walk() -> list[FileEntry]:  # noqa: C901
+            entries: list[FileEntry] = []
+            if resolved_root.is_file():
+                stat = resolved_root.stat()
+                path = resolved_root.relative_to(default_path).as_posix()
+                entries.append(FileEntry(path=path, is_file=True, is_dir=False, size=stat.st_size, mtime=stat.st_mtime))
+                return entries
 
-        # Handle absolute paths - Python 3.13's pathlib.glob() doesn't support them
-        if pattern_path.is_absolute():
-            # Use glob module for absolute patterns
-            for p_str in glob_module.glob(pattern, recursive=True):
-                resolved = Path(p_str).resolve()
-                # Filter by allowed_paths for security
-                if self._is_path_allowed(resolved):
-                    matches.append(p_str)
-        else:
-            # Use pathlib for relative patterns
-            for p in default_path.glob(pattern):
-                try:
-                    rel = p.relative_to(default_path)
-                    matches.append(str(rel))
-                except ValueError:
-                    matches.append(str(p))
+            root_depth = len(resolved_root.parts)
+            for current, dirnames, filenames in os.walk(resolved_root, followlinks=follow_symlinks):
+                current_path = Path(current)
+                depth = len(current_path.parts) - root_depth
+                if max_depth is not None and depth >= max_depth:
+                    dirnames[:] = []
+                if not include_hidden:
+                    dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+                    filenames = [name for name in filenames if not name.startswith(".")]
+                for name in sorted(dirnames):
+                    path = current_path / name
+                    try:
+                        if follow_symlinks:
+                            resolved = path.resolve()
+                            if not self._is_path_allowed(resolved):
+                                continue
+                            rel = resolved.relative_to(default_path).as_posix()
+                            stat = path.stat()
+                        else:
+                            rel = path.relative_to(default_path).as_posix()
+                            stat = path.lstat()
+                    except (OSError, ValueError):
+                        continue
+                    entries.append(
+                        FileEntry(path=rel, is_file=False, is_dir=True, size=stat.st_size, mtime=stat.st_mtime)
+                    )
+                for name in sorted(filenames):
+                    path = current_path / name
+                    try:
+                        if follow_symlinks:
+                            resolved = path.resolve()
+                            if not self._is_path_allowed(resolved):
+                                continue
+                            rel = resolved.relative_to(default_path).as_posix()
+                            stat = path.stat()
+                        else:
+                            rel = path.relative_to(default_path).as_posix()
+                            stat = path.lstat()
+                    except (OSError, ValueError):
+                        continue
+                    entries.append(
+                        FileEntry(path=rel, is_file=True, is_dir=False, size=stat.st_size, mtime=stat.st_mtime)
+                    )
+            return entries
 
-        # Sort by modification time (newest first)
-        def get_mtime(x: str) -> float:
-            try:
-                p = Path(x) if Path(x).is_absolute() else (default_path / x)
-                return p.stat().st_mtime
-            except (OSError, FileNotFoundError):
-                return 0.0
-
-        matches.sort(key=get_mtime, reverse=True)
-        return matches
+        for entry in await anyio.to_thread.run_sync(_walk):  # type: ignore[reportAttributeAccessIssue]
+            yield entry
 
 
 @dataclass(frozen=True)
@@ -421,11 +472,13 @@ class VirtualMount:
     """
 
     host_path: Path
-    virtual_path: Path
+    virtual_path: Path | VirtualPath
 
     def __post_init__(self) -> None:
-        if not self.virtual_path.is_absolute():
+        virtual_path = normalize_virtual_path(self.virtual_path)
+        if not virtual_path.is_absolute():
             raise ValueError(f"virtual_path must be absolute, got: {self.virtual_path}")
+        object.__setattr__(self, "virtual_path", virtual_path)
 
 
 class VirtualLocalFileOperator(FileOperator):
@@ -465,11 +518,11 @@ class VirtualLocalFileOperator(FileOperator):
     def __init__(
         self,
         mounts: list[VirtualMount],
-        default_virtual_path: Path | None = None,
+        default_virtual_path: Path | VirtualPath | None = None,
         instructions_skip_dirs: frozenset[str] | None = None,
         instructions_max_depth: int = 3,
         tmp_dir: Path | None = None,
-        tmp_file_operator: "TmpFileOperator | None" = None,
+        tmp_file_operator: TmpFileOperator | None = None,
     ):
         """Initialize VirtualLocalFileOperator.
 
@@ -485,7 +538,9 @@ class VirtualLocalFileOperator(FileOperator):
         """
         self._mounts = mounts
         default_vp = (
-            default_virtual_path if default_virtual_path is not None else (mounts[0].virtual_path if mounts else None)
+            normalize_virtual_path(default_virtual_path)
+            if default_virtual_path is not None
+            else (mounts[0].virtual_path if mounts else None)
         )
 
         super().__init__(
@@ -497,7 +552,7 @@ class VirtualLocalFileOperator(FileOperator):
             tmp_file_operator=tmp_file_operator,
         )
 
-    def _find_mount(self, normalized_virtual: Path) -> VirtualMount:
+    def _find_mount(self, normalized_virtual: VirtualPath) -> VirtualMount:
         """Find the mount whose virtual_path is the longest prefix of the given path.
 
         Args:
@@ -527,7 +582,7 @@ class VirtualLocalFileOperator(FileOperator):
             )
         return best
 
-    def _resolve_virtual(self, path: str) -> Path:
+    def _resolve_virtual(self, path: str) -> VirtualPath:
         """Resolve a virtual path to a normalized absolute virtual path.
 
         Args:
@@ -542,11 +597,10 @@ class VirtualLocalFileOperator(FileOperator):
         """
         if self._default_path is None:
             raise PathNotAllowedError(path, [])
-        target = Path(path)
+        target = as_virtual_path(path)
         if not target.is_absolute():
-            target = self._default_path / target
-        # Normalize without resolving against real filesystem
-        normalized = Path(os.path.normpath(target))
+            target = as_virtual_path(self._default_path) / target
+        normalized = normalize_virtual_path(target)
 
         # Validate: must be under at least one mount
         self._find_mount(normalized)
@@ -566,7 +620,7 @@ class VirtualLocalFileOperator(FileOperator):
         virtual = self._resolve_virtual(path)
         mount = self._find_mount(virtual)
         rel = virtual.relative_to(mount.virtual_path)
-        resolved = (mount.host_path.resolve() / rel).resolve()
+        resolved = (mount.host_path.resolve() / Path(rel.as_posix())).resolve()
 
         # Security: verify resolved path hasn't escaped the mount root via symlinks
         mount_root = mount.host_path.resolve()
@@ -620,7 +674,7 @@ class VirtualLocalFileOperator(FileOperator):
         found = self._find_mount_for_host(host_path)
         if found is not None:
             rel = host_path.relative_to(found.host_path.resolve())
-            virtual_abs = found.virtual_path / rel
+            virtual_abs = found.virtual_path / rel.as_posix()
             # Return relative to default_path if possible
             if self._default_path is not None:
                 try:
@@ -664,11 +718,9 @@ class VirtualLocalFileOperator(FileOperator):
     ) -> bytes:
         host = self._to_host(path)
         try:
-            content = await anyio.Path(host).read_bytes()
-            if offset > 0 or length is not None:
-                end = None if length is None else offset + length
-                content = content[offset:end]
-            return content
+            return await anyio.to_thread.run_sync(  # type: ignore[reportAttributeAccessIssue]
+                lambda: _read_path_bytes(host, offset=offset, length=length)
+            )
         except FileNotFoundError as e:
             raise FileOperationError("read", path, "file not found") from e
         except PermissionError as e:
@@ -830,69 +882,95 @@ class VirtualLocalFileOperator(FileOperator):
         except OSError as e:
             raise FileOperationError("stat", path, str(e)) from e
 
-    async def _glob_impl(self, pattern: str) -> list[str]:  # noqa: C901
-        """Find files matching glob pattern.
-
-        Relative patterns are globbed against the default mount's host path.
-        Absolute virtual patterns are matched to the appropriate mount and globbed there.
-        Results are returned as relative paths for relative patterns,
-        or absolute virtual paths for absolute patterns.
-        """
+    async def _walk_files_impl(  # noqa: C901
+        self,
+        root: str = ".",
+        *,
+        max_depth: int | None = None,
+        include_hidden: bool = False,
+        follow_symlinks: bool = False,
+    ) -> AsyncIterator[FileEntry]:
+        """Walk files and directories under the virtual default path."""
         if self._default_path is None:
-            return []
+            return
+        root_virtual = as_virtual_path(root)
+        if not root_virtual.is_absolute():
+            root_virtual = normalize_virtual_path(as_virtual_path(self._default_path) / root_virtual)
+        host_root = self._to_host(str(root_virtual))
+        default_virtual = as_virtual_path(self._default_path)
+        if not await anyio.Path(host_root).exists():
+            return
 
-        pattern_path = Path(pattern)
-        default_mount = self._find_mount(self._default_path)
-        default_host = default_mount.host_path.resolve()
-
-        if pattern_path.is_absolute():
-            # Find which mount this pattern belongs to
-            normalized = Path(os.path.normpath(pattern_path))
-            try:
-                mount = self._find_mount(normalized)
-            except PathNotAllowedError:
-                return []
-            mount_host = mount.host_path.resolve()
-            rel = normalized.relative_to(mount.virtual_path)
-            host_pattern = str(mount_host / rel)
-            matches = []
-            for p_str in glob_module.glob(host_pattern, recursive=True):
-                resolved = Path(p_str).resolve()
-                virtual_rel = self._to_virtual_rel(resolved)
-                if virtual_rel is not None:
-                    matches.append(virtual_rel)
-        else:
-            # Relative pattern: glob on default mount's host path
-            matches = []
-            for p in default_host.glob(pattern):
+        def _logical_path(host_path: Path) -> str | None:
+            virtual = self._to_virtual_rel(host_path.resolve())
+            if virtual is None:
+                return None
+            virtual_path = as_virtual_path(virtual)
+            if virtual_path.is_absolute():
                 try:
-                    rel = p.relative_to(default_host)
-                    matches.append(str(rel))
+                    return virtual_path.relative_to(default_virtual).as_posix()
                 except ValueError:
-                    matches.append(str(p))
+                    return virtual_path.as_posix()
+            return virtual
 
-        # Sort by modification time (newest first)
-        def get_mtime(x: str) -> float:
-            try:
-                target = Path(x)
-                if target.is_absolute():
-                    # Absolute virtual path - translate to host for mtime
-                    host = self._to_host(x)
-                    return host.stat().st_mtime
-                else:
-                    return (default_host / target).stat().st_mtime
-            except (OSError, FileNotFoundError):
-                return 0.0
+        def _walk() -> list[FileEntry]:  # noqa: C901
+            entries: list[FileEntry] = []
+            if host_root.is_file():
+                logical = _logical_path(host_root)
+                if logical is None:
+                    return entries
+                stat = host_root.stat()
+                entries.append(
+                    FileEntry(path=logical, is_file=True, is_dir=False, size=stat.st_size, mtime=stat.st_mtime)
+                )
+                return entries
 
-        matches.sort(key=get_mtime, reverse=True)
-        return matches
+            root_depth = len(host_root.parts)
+            for current, dirnames, filenames in os.walk(host_root, followlinks=follow_symlinks):
+                current_path = Path(current)
+                depth = len(current_path.parts) - root_depth
+                if max_depth is not None and depth >= max_depth:
+                    dirnames[:] = []
+                if not include_hidden:
+                    dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+                    filenames = [name for name in filenames if not name.startswith(".")]
+                for name in sorted(dirnames):
+                    path = current_path / name
+                    logical = _logical_path(path)
+                    if logical is None:
+                        continue
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    entries.append(
+                        FileEntry(path=logical, is_file=False, is_dir=True, size=stat.st_size, mtime=stat.st_mtime)
+                    )
+                for name in sorted(filenames):
+                    path = current_path / name
+                    logical = _logical_path(path)
+                    if logical is None:
+                        continue
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    entries.append(
+                        FileEntry(path=logical, is_file=True, is_dir=False, size=stat.st_size, mtime=stat.st_mtime)
+                    )
+            return entries
+
+        for entry in await anyio.to_thread.run_sync(_walk):  # type: ignore[reportAttributeAccessIssue]
+            yield entry
 
 
 class LocalShell(Shell):
-    """Local shell command executor with path validation.
+    """Local shell command executor with optional sandbox policy.
 
-    Implements the Shell ABC for local command execution.
-    Validates working directory against allowed paths.
+    LocalShell is the single SDK implementation for host shell execution. With
+    no sandbox policy it preserves raw subprocess behavior. When a
+    ShellSandboxRuntimePolicy is provided and enabled, LocalShell routes command
+    creation through the selected sandbox backend.
     """
 
     def __init__(
@@ -901,6 +979,9 @@ class LocalShell(Shell):
         allowed_paths: list[Path] | None = None,
         default_timeout: float = 30.0,
         include_os_env: bool = True,
+        shell_executable: str | None = None,
+        environment_overrides: dict[str, str] | None = None,
+        sandbox_policy: ShellSandboxRuntimePolicy | None = None,
     ):
         """Initialize LocalShell.
 
@@ -914,8 +995,17 @@ class LocalShell(Shell):
                 variables when an explicit env dict is provided to execute().
                 When True (default), os.environ is merged as the base layer.
                 When False, only the explicitly provided env dict is used.
-                Note: when env=None, subprocess always inherits os.environ
-                regardless of this setting (Python subprocess behavior).
+                Note: raw mode with env=None naturally inherits os.environ;
+                sandbox mode always builds an explicit policy-filtered env.
+            shell_executable: Shell executable used by local shell execution.
+                Defaults to /bin/bash on POSIX systems when available and
+                Python's platform default shell otherwise.
+            environment_overrides: Environment values injected before per-call
+                env values. Used by workspace providers to pass runtime secrets
+                and tool configuration into shell commands.
+            sandbox_policy: Optional resolved shell sandbox policy. When
+                provided and enabled, backend, network, mounts, environment
+                allowlist, and raw host allowance affect process creation.
         """
         # Fallback: use first allowed_path as default when only allowed_paths is provided
         if default_cwd is None and allowed_paths:
@@ -927,6 +1017,10 @@ class LocalShell(Shell):
             default_timeout=default_timeout,
         )
         self._include_os_env = include_os_env
+        self._shell_executable = _resolve_shell_executable(shell_executable)
+        self._platform_name = sys.platform
+        self._environment_overrides = dict(environment_overrides or {})
+        self._sandbox_policy = sandbox_policy
 
     def _resolve_cwd(self, cwd: str | None) -> Path:
         """Resolve and validate working directory."""
@@ -960,18 +1054,79 @@ class LocalShell(Shell):
         return False
 
     def _build_effective_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
-        """Build effective environment for subprocess.
+        """Build effective environment for subprocess."""
+        requested = {**self._environment_overrides, **dict(env or {})}
+        policy = self._sandbox_policy
+        if policy is not None and policy.enabled:
+            return self._build_sandbox_env(requested, policy.env_allowlist)
+        return self._build_raw_env(env, requested)
 
-        - include_os_env=True + env provided: merge os.environ as base layer
-        - include_os_env=True + env=None: inherit naturally (pass None)
-        - include_os_env=False + env provided: use only provided env
-        - include_os_env=False + env=None: pass empty dict to prevent inheritance
-        """
+    def _build_raw_env(self, env: dict[str, str] | None, requested: dict[str, str]) -> dict[str, str] | None:
+        if requested:
+            return {**os.environ, **requested} if self._include_os_env else requested
         if env is not None and self._include_os_env:
             return {**os.environ, **env}
         if env is None and not self._include_os_env:
             return {}
         return env
+
+    def _build_sandbox_env(self, requested: dict[str, str], env_allowlist: tuple[str, ...]) -> dict[str, str]:
+        allowlist = set(env_allowlist)
+        if "*" in allowlist:
+            return {**os.environ, **requested} if self._include_os_env else requested
+        filtered = {key: value for key, value in requested.items() if key in allowlist}
+        if self._include_os_env:
+            for key in allowlist:
+                if key in os.environ and key not in filtered:
+                    filtered[key] = os.environ[key]
+        if "HOME" not in filtered and "HOME" in os.environ:
+            filtered["HOME"] = os.environ["HOME"]
+        if "PATH" not in filtered and "PATH" in os.environ:
+            filtered["PATH"] = os.environ["PATH"]
+        return filtered
+
+    def _shell_environment_instruction(self) -> str:
+        shell_type = _shell_type_from_executable(self._shell_executable)
+        parts = [
+            "  <shell-environment>",
+            f"    <platform>{self._platform_name}</platform>",
+            f"    <shell-type>{shell_type}</shell-type>",
+        ]
+        if self._shell_executable is not None:
+            parts.append(f"    <shell-executable>{self._shell_executable}</shell-executable>")
+        parts.append("  </shell-environment>")
+        return "\n".join(parts)
+
+    async def get_context_instructions(self) -> str | None:
+        """Return instructions for the agent about local shell capabilities."""
+        instructions = await super().get_context_instructions()
+        if instructions is None:
+            return None
+        instructions = instructions.replace(
+            "\n  <default-timeout>", f"\n{self._shell_environment_instruction()}\n  <default-timeout>"
+        )
+        if self._sandbox_policy is None:
+            return instructions
+        metadata = self._sandbox_policy.to_metadata()
+        sandbox_lines = [
+            "  <shell-sandbox>",
+            f"    <enabled>{str(self._sandbox_policy.enabled).lower()}</enabled>",
+            f"    <profile>{self._sandbox_policy.profile}</profile>",
+            f"    <backend>{self._sandbox_policy.backend}</backend>",
+            f"    <network>{self._sandbox_policy.network}</network>",
+            f"    <raw-host-allowed>{str(self._sandbox_policy.raw_shell_allowed).lower()}</raw-host-allowed>",
+            "  </shell-sandbox>",
+        ]
+        insertion = "\n".join(sandbox_lines)
+        note = (
+            f"Commands run through YA shell sandbox policy {metadata['profile']} on backend {metadata['backend']}."
+            if self._sandbox_policy.enabled
+            else "Commands will be executed with the working directory validated."
+        )
+        return instructions.replace("\n  <note>", f"\n{insertion}\n  <note>").replace(
+            "Commands will be executed with the working directory validated.",
+            note,
+        )
 
     async def execute(
         self,
@@ -997,19 +1152,55 @@ class LocalShell(Shell):
             raise ShellExecutionError("", stderr="Empty command")
 
         resolved_cwd = self._resolve_cwd(cwd)
-        effective_timeout = timeout
+        sandbox_enabled = self._sandbox_policy is not None and self._sandbox_policy.enabled
+        policy = self._sandbox_policy if sandbox_enabled else None
+        effective_timeout = self._default_timeout if timeout is None and sandbox_enabled else timeout
+        cleanup = lambda: None
 
         try:
             effective_env = self._build_effective_env(env)
+            if policy is not None:
+                if policy.backend == "raw_host" and not policy.raw_shell_allowed:
+                    raise ShellExecutionError(
+                        command, stderr="Raw host shell backend is disabled by shell sandbox policy"
+                    )
+                if policy.backend == "raw_host":
+                    process = await asyncio.create_subprocess_shell(
+                        command,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=resolved_cwd,
+                        env=effective_env,
+                        executable=self._shell_executable,
+                        **process_group_kwargs(),
+                    )
+                else:
+                    from ya_agent_sdk.environment.shell_sandbox.backend import build_sandbox_command
 
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=resolved_cwd,
-                env=effective_env,
-                **_process_group_kwargs(),
-            )
+                    args, cleanup = build_sandbox_command(
+                        command=command,
+                        cwd=resolved_cwd,
+                        policy=policy,
+                        shell_executable=self._shell_executable,
+                    )
+                    process = await asyncio.create_subprocess_exec(
+                        *args,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=resolved_cwd,
+                        env=effective_env,
+                        **process_group_kwargs(),
+                    )
+            else:
+                process = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=resolved_cwd,
+                    env=effective_env,
+                    executable=self._shell_executable,
+                    **process_group_kwargs(),
+                )
 
             try:
                 if effective_timeout is not None:
@@ -1020,7 +1211,7 @@ class LocalShell(Shell):
                 else:
                     stdout_bytes, stderr_bytes = await process.communicate()
             except TimeoutError as e:
-                await _terminate_process_tree(process)
+                await terminate_process_tree(process)
                 raise ShellTimeoutError(command, effective_timeout or 0) from e
 
             stdout = stdout_bytes.decode("utf-8", errors="replace")
@@ -1030,15 +1221,17 @@ class LocalShell(Shell):
         except FileNotFoundError as e:
             raise ShellExecutionError(
                 command,
-                stderr="Command not found",
+                stderr="Shell sandbox backend is unavailable" if policy is not None else "Command not found",
             ) from e
         except PermissionError as e:
             raise ShellExecutionError(
                 command,
-                stderr="Permission denied",
+                stderr="Shell sandbox backend permission denied" if policy is not None else "Permission denied",
             ) from e
         except OSError as e:
             raise ShellExecutionError(command, stderr=str(e)) from e
+        finally:
+            cleanup()
 
     async def _create_process(
         self,
@@ -1058,32 +1251,79 @@ class LocalShell(Shell):
 
         resolved_cwd = self._resolve_cwd(cwd)
         effective_env = self._build_effective_env(env)
+        cleanup = lambda: None
 
         try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=resolved_cwd,
-                env=effective_env,
-                **_process_group_kwargs(),
-            )
+            sandbox_enabled = self._sandbox_policy is not None and self._sandbox_policy.enabled
+            policy = self._sandbox_policy if sandbox_enabled else None
+            if policy is not None:
+                if policy.backend == "raw_host" and not policy.raw_shell_allowed:
+                    raise ShellExecutionError(
+                        command, stderr="Raw host shell backend is disabled by shell sandbox policy"
+                    )
+                if policy.backend == "raw_host":
+                    process = await asyncio.create_subprocess_shell(
+                        command,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=resolved_cwd,
+                        env=effective_env,
+                        executable=self._shell_executable,
+                        **process_group_kwargs(),
+                    )
+                else:
+                    from ya_agent_sdk.environment.shell_sandbox.backend import build_sandbox_command
+
+                    args, cleanup = build_sandbox_command(
+                        command=command,
+                        cwd=resolved_cwd,
+                        policy=policy,
+                        shell_executable=self._shell_executable,
+                    )
+                    process = await asyncio.create_subprocess_exec(
+                        *args,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=resolved_cwd,
+                        env=effective_env,
+                        **process_group_kwargs(),
+                    )
+            else:
+                process = await asyncio.create_subprocess_shell(
+                    command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=resolved_cwd,
+                    env=effective_env,
+                    executable=self._shell_executable,
+                    **process_group_kwargs(),
+                )
         except Exception as e:
+            cleanup()
             raise ShellExecutionError(command, stderr=str(e)) from e
 
         if process.stdout is None or process.stderr is None:
+            cleanup()
             raise ShellExecutionError(command, stderr="Failed to capture subprocess streams")
 
         async def _wait() -> int:
-            await process.wait()
-            return process.returncode or 0
+            try:
+                await process.wait()
+                return process.returncode or 0
+            finally:
+                cleanup()
 
         async def _kill() -> None:
-            await _kill_process_tree(process)
+            try:
+                await kill_process_tree(process)
+            finally:
+                cleanup()
 
         async def _send_signal(sig: int) -> None:
-            _send_process_tree_signal(process, sig)
+            send_process_tree_signal(process, sig)
 
         stdin = StdinAdapter(process.stdin) if process.stdin is not None else None
 
@@ -1132,6 +1372,9 @@ class LocalEnvironment(Environment):
         resource_state: ResourceRegistryState | None = None,
         resource_factories: dict[str, ResourceFactory] | None = None,
         include_os_env: bool = True,
+        shell_executable: str | None = None,
+        environment_overrides: dict[str, str] | None = None,
+        shell_sandbox_policy: ShellSandboxRuntimePolicy | None = None,
     ):
         """Initialize LocalEnvironment.
 
@@ -1150,6 +1393,12 @@ class LocalEnvironment(Environment):
             include_os_env: Whether shell subprocesses include parent process
                 environment variables when explicit env is provided.
                 Passed through to LocalShell. See LocalShell for details.
+            shell_executable: Shell executable used by LocalShell.
+                Defaults to /bin/bash on POSIX systems when available and
+                Python's platform default shell otherwise.
+            environment_overrides: Environment values injected into shell commands.
+            shell_sandbox_policy: Optional LocalShell sandbox policy. The default
+                is raw local subprocess behavior for SDK and YAACLI compatibility.
         """
         super().__init__(
             resource_state=resource_state,
@@ -1161,6 +1410,9 @@ class LocalEnvironment(Environment):
         self._tmp_base_dir = tmp_base_dir
         self._enable_tmp_dir = enable_tmp_dir
         self._include_os_env = include_os_env
+        self._shell_executable = shell_executable
+        self._environment_overrides = dict(environment_overrides or {})
+        self._shell_sandbox_policy = shell_sandbox_policy
         self._tmp_dir_obj: tempfile.TemporaryDirectory[str] | None = None
 
     @property
@@ -1211,6 +1463,9 @@ class LocalEnvironment(Environment):
                 allowed_paths=allowed or None,
                 default_timeout=self._shell_timeout,
                 include_os_env=self._include_os_env,
+                shell_executable=self._shell_executable,
+                environment_overrides=self._environment_overrides,
+                sandbox_policy=self._shell_sandbox_policy,
             )
 
     async def _teardown(self) -> None:

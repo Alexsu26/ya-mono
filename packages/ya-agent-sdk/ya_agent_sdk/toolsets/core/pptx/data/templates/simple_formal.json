@@ -1,0 +1,54 @@
+{
+  "asset_policy": {
+    "allow_public_image_search": false,
+    "preferred_kinds": []
+  },
+  "id": "simple_formal",
+  "keywords": [],
+  "layouts": [
+    {
+      "description": "Simple title slide",
+      "id": "cover",
+      "role": "cover"
+    },
+    {
+      "description": "Simple agenda",
+      "id": "agenda",
+      "role": "agenda"
+    },
+    {
+      "description": "Simple divider",
+      "id": "section",
+      "role": "section"
+    },
+    {
+      "description": "Simple content",
+      "id": "content",
+      "role": "content"
+    },
+    {
+      "description": "Simple case slide",
+      "id": "case",
+      "role": "case"
+    },
+    {
+      "description": "Simple visual placeholder",
+      "id": "image_placeholder",
+      "role": "image_placeholder"
+    },
+    {
+      "description": "Simple summary",
+      "id": "summary",
+      "role": "summary"
+    }
+  ],
+  "scene": "simple_formal",
+  "style": "simple_formal",
+  "theme": {
+    "accentColor": "4A5568",
+    "backgroundColor": "FFFFFF",
+    "bodyColor": "333333",
+    "fontFace": "Aptos",
+    "titleColor": "222222"
+  }
+}

@@ -2,11 +2,12 @@
 
 import io
 import os
+from types import MappingProxyType
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from PIL import Image
-from pydantic_ai.messages import BinaryContent, ModelRequest, UserPromptPart
+from pydantic_ai.messages import BinaryContent, ModelRequest, ToolReturnPart, UserPromptPart
 from ya_agent_sdk.context import AgentContext, ModelConfig
 from ya_agent_sdk.filters.image import _raw_bytes_limit_for_base64, compress_large_images
 from ya_agent_sdk.utils import compress_image_data
@@ -382,6 +383,7 @@ def test_raw_bytes_limit_for_base64():
     assert _raw_bytes_limit_for_base64(0) == 0
     # Small values
     assert _raw_bytes_limit_for_base64(4) == 3
+    assert _raw_bytes_limit_for_base64(6) == 3
     assert _raw_bytes_limit_for_base64(100) == 75
 
 
@@ -429,3 +431,63 @@ async def test_filter_compresses_image_near_base64_boundary():
         f"Compressed image ({len(content[0].data)} bytes) exceeds "
         f"raw budget ({raw_budget} bytes) for {api_limit} byte API limit"
     )
+
+
+@pytest.mark.anyio
+async def test_filter_compresses_tool_return_image_content():
+    """ToolReturnPart binary images should be compressed before being sent back to the model."""
+    large_png = _make_png(4000, 4000)
+    max_bytes = len(large_png) // 2
+    ctx = _make_ctx(max_image_bytes=max_bytes)
+
+    messages = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="fetch",
+                    tool_call_id="call_1",
+                    content=BinaryContent(data=large_png, media_type="image/png"),
+                ),
+            ]
+        ),
+    ]
+
+    result = await compress_large_images(ctx, messages)
+    part = result[0].parts[0]
+    assert isinstance(part, ToolReturnPart)
+    assert isinstance(part.content, BinaryContent)
+    assert len(part.content.data) <= max_bytes
+    assert part.content.media_type == "image/jpeg"
+
+
+@pytest.mark.anyio
+async def test_filter_compresses_nested_tool_return_image_content():
+    """Nested BinaryContent in ToolReturnPart payloads should be compressed recursively."""
+    large_png = _make_png(4000, 4000)
+    max_bytes = len(large_png) // 2
+    ctx = _make_ctx(max_image_bytes=max_bytes)
+
+    messages = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="fetch",
+                    tool_call_id="call_1",
+                    content=MappingProxyType({
+                        "items": ["preview", BinaryContent(data=large_png, media_type="image/png")]
+                    }),
+                ),
+            ]
+        ),
+    ]
+
+    result = await compress_large_images(ctx, messages)
+    part = result[0].parts[0]
+    assert isinstance(part, ToolReturnPart)
+    assert isinstance(part.content, dict)
+    items = part.content["items"]
+    assert isinstance(items, list)
+    assert items[0] == "preview"
+    assert isinstance(items[1], BinaryContent)
+    assert len(items[1].data) <= max_bytes
+    assert items[1].media_type == "image/jpeg"

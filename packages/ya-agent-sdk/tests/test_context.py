@@ -52,6 +52,26 @@ async def test_model_config_image_split_custom_values() -> None:
     assert cfg.image_split_overlap == 64
 
 
+async def test_model_config_stream_resume_defaults() -> None:
+    """Should provide stream resume retry defaults."""
+    cfg = ModelConfig()
+    assert cfg.stream_resume_on_error is False
+    assert cfg.stream_resume_max_attempts == 3
+    assert cfg.stream_resume_prompt is None
+
+
+async def test_model_config_stream_resume_custom_values() -> None:
+    """Should allow overriding stream resume retry config values."""
+    cfg = ModelConfig(
+        stream_resume_on_error=True,
+        stream_resume_max_attempts=5,
+        stream_resume_prompt="resume from checkpoint",
+    )
+    assert cfg.stream_resume_on_error is True
+    assert cfg.stream_resume_max_attempts == 5
+    assert cfg.stream_resume_prompt == "resume from checkpoint"
+
+
 async def test_agent_context_elapsed_time_before_start(env: LocalEnvironment) -> None:
     """Should return None before context is started."""
     ctx = AgentContext(env=env)
@@ -127,18 +147,21 @@ async def test_agent_context_create_subagent_context_inherits_security(env: Loca
 
 
 async def test_agent_context_create_subagent_context_resets_prompts(env: LocalEnvironment) -> None:
-    """Should reset user_prompts and steering_messages for subagent context."""
+    """Should reset user_prompts, previous assistant reference, and steering_messages for subagents."""
     parent = AgentContext(env=env)
     parent.user_prompts = "Parent prompt"
+    parent.previous_assistant_response_reference = "Previous parent response"
     parent.steering_messages = ["Parent steering 1", "Parent steering 2"]
 
     async with parent.create_subagent_context("search") as child:
         # Subagent should have independent prompt tracking
         assert child.user_prompts is None  # Reset, to be set by subagent caller
+        assert child.previous_assistant_response_reference is None
         assert child.steering_messages == []  # Fresh queue for subagent
 
         # Parent's prompts should be unaffected
         assert parent.user_prompts == "Parent prompt"
+        assert parent.previous_assistant_response_reference == "Previous parent response"
         assert parent.steering_messages == ["Parent steering 1", "Parent steering 2"]
 
 
@@ -695,6 +718,7 @@ async def test_export_and_with_state_empty(env: LocalEnvironment) -> None:
         assert state.user_prompts is None
         assert state.steering_messages == []
         assert state.handoff_message is None
+        assert state.shell_env == {}
         assert state.deferred_tool_metadata == {}
 
     # Restore to new context
@@ -726,8 +750,10 @@ async def test_export_and_with_state_with_data(env: LocalEnvironment) -> None:
             ledger_key="test-uuid",
         )
         ctx.user_prompts = "Test prompt"
+        ctx.previous_assistant_response_reference = "Previous response with numbered options"
         ctx.steering_messages = ["Steering 1", "Steering 2"]
         ctx.handoff_message = "Handoff summary"
+        ctx.shell_env = {"BASE_KEY": "base_value", "PATH": "/workspace/bin"}
         ctx.deferred_tool_metadata["tool-1"] = {"key": "value"}
 
         # Default export does NOT include usage_snapshot_entries
@@ -753,8 +779,10 @@ async def test_export_and_with_state_with_data(env: LocalEnvironment) -> None:
         # Verify usage_snapshot_entries is empty (not restored by default)
         assert new_ctx.usage_snapshot_entries == {}
         assert new_ctx.user_prompts == "Test prompt"
+        assert new_ctx.previous_assistant_response_reference == "Previous response with numbered options"
         assert new_ctx.steering_messages == ["Steering 1", "Steering 2"]
         assert new_ctx.handoff_message == "Handoff summary"
+        assert new_ctx.shell_env == {"BASE_KEY": "base_value", "PATH": "/workspace/bin"}
         assert new_ctx.deferred_tool_metadata == {"tool-1": {"key": "value"}}
 
 
@@ -1103,6 +1131,41 @@ async def test_resumable_state_with_multiple_binary_contents(env: LocalEnvironme
         assert content2[0].media_type == "image/jpeg"
 
 
+async def test_resumable_state_with_tool_return_binary_content(env: LocalEnvironment) -> None:
+    """Should restore BinaryContent inside ToolReturnPart content after JSON round-trip."""
+    from pydantic_ai.messages import BinaryContent, ModelRequest, ToolReturnPart
+    from ya_agent_sdk.context import ResumableState
+
+    image_data = b"\x89PNG\r\n\x1a\nexample"
+
+    async with AgentContext(env=env) as ctx:
+        ctx.subagent_history["fetch-agent"] = [
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="fetch",
+                        content=[BinaryContent(data=image_data, media_type="image/png")],
+                        tool_call_id="call_1",
+                    )
+                ]
+            )
+        ]
+
+        json_str = ctx.export_state().model_dump_json()
+        restored_state = ResumableState.model_validate_json(json_str)
+        history = restored_state.to_subagent_history()
+
+        request = history["fetch-agent"][0]
+        assert isinstance(request, ModelRequest)
+        part = request.parts[0]
+        assert isinstance(part, ToolReturnPart)
+        assert isinstance(part.content, list)
+        restored_content = part.content[0]
+        assert isinstance(restored_content, BinaryContent)
+        assert restored_content.data == image_data
+        assert restored_content.media_type == "image/png"
+
+
 async def test_resumable_state_with_need_user_approve_tools(env: LocalEnvironment) -> None:
     """Should serialize and deserialize ResumableState with need_user_approve_tools."""
     from ya_agent_sdk.context import ResumableState
@@ -1248,12 +1311,12 @@ def test_tool_id_wrapper_wrap_event_function_tool_result() -> None:
 
     wrapper = ToolIdWrapper()
     result_part = ToolReturnPart(tool_name="test_tool", tool_call_id="original-id", content="result")
-    event = FunctionToolResultEvent(result=result_part)
+    event = FunctionToolResultEvent(part=result_part)
 
     result = wrapper.wrap_event(event)
 
     assert result.tool_call_id.startswith("ya-")
-    assert result.result.tool_call_id.startswith("ya-")
+    assert result.part.tool_call_id.startswith("ya-")
 
 
 def test_tool_id_wrapper_wrap_event_part_start() -> None:
@@ -1412,7 +1475,7 @@ def test_tool_id_wrapper_consistency_across_methods() -> None:
 
     # Wrap via result event - should use same normalized ID
     result_part = ToolReturnPart(tool_name="test", tool_call_id=original_id, content="done")
-    result_event = FunctionToolResultEvent(result=result_part)
+    result_event = FunctionToolResultEvent(part=result_part)
     wrapper.wrap_event(result_event)
 
     # Wrap via messages - should use same normalized ID
@@ -1421,7 +1484,7 @@ def test_tool_id_wrapper_consistency_across_methods() -> None:
     wrapper.wrap_messages(mock_ctx, messages)
 
     # All should have same normalized ID
-    assert call_event.part.tool_call_id == result_event.result.tool_call_id
+    assert call_event.part.tool_call_id == result_event.part.tool_call_id
     assert call_event.part.tool_call_id == messages[0].parts[0].tool_call_id
 
 

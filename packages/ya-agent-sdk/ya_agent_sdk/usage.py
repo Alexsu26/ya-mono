@@ -17,14 +17,14 @@ _RUN_USAGE_FIELD_NAMES = frozenset(field.name for field in fields(RunUsage))
 
 def coerce_run_usage(usage: object) -> RunUsage:
     """Convert Pydantic AI usage wrappers into a concrete ``RunUsage`` instance."""
-    if type(usage) is RunUsage:
+    if is_dataclass(usage):
         return RunUsage(**_run_usage_data(usage))
     if callable(usage):
         usage = usage()
     return RunUsage(**_run_usage_data(usage))
 
 
-def _run_usage_data(usage: Any) -> dict[str, Any]:
+def _run_usage_data(usage: object) -> dict[str, Any]:
     if not is_dataclass(usage):
         raise TypeError(f"Expected RunUsage-compatible dataclass, got {type(usage).__name__}")
 
@@ -90,19 +90,3 @@ class UsageSnapshot(BaseModel):
 
     model_usages: dict[str, RunUsage] = Field(default_factory=dict)
     """Cumulative usage grouped by model identifier."""
-
-
-class InternalUsage(BaseModel):
-    """Backward-compatible usage record for internal model calls."""
-
-    model_id: str
-    usage: RunUsage
-
-
-class ExtraUsageRecord(BaseModel):
-    """Backward-compatible projection of a usage ledger entry."""
-
-    uuid: str
-    agent: str
-    model_id: str
-    usage: RunUsage

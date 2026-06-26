@@ -44,3 +44,12 @@ class AgentSettings(BaseSettings):
 
     compact_model: str | None = None
     """Model to use for compact when native capability is unavailable."""
+
+    pptx_pexels_api_key: str | None = None
+    """Optional Pexels API key for PPTX public image search."""
+
+    pptx_unsplash_access_key: str | None = None
+    """Optional Unsplash access key for PPTX public image search."""
+
+    pptx_asset_search_enabled: bool = True
+    """Whether PPTX public image search is enabled when provider keys are configured."""

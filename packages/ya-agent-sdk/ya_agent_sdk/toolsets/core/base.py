@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, cast
 from pydantic import BaseModel, Field
 from pydantic_ai import ApprovalRequired, CallDeferred, RunContext, Tool, UserError
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import InstructionPart, ModelMessage
 from pydantic_ai.tools import (
     DeferredToolResults,
     ToolApproved,
@@ -59,7 +59,7 @@ class UserInteraction(BaseModel):
         "If true, 'user_input' may contain additional data provided by the user.",
     )
     reason: str | None = Field(None, description="The reason for rejection, if any.")
-    user_input: Any = Field(
+    user_input: object = Field(
         None,
         description="Additional user input data. Structure depends on tool implementation.",
     )
@@ -469,7 +469,7 @@ class Toolset(BaseToolset[AgentDepsT]):
         """Create a pydantic_ai Tool wrapper for a BaseTool instance."""
 
         @functools.wraps(tool_instance.call)
-        async def _call(ctx: RunContext[AgentDepsT], **kwargs: Any) -> Any:
+        async def _call(ctx: RunContext[AgentDepsT], **kwargs: object) -> object:
             return await tool_instance.call(ctx, **kwargs)
 
         return Tool(
@@ -490,7 +490,8 @@ class Toolset(BaseToolset[AgentDepsT]):
         logger.debug(f"get_tools called, preparing {len(self._tool_classes)} tools")
 
         # Phase 1: determine basic availability and collect tags
-        available_names: set[str] = set()
+        # Use a list to preserve registration order for deterministic tool output.
+        available_names: list[str] = []
         collected_tags: set[str] = set()
 
         for name in self._tool_classes:
@@ -499,7 +500,7 @@ class Toolset(BaseToolset[AgentDepsT]):
             if self._skip_unavailable and not tool_instance.is_available(ctx):
                 logger.debug(f"Skipping unavailable tool {name!r}")
                 continue
-            available_names.add(name)
+            available_names.append(name)
             collected_tags.update(tool_instance.tags)
 
         # Set collected tags on context (recomputed fresh each call)
@@ -547,7 +548,7 @@ class Toolset(BaseToolset[AgentDepsT]):
         args: dict[str, Any],
         ctx: RunContext[AgentDepsT],
         tool: HookableToolsetTool[AgentDepsT],
-    ) -> Any:
+    ) -> object:
         """Execute the tool function and capture exceptions.
 
         Subclasses can override this method to customize tool execution,
@@ -577,7 +578,7 @@ class Toolset(BaseToolset[AgentDepsT]):
         tool_args: dict[str, Any],
         ctx: RunContext[AgentDepsT],
         tool: ToolsetTool[AgentDepsT],
-    ) -> Any:
+    ) -> object:
         """Call a tool with hooks.
 
         Execution order: global_pre -> tool_pre -> execute -> tool_post -> global_post
@@ -661,17 +662,18 @@ class Toolset(BaseToolset[AgentDepsT]):
         logger.debug(f"call_tool: {name!r} completed successfully")
         return result
 
-    async def get_instructions(self, ctx: RunContext[AgentDepsT]) -> str | list[str] | None:
-        """Collect instructions from all tools with group-based deduplication.
+    async def get_instructions(self, ctx: RunContext[AgentDepsT]) -> list[InstructionPart] | None:
+        """Collect static instructions from all tools with group-based deduplication.
 
         When multiple tools return Instructions with the same group,
-        only the first one is included. Tools returning plain strings
-        use their tool name as the implicit group.
+        only the first one is included. Tools returning plain strings use their
+        tool name as the implicit group.
 
         Uses the same two-phase filtering as get_tools() to ensure only
         available and non-superseded tools contribute instructions.
 
-        Returns a combined instruction string or None if no tools have instructions.
+        Returns Pydantic AI ``InstructionPart`` objects with ``dynamic=False``
+        so tool instructions can participate in prompt caching.
         """
         # Phase 1: determine available tools and collect tags (same as get_tools)
         # Use a list to preserve registration order for deterministic deduplication
@@ -686,7 +688,7 @@ class Toolset(BaseToolset[AgentDepsT]):
             collected_tags.update(tool_instance.tags)
 
         # Phase 2: collect instructions, filtering superseded tools
-        instructions: dict[str, str] = {}  # group -> content
+        instructions: dict[str, InstructionPart] = {}  # group -> part
 
         for name in available_names:
             tool_instance = self._get_tool_instance(name)
@@ -702,14 +704,20 @@ class Toolset(BaseToolset[AgentDepsT]):
 
             if isinstance(result, Instruction):
                 group, content = result.group, result.content
-            else:  # str - use tool name as implicit group
+            else:  # str - use tool name as implicit group and keep static by default
                 group, content = tool_instance.name, result
+
+            if not content.strip():
+                continue
 
             # First instruction for this group wins
             if group not in instructions:
-                instructions[group] = f'<tool-instruction name="{group}">{content}</tool-instruction>'
+                instructions[group] = InstructionPart(
+                    content=f'<tool-instruction name="{group}">{content}</tool-instruction>',
+                    dynamic=False,
+                )
 
-        return "\n".join(instructions.values()) if instructions else None
+        return list(instructions.values()) or None
 
     def _get_tool_impl_by_name(self, name: str) -> BaseTool | None:
         """Get a tool instance by name."""

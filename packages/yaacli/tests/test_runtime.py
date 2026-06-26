@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
-from yaacli.browser import BrowserManager
+from pydantic_ai.messages import ModelRequest, UserPromptPart
+from ya_agent_sdk.agents.lifecycle import ContextHandoffCompleteContext, ContextHandoffSource
+from ya_agent_sdk.filters.handoff import process_handoff_message
 from yaacli.config import (
-    BrowserConfig,
     GeneralConfig,
     MCPConfig,
     MCPServerConfig,
@@ -15,7 +16,8 @@ from yaacli.config import (
     ToolsConfig,
     YaacliConfig,
 )
-from yaacli.runtime import create_tui_runtime
+from yaacli.runtime import GoalContextHandoffExtension, create_tui_runtime
+from yaacli.toolsets.background import SpawnDelegateTool, SteerSubagentTool
 
 # =============================================================================
 # create_tui_runtime Tests
@@ -37,63 +39,7 @@ def test_create_tui_runtime_minimal(tmp_path: Path) -> None:
     assert runtime.env is not None
     assert runtime.ctx is not None
     assert runtime.agent is not None
-
-
-def test_create_tui_runtime_uses_active_model_profile(tmp_path: Path) -> None:
-    """Named active model profiles are used to create the main runtime."""
-    config = YaacliConfig(
-        general=GeneralConfig(active_model="gpt"),
-        models={
-            "gpt": ModelProfileConfig(
-                model="openai-chat:gpt-4o",
-                model_settings="openai_default",
-                model_cfg="openai",
-            )
-        },
-    )
-
-    runtime = create_tui_runtime(
-        config=config,
-        working_dir=tmp_path,
-    )
-
-    assert runtime.agent.model is not None
-    assert runtime.ctx.model_cfg.context_window == 270_000
-
-
-def test_apply_model_profile_passes_codex_oauth_headers(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """Runtime /model switching preserves Codex OAuth session headers."""
-    from yaacli.runtime import apply_model_profile
-
-    calls: list[tuple[str, dict[str, str] | None]] = []
-
-    def fake_infer(model: str, extra_headers: dict[str, str] | None = None) -> None:
-        calls.append((model, extra_headers))
-        return None
-
-    runtime = create_tui_runtime(
-        config=YaacliConfig(general=GeneralConfig(model="openai-chat:gpt-4")),
-        working_dir=tmp_path,
-    )
-    monkeypatch.setattr("yaacli.runtime.infer_model", fake_infer)
-
-    apply_model_profile(runtime, ModelProfileConfig(model="oauth@codex:gpt-5.5"))
-
-    assert calls == [
-        (
-            "oauth@codex:gpt-5.5",
-            {
-                "session_id": runtime.ctx.run_id,
-                "session-id": runtime.ctx.run_id,
-                "thread_id": runtime.ctx.run_id,
-                "thread-id": runtime.ctx.run_id,
-                "x-client-request-id": runtime.ctx.run_id,
-            },
-        )
-    ]
+    assert any(isinstance(extension, GoalContextHandoffExtension) for extension in runtime.lifecycle_extensions)
 
 
 async def test_create_tui_runtime_uses_custom_config_dir_for_allowed_paths(tmp_path: Path) -> None:
@@ -138,6 +84,113 @@ async def test_create_tui_runtime_orders_skill_paths_by_priority(tmp_path: Path)
         assert allowed_paths[:4] == expected_prefix
 
 
+def test_create_tui_runtime_uses_persisted_model_profile(tmp_path: Path) -> None:
+    """Runtime uses the persisted model profile at startup."""
+    from yaacli.model_profiles import save_selected_model_profile_id
+
+    config_dir = tmp_path / "config"
+    config = YaacliConfig(
+        general=GeneralConfig(
+            model="openai-chat:gpt-4",
+            model_cfg="claude_200k",
+        ),
+        model_profiles={
+            "long": ModelProfileConfig(
+                label="Long",
+                model="openai-chat:gpt-4",
+                model_cfg="gemini_1m",
+            ),
+        },
+    )
+    save_selected_model_profile_id(config_dir, "long")
+
+    runtime = create_tui_runtime(
+        config=config,
+        working_dir=tmp_path,
+        config_dir=config_dir,
+    )
+
+    assert runtime.ctx.model_cfg.context_window == 1_000_000
+
+
+async def test_goal_context_handoff_extension_marks_active_goal() -> None:
+    """YAACLI lifecycle extension should mark active goals after context handoff."""
+    from yaacli.session import TUIContext
+
+    ctx = TUIContext.model_construct()
+    ctx.goal_task = "fix tests"
+    ctx.goal_iteration = 0
+    ctx.goal_max_iterations = 10
+    ctx.goal_needs_post_restore_audit = False
+    ctx.goal_last_context_handoff_source = None
+    extension = GoalContextHandoffExtension()
+
+    await extension.on_context_handoff_complete(
+        ContextHandoffCompleteContext(
+            event_id="handoff-1",
+            deps=ctx,
+            source=ContextHandoffSource.COMPACT,
+            original_messages=[],
+            trimmed_messages=[],
+            handoff_messages=[],
+            summary_markdown="summary",
+        )
+    )
+
+    assert ctx.goal_needs_post_restore_audit is True
+    assert ctx.goal_last_context_handoff_source == "compact"
+
+
+async def test_goal_context_handoff_extension_marks_goal_through_handoff_filter() -> None:
+    """The summarize handoff filter should trigger YAACLI goal post-restore audit state."""
+    from yaacli.session import TUIContext
+
+    ctx = TUIContext()
+    ctx.goal_task = "fix tests"
+    ctx.lifecycle_extensions = [GoalContextHandoffExtension()]
+    ctx.handoff_message = "# Context Summary\n\nContinue the task."
+    run_ctx = MagicMock()
+    run_ctx.deps = ctx
+
+    result = await process_handoff_message(
+        run_ctx,
+        [ModelRequest(parts=[UserPromptPart(content="original request")])],
+    )
+
+    assert len(result) == 1
+    assert ctx.handoff_message is None
+    assert ctx.goal_needs_post_restore_audit is True
+    assert ctx.goal_last_context_handoff_source == "summarize_tool"
+
+
+async def test_goal_context_handoff_extension_ignores_inactive_goal() -> None:
+    """Inactive goal contexts should not get post-restore audit state."""
+    from yaacli.session import TUIContext
+
+    ctx = TUIContext.model_construct()
+    ctx.goal_task = None
+    ctx.goal_iteration = 0
+    ctx.goal_max_iterations = 10
+    ctx.goal_needs_post_restore_audit = False
+    ctx.goal_last_context_handoff_source = None
+    extension = GoalContextHandoffExtension()
+
+    await extension.on_context_handoff_complete(
+        ContextHandoffCompleteContext(
+            event_id="handoff-1",
+            deps=ctx,
+            source=ContextHandoffSource.SUMMARIZE_TOOL,
+            original_messages=[],
+            trimmed_messages=[],
+            handoff_messages=[],
+            summary_markdown="summary",
+        )
+    )
+
+    assert ctx.goal_needs_post_restore_audit is False
+    assert ctx.goal_last_context_handoff_source is None
+
+
 def test_create_tui_runtime_with_model_settings(tmp_path: Path) -> None:
     """Test creating runtime with model settings preset."""
     # Use openai which is more commonly mocked in tests
@@ -178,29 +231,9 @@ def test_create_tui_runtime_with_mcp_servers(tmp_path: Path) -> None:
     )
 
     assert runtime is not None
-
-
-def test_create_tui_runtime_with_browser_manager(tmp_path: Path) -> None:
-    """Test creating runtime with browser manager."""
-    config = YaacliConfig(
-        general=GeneralConfig(model="openai-chat:gpt-4"),
-    )
-
-    # Create a mock browser manager
-    browser_config = BrowserConfig(cdp_url="ws://localhost:9222")
-    browser_manager = BrowserManager(browser_config)
-    # Manually set cdp_url to simulate started state
-    browser_manager._cdp_url = "ws://localhost:9222"
-
-    # Mock get_browser_toolset to avoid importing actual toolset
-    with patch.object(browser_manager, "get_browser_toolset", return_value=None):
-        runtime = create_tui_runtime(
-            config=config,
-            browser_manager=browser_manager,
-            working_dir=tmp_path,
-        )
-
-    assert runtime is not None
+    mcp_proxy = next(toolset for toolset in runtime.agent.toolsets if getattr(toolset, "prefix", None) == "mcp")
+    assert mcp_proxy.search_tool_name == "mcp_search_tool"
+    assert mcp_proxy.call_tool_name == "mcp_call_tool"
 
 
 def test_create_tui_runtime_with_need_approval(tmp_path: Path) -> None:
@@ -300,6 +333,47 @@ def test_create_tui_runtime_with_model_cfg_dict(tmp_path: Path) -> None:
     assert runtime.ctx.model_cfg.context_window == 100_000
     assert runtime.ctx.model_cfg.max_images == 10
     assert ModelCapability.vision in runtime.ctx.model_cfg.capabilities
+
+
+def test_create_tui_runtime_can_disable_async_subagents(tmp_path: Path) -> None:
+    config = YaacliConfig(
+        general=GeneralConfig(model="openai-chat:gpt-4"),
+    )
+
+    runtime = create_tui_runtime(
+        config=config,
+        working_dir=tmp_path,
+        enable_async_subagents=False,
+    )
+
+    assert runtime.core_toolset is not None
+    assert "spawn_delegate" not in runtime.core_toolset._tool_classes
+    assert "steer_subagent" not in runtime.core_toolset._tool_classes
+    assert "shell_monitor" in runtime.core_toolset._tool_classes
+    assert SpawnDelegateTool.name == "spawn_delegate"
+    assert SteerSubagentTool.name == "steer_subagent"
+
+
+def test_create_tui_runtime_can_disable_delegate_subagents(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    subagents_dir = config_dir / "subagents"
+    subagents_dir.mkdir(parents=True)
+    (subagents_dir / "helper.md").write_text(
+        "---\nname: helper\ndescription: Helper subagent\n---\n\nYou are a helper.\n"
+    )
+    config = YaacliConfig(
+        general=GeneralConfig(model="openai-chat:gpt-4"),
+    )
+
+    runtime = create_tui_runtime(
+        config=config,
+        working_dir=tmp_path,
+        config_dir=config_dir,
+        enable_delegate_subagents=False,
+    )
+
+    assert runtime.core_toolset is not None
+    assert "delegate" not in runtime.core_toolset._tool_classes
 
 
 def test_create_tui_runtime_with_no_model_cfg(tmp_path: Path) -> None:

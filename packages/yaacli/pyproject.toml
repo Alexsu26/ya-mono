@@ -22,6 +22,7 @@ Repository = "https://github.com/wh1isper/ya-mono"
 
 [project.scripts]
 yaacli = "yaacli.cli:cli"
+yaacli-desktop-sidecar = "yaacli.desktop.sidecar:main"
 
 [project.optional-dependencies]
 rs = ["ya-agent-sdk[all,rs]"]
@@ -41,28 +42,31 @@ bump = true
 [tool.hatch.metadata.hooks.uv-dynamic-versioning]
 dependencies = [
     "ya-agent-sdk[all]=={{ version }}",
+    "ya-agent-stream-protocol=={{ version }}",
     "ya-oauth=={{ version }}",
     "ya-oauth-provider=={{ version }}",
     "click>=8.0",
     "pillow>=10.0.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
-    "pydantic-ai>=1.96.0",
+    "pydantic-ai>=1.100.0,<2",
     "pyobjc-framework-Cocoa>=10.0; platform_system == 'Darwin'",
     "python-dotenv>=1.0.0",
     "textual>=0.87",
-    "y-agent-environment>=0.1.0",
+    "ya-agent-environment=={{ version }}",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["yaacli"]
 
 [tool.uv.sources]
+ya-agent-environment = { workspace = true }
 ya-agent-sdk = { workspace = true }
+ya-agent-stream-protocol = { workspace = true }
 ya-oauth = { workspace = true }
 ya-oauth-provider = { workspace = true }
 
 [tool.deptry]
 ignore = ["DEP001"]
-package_module_name_map = { "click" = "click", "pillow" = "PIL", "pydantic" = "pydantic", "pydantic-ai" = "pydantic_ai", "pydantic-settings" = "pydantic_settings", "pyobjc-framework-Cocoa" = "AppKit|Foundation", "python-dotenv" = "dotenv", "textual" = "textual", "ya-agent-sdk" = "ya_agent_sdk", "ya-oauth" = "ya_oauth", "ya-oauth-provider" = "ya_oauth_provider", "y-agent-environment" = "y_agent_environment" }
-per_rule_ignores = { DEP001 = ["quick_validate"], DEP003 = ["anyio", "click", "dotenv", "prompt_toolkit", "pillow", "pydantic", "pydantic_ai", "pydantic_settings", "pyobjc-framework-Cocoa", "rich", "textual", "yaml", "y_agent_environment", "ya_agent_sdk", "ya_oauth", "ya_oauth_provider", "yaacli"], DEP004 = ["pytest"] }
+package_module_name_map = { "click" = "click", "pillow" = "PIL", "pydantic" = "pydantic", "pydantic-ai" = "pydantic_ai", "pydantic-settings" = "pydantic_settings", "pyobjc-framework-Cocoa" = "AppKit|Foundation", "python-dotenv" = "dotenv", "textual" = "textual", "ya-agent-sdk" = "ya_agent_sdk", "ya-agent-stream-protocol" = "ya_agent_stream_protocol", "ya-agent-environment" = "ya_agent_environment", "ya-oauth" = "ya_oauth", "ya-oauth-provider" = "ya_oauth_provider" }
+per_rule_ignores = { DEP001 = ["quick_validate"], DEP003 = ["anyio", "click", "dotenv", "prompt_toolkit", "pillow", "pydantic", "pydantic_ai", "pydantic_settings", "pyobjc-framework-Cocoa", "rich", "textual", "yaml", "ya_agent_environment", "ya_agent_sdk", "ya_agent_stream_protocol", "yaacli"], DEP004 = ["pytest"] }

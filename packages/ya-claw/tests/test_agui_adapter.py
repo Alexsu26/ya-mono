@@ -4,11 +4,14 @@ from pydantic_ai import PartDeltaEvent, PartEndEvent, PartStartEvent, TextPartDe
 from pydantic_ai.messages import TextPart
 from ya_agent_sdk.context.agent import StreamEvent
 from ya_agent_sdk.events import ModelRequestStartEvent
-from ya_claw.agui_adapter import AguiEventAdapter, AguiReplayBuffer
+from ya_agent_stream_protocol.agui import AguiReplayBuffer
+from ya_agent_stream_protocol.sdk import AguiAdapterConfig, AguiEventAdapter
+
+CLAW_ADAPTER_CONFIG = AguiAdapterConfig(run_event_prefix="ya_claw")
 
 
 def test_agui_adapter_maps_text_stream_events_and_compacts_replay() -> None:
-    adapter = AguiEventAdapter(session_id="session-1", run_id="run-1")
+    adapter = AguiEventAdapter(session_id="session-1", run_id="run-1", config=CLAW_ADAPTER_CONFIG)
     replay = AguiReplayBuffer()
 
     stream_events = [
@@ -55,12 +58,12 @@ def test_agui_adapter_maps_text_stream_events_and_compacts_replay() -> None:
         "TEXT_MESSAGE_END",
     ]
 
-    replay.append(adapter.build_run_finished_event(result={"output_summary": "hello world"}))
+    replay.append(adapter.build_run_finished_event(result={"output_text": "hello world"}))
 
     compacted = replay.snapshot()
     assert [event["type"] for event in compacted] == ["CUSTOM", "TEXT_MESSAGE_CHUNK", "RUN_FINISHED"]
     assert compacted[1]["delta"] == "hello world"
-    assert "result" not in compacted[2]
+    assert compacted[2]["result"] == {"output_text": "hello world"}
 
 
 def test_agui_replay_buffer_merges_tool_call_chunks() -> None:
@@ -91,12 +94,21 @@ def test_agui_replay_buffer_merges_tool_call_chunks() -> None:
     assert compacted[1]["type"] == "TOOL_CALL_RESULT"
 
 
-def test_agui_adapter_maps_run_lifecycle_events() -> None:
-    adapter = AguiEventAdapter(session_id="session-1", run_id="run-1")
+def test_agui_replay_buffer_stores_chunk_fragments_until_snapshot() -> None:
+    replay = AguiReplayBuffer()
+    for index in range(5):
+        replay.append({"type": "TEXT_MESSAGE_CHUNK", "messageId": "message-1", "delta": str(index)})
 
-    queued = adapter.build_run_queued_event({"status": "queued"})
+    assert replay.events == [{"type": "TEXT_MESSAGE_CHUNK", "messageId": "message-1", "delta": ""}]
+    assert replay.snapshot()[0]["delta"] == "01234"
+
+
+def test_agui_adapter_maps_run_lifecycle_events() -> None:
+    adapter = AguiEventAdapter(session_id="session-1", run_id="run-1", config=CLAW_ADAPTER_CONFIG)
+
+    queued = adapter.build_run_custom_event("run_queued", {"status": "queued"})
     started = adapter.build_run_started_event()
-    finished = adapter.build_run_finished_event(result={"output_summary": "done"})
+    finished = adapter.build_run_finished_event(result={"output_text": "done"})
     errored = adapter.build_run_error_event(message="boom", code="error")
 
     assert queued["type"] == "CUSTOM"
@@ -104,6 +116,6 @@ def test_agui_adapter_maps_run_lifecycle_events() -> None:
     assert started["type"] == "RUN_STARTED"
     assert started["runId"] == "run-1"
     assert finished["type"] == "RUN_FINISHED"
-    assert "result" not in finished
+    assert finished["result"] == {"output_text": "done"}
     assert errored["type"] == "RUN_ERROR"
     assert errored["message"] == "boom"

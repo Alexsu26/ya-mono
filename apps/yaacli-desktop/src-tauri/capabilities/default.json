@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "description": "Minimal capability set for the YAACLI Desktop main window",
+  "identifier": "default",
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "notification:default",
+    "updater:default"
+  ],
+  "windows": [
+    "main"
+  ]
+}

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Development placeholder. The bundle build replaces this file with the
+# self-contained PyInstaller executable before Tauri packages it.
+exec uv run --package yaacli yaacli-desktop-sidecar "$@"

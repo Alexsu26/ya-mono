@@ -21,24 +21,43 @@ Yet Another Agent SDK for building AI agents with [Pydantic AI](https://ai.pydan
 - Human-in-the-loop approval workflows
 - Event system and streaming support
 - Message bus for agent coordination and user steering
-- Browser automation with Docker sandbox support
 
 ## Installation
 
 ```bash
-pip install ya-agent-sdk[all]
-uv add ya-agent-sdk[all]
+pip install 'ya-agent-sdk[all,rs]'
+uv add 'ya-agent-sdk[all,rs]'
 ```
 
-Selective extras:
+`[rs]` adds the native Rust filesystem search binding. Selective extras:
 
 ```bash
-pip install ya-agent-sdk[docker]
-pip install ya-agent-sdk[web]
-pip install ya-agent-sdk[document]
-pip install ya-agent-sdk[s3]
-pip install ya-agent-sdk[tool-search]
+pip install 'ya-agent-sdk[rs]'
+pip install 'ya-agent-sdk[docker]'
+pip install 'ya-agent-sdk[web]'
+pip install 'ya-agent-sdk[document]'
+pip install 'ya-agent-sdk[s3]'
+pip install 'ya-agent-sdk[tool-search]'
+pip install 'ya-agent-sdk[oauth]'
 ```
+
+## OAuth-backed Codex
+
+Use your ChatGPT/Codex subscription through `ya-oauth`:
+
+```bash
+uv run --package ya-oauth ya-oauth login codex
+```
+
+Then select the OAuth model string:
+
+```python
+from ya_agent_sdk.agents import create_agent
+
+runtime = create_agent("oauth@codex:gpt-5.5")
+```
+
+The SDK passes stable session and thread headers into the OAuth provider. YA Claw sets the provider session header from the session ID and the provider thread header from the run ID.
 
 ## Quick Start
 
@@ -54,6 +73,42 @@ async with stream_agent(runtime, "Hello") as streamer:
     async for event in streamer:
         print(event)
 ```
+
+## Local Shell Sandbox Policy
+
+`LocalShell` is the SDK's single local subprocess implementation. By default, `LocalShell` and `LocalEnvironment` preserve raw local subprocess behavior for SDK and YAACLI compatibility. Pass a resolved `ShellSandboxRuntimePolicy` to `LocalShell(sandbox_policy=...)` or `LocalEnvironment(shell_sandbox_policy=...)` to route commands through the selected local sandbox backend. `SandboxedLocalShell` is exported as a direct alias of `LocalShell` for naming convenience.
+
+Path masks are opt-in. `ShellSandboxConfig.masked_path_aliases` provides recommended aliases such as `common_credentials`, `ssh`, `aws`, and `kube`; `masked_paths` accepts concrete paths. Linux bubblewrap applies these masks as tmpfs mounts inside the sandbox.
+
+## Shell Command Review
+
+Configure shell command review on `AgentContext.security.shell_review` to run a small reviewer model before shell execution:
+
+```python
+from ya_agent_sdk.agents import create_agent, stream_agent
+from ya_agent_sdk.context import SecurityConfig, ShellReviewConfig
+
+runtime = create_agent(
+    "gateway@openai-responses:gpt-5.5",
+    extra_context_kwargs={
+        "security": SecurityConfig(
+            shell_review=ShellReviewConfig(
+                enabled=True,
+                model="gateway@openai-responses:gpt-5.4-mini",
+                model_settings="openai_responses_low",
+                on_needs_approval="defer",
+                risk_threshold="high",
+            )
+        )
+    },
+)
+
+async with stream_agent(runtime, "Run the test suite") as streamer:
+    async for event in streamer:
+        print(event)
+```
+
+`model` is required when shell review is enabled. `model_settings` accepts SDK preset names or an inline settings dictionary. `on_needs_approval` supports `defer` for HITL-capable runtimes and `deny` for autopilot runtimes. `risk_threshold` defaults to `high` and controls when the configured action triggers.
 
 ## Model Preset Tips
 
@@ -80,7 +135,6 @@ This package lives in the [`ya-mono`](https://github.com/wh1isper/ya-mono) works
 | --- | --- |
 | [`general.py`](https://github.com/wh1isper/ya-mono/tree/main/examples/general.py) | Production pattern with streaming, HITL approval, and session persistence |
 | [`deepresearch.py`](https://github.com/wh1isper/ya-mono/tree/main/examples/deepresearch.py) | Autonomous research agent with web search and content extraction |
-| [`browser_use.py`](https://github.com/wh1isper/ya-mono/tree/main/examples/browser_use.py) | Browser automation with Docker-based headless Chrome sandbox |
 
 ## Reference Files
 

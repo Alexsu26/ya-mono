@@ -20,14 +20,36 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from ya_claw.orm.base import Base
 
 _ALLOWED_RUN_STATUSES = ("queued", "running", "completed", "failed", "cancelled")
-_ALLOWED_SESSION_TYPES = ("conversation", "memory")
-_ALLOWED_BRIDGE_EVENT_STATUSES = ("received", "queued", "submitted", "steered", "duplicate", "failed")
+_ALLOWED_SESSION_TYPES = ("conversation", "memory", "agency", "async_task")
+_ALLOWED_BRIDGE_EVENT_STATUSES = ("received", "queued", "submitted", "steered", "deferred", "duplicate", "failed")
+_ALLOWED_AGENCY_FIRE_STATUSES = ("pending", "submitted", "steered", "merged", "consumed", "failed")
+_ALLOWED_ASYNC_TASK_STATUSES = ("queued", "running", "completed", "failed", "cancelled")
+_ALLOWED_ASYNC_TASK_WAKE_POLICIES = ("steer_or_run", "record_only")
+_ALLOWED_HITL_BATCH_STATUSES = ("pending", "completed", "cancelled")
+_ALLOWED_HITL_INTERACTION_STATUSES = ("pending", "approved", "denied")
+_ALLOWED_HITL_DEFERRED_INPUT_STATUSES = ("pending", "consumed", "discarded")
+_ALLOWED_BRIDGE_HITL_MESSAGE_STATUSES = ("active", "completed", "failed")
 _ALLOWED_SCHEDULE_STATUSES = ("active", "paused", "completed", "deleted")
 _ALLOWED_SCHEDULE_TRIGGER_KINDS = ("cron", "once")
-_ALLOWED_SCHEDULE_EXECUTION_MODES = ("continue_session", "fork_session", "isolate_session")
+_ALLOWED_SCHEDULE_EXECUTION_MODES = ("continue_session", "fork_session", "isolate_session", "workflow")
 _ALLOWED_SCHEDULE_ACTIVE_POLICIES = ("steer", "queue")
 _ALLOWED_SCHEDULE_FIRE_STATUSES = ("pending", "submitted", "steered", "skipped", "failed")
 _ALLOWED_HEARTBEAT_FIRE_STATUSES = ("pending", "submitted", "skipped", "failed")
+_ALLOWED_WORKFLOW_DEFINITION_STATUSES = ("draft", "active", "archived")
+_ALLOWED_WORKFLOW_SCOPES = ("global", "session")
+_ALLOWED_WORKFLOW_RUN_STATUSES = ("queued", "running", "waiting", "completed", "failed", "cancelled")
+_ALLOWED_WORKFLOW_TRIGGER_KINDS = ("web", "api", "agent", "schedule", "bridge", "system")
+_ALLOWED_WORKFLOW_NODE_RUN_STATUSES = (
+    "pending",
+    "ready",
+    "queued",
+    "running",
+    "waiting",
+    "completed",
+    "failed",
+    "cancelled",
+    "skipped",
+)
 
 
 def utc_now() -> datetime:
@@ -71,6 +93,7 @@ class SessionRecord(Base):
         ),
         Index("ix_sessions_session_type_updated", "session_type", "updated_at"),
         Index("ix_sessions_source_session", "source_session_id"),
+        Index("ix_sessions_type_source_unique", "session_type", "source_session_id", unique=True),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -113,7 +136,6 @@ class RunRecord(Base):
     input_parts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     run_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
     output_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    output_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     termination_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -124,6 +146,43 @@ class RunRecord(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     session: Mapped[SessionRecord] = relationship(back_populates="runs")
+
+
+class SessionAsyncTaskRecord(Base):
+    __tablename__ = "session_async_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN {_ALLOWED_ASYNC_TASK_STATUSES!s}",
+            name="ck_session_async_tasks_status",
+        ),
+        CheckConstraint(
+            f"wake_policy IN {_ALLOWED_ASYNC_TASK_WAKE_POLICIES!s}",
+            name="ck_session_async_tasks_wake_policy",
+        ),
+        UniqueConstraint("parent_session_id", "name", name="uq_session_async_tasks_parent_name"),
+        Index("ix_session_async_tasks_parent_status", "parent_session_id", "status"),
+        Index("ix_session_async_tasks_task_session", "task_session_id"),
+        Index("ix_session_async_tasks_task_run", "task_run_id"),
+        Index("ix_session_async_tasks_name", "parent_session_id", "name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    parent_session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
+    parent_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    parent_agent_id: Mapped[str] = mapped_column(String(255), default="main")
+    task_session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
+    task_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    subagent_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    wake_policy: Mapped[str] = mapped_column(String(32), default="steer_or_run")
+    input_parts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    result_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    task_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SessionMemoryStateRecord(Base):
@@ -146,6 +205,39 @@ class SessionMemoryStateRecord(Base):
     memory_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class AgencyFireRecord(Base):
+    __tablename__ = "agency_fires"
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN {_ALLOWED_AGENCY_FIRE_STATUSES!s}",
+            name="ck_agency_fires_status",
+        ),
+        UniqueConstraint("dedupe_key", name="uq_agency_fires_dedupe"),
+        Index("ix_agency_fires_status_scheduled", "status", "scheduled_at"),
+        Index("ix_agency_fires_kind_created", "kind", "created_at"),
+        Index("ix_agency_fires_run", "run_id"),
+        Index("ix_agency_fires_source", "source_session_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_session_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    agency_session_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    active_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, default=100)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ScheduleRecord(Base):
@@ -192,11 +284,14 @@ class ScheduleRecord(Base):
     source_session_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     on_active: Mapped[str] = mapped_column(String(32), default="queue")
     input_parts_template: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    workflow_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    workflow_inputs_template: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     schedule_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
     last_fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_fire_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_session_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_workflow_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     fire_count: Mapped[int] = mapped_column(Integer, default=0)
     failure_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -227,6 +322,7 @@ class ScheduleFireRecord(Base):
     created_session_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     active_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    workflow_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     input_parts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     fire_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
@@ -257,6 +353,126 @@ class HeartbeatFireRecord(Base):
     fire_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class WorkflowDefinitionRecord(Base):
+    __tablename__ = "workflow_definitions"
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN {_ALLOWED_WORKFLOW_DEFINITION_STATUSES!s}",
+            name="ck_workflow_definitions_status",
+        ),
+        CheckConstraint(
+            f"scope IN {_ALLOWED_WORKFLOW_SCOPES!s}",
+            name="ck_workflow_definitions_scope",
+        ),
+        Index("ix_workflow_definitions_status_updated", "status", "updated_at"),
+        Index("ix_workflow_definitions_owner_session", "owner_session_id"),
+        Index("ix_workflow_definitions_scope_status", "scope", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    definition_version: Mapped[int] = mapped_column(Integer, default=1)
+    schema_version: Mapped[str] = mapped_column(String(64), default="ya-claw.workflow.v1")
+    owner_kind: Mapped[str] = mapped_column(String(32), default="api")
+    owner_session_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    owner_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    scope: Mapped[str] = mapped_column(String(32), default="global")
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    when_to_use: Mapped[str | None] = mapped_column(Text, nullable=True)
+    argument_hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input_schema: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    definition: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    workflow_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WorkflowRunRecord(Base):
+    __tablename__ = "workflow_runs"
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN {_ALLOWED_WORKFLOW_RUN_STATUSES!s}",
+            name="ck_workflow_runs_status",
+        ),
+        CheckConstraint(
+            f"trigger_kind IN {_ALLOWED_WORKFLOW_TRIGGER_KINDS!s}",
+            name="ck_workflow_runs_trigger_kind",
+        ),
+        Index("ix_workflow_runs_workflow_created", "workflow_id", "created_at"),
+        Index("ix_workflow_runs_status_updated", "status", "updated_at"),
+        Index("ix_workflow_runs_supervisor_session", "supervisor_session_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    workflow_id: Mapped[str] = mapped_column(ForeignKey("workflow_definitions.id", ondelete="CASCADE"), nullable=False)
+    workflow_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    definition_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    trigger_kind: Mapped[str] = mapped_column(String(32), default="api")
+    supervisor_session_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    supervisor_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    profile_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    workspace: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    inputs: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_node_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    workflow_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class WorkflowNodeRunRecord(Base):
+    __tablename__ = "workflow_node_runs"
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN {_ALLOWED_WORKFLOW_NODE_RUN_STATUSES!s}",
+            name="ck_workflow_node_runs_status",
+        ),
+        Index("ix_workflow_node_runs_workflow_node", "workflow_run_id", "node_id"),
+        Index("ix_workflow_node_runs_run", "run_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    workflow_run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False)
+    node_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    attempt_no: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    profile_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    input_parts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    output_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    needs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    node_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class WorkflowEventRecord(Base):
+    __tablename__ = "workflow_events"
+    __table_args__ = (
+        Index("ix_workflow_events_run_created", "workflow_run_id", "created_at"),
+        Index("ix_workflow_events_node", "node_run_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    workflow_run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False)
+    node_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source_kind: Mapped[str] = mapped_column(String(32), default="workflow")
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class BridgeConversationRecord(Base):
@@ -308,6 +524,121 @@ class BridgeEventRecord(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class HitlBatchRecord(Base):
+    __tablename__ = "hitl_batches"
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN {_ALLOWED_HITL_BATCH_STATUSES!s}",
+            name="ck_hitl_batches_status",
+        ),
+        Index("ix_hitl_batches_run_status", "run_id", "status"),
+        Index("ix_hitl_batches_session_status", "session_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    current_interaction_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    deferred_requests: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class HitlInteractionRecord(Base):
+    __tablename__ = "hitl_interactions"
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN {_ALLOWED_HITL_INTERACTION_STATUSES!s}",
+            name="ck_hitl_interactions_status",
+        ),
+        UniqueConstraint("batch_id", "interaction_id", name="uq_hitl_interactions_batch_interaction"),
+        Index("ix_hitl_interactions_run_status", "run_id", "status"),
+        Index("ix_hitl_interactions_batch_sequence", "batch_id", "sequence_no"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("hitl_batches.id", ondelete="CASCADE"), nullable=False)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), nullable=False)
+    interaction_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    tool_call_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    tool_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    kind: Mapped[str] = mapped_column(String(64), default="approval")
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    arguments_preview: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    interaction_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class HitlDeferredInputRecord(Base):
+    __tablename__ = "hitl_deferred_inputs"
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN {_ALLOWED_HITL_DEFERRED_INPUT_STATUSES!s}",
+            name="ck_hitl_deferred_inputs_status",
+        ),
+        UniqueConstraint("adapter", "tenant_key", "external_event_id", name="uq_hitl_deferred_inputs_event"),
+        UniqueConstraint("adapter", "tenant_key", "external_message_id", name="uq_hitl_deferred_inputs_message"),
+        Index("ix_hitl_deferred_inputs_batch_sequence", "batch_id", "sequence_no"),
+        Index("ix_hitl_deferred_inputs_run_status", "run_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("hitl_batches.id", ondelete="CASCADE"), nullable=False)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), nullable=False)
+    conversation_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    adapter: Mapped[str] = mapped_column(String(32), nullable=False)
+    tenant_key: Mapped[str] = mapped_column(String(255), nullable=False, default="default")
+    external_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    external_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    external_chat_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_parts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    source_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BridgeHitlMessageRecord(Base):
+    __tablename__ = "bridge_hitl_messages"
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN {_ALLOWED_BRIDGE_HITL_MESSAGE_STATUSES!s}",
+            name="ck_bridge_hitl_messages_status",
+        ),
+        UniqueConstraint("adapter", "tenant_key", "external_message_id", name="uq_bridge_hitl_messages_message"),
+        Index("ix_bridge_hitl_messages_run", "run_id"),
+        Index("ix_bridge_hitl_messages_batch", "batch_id"),
+        Index("ix_bridge_hitl_messages_chat_status", "adapter", "tenant_key", "external_chat_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    adapter: Mapped[str] = mapped_column(String(32), nullable=False)
+    tenant_key: Mapped[str] = mapped_column(String(255), nullable=False, default="default")
+    external_chat_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    external_message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), nullable=False)
+    batch_id: Mapped[str | None] = mapped_column(ForeignKey("hitl_batches.id", ondelete="SET NULL"), nullable=True)
+    interaction_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class RuntimeInstanceRecord(Base):

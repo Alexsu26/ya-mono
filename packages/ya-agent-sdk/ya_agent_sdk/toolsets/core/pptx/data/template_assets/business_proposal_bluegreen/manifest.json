@@ -1,0 +1,27 @@
+{
+  "backgrounds": {
+    "agenda": "backgrounds/agenda.png",
+    "content": "backgrounds/content.png",
+    "cover": "backgrounds/cover.png",
+    "hero_image": "backgrounds/content.png",
+    "hub_spoke": "backgrounds/hub_spoke.png",
+    "matrix_2x2": "backgrounds/content.png",
+    "metric_cards": "backgrounds/content.png",
+    "party_roles": "backgrounds/party_roles.png",
+    "risk_grid": "backgrounds/risk_grid.png",
+    "section": "backgrounds/section.png",
+    "summary": "backgrounds/summary.png",
+    "timeline": "backgrounds/timeline.png",
+    "two_column": "backgrounds/two_column.png"
+  },
+  "id": "business_proposal_bluegreen",
+  "source": "project cooperation proposal template",
+  "strategy": "template_background_with_editable_text_overlay",
+  "typography": {
+    "body_min_pt": 16,
+    "diagram_min_pt": 14,
+    "footnote_min_pt": 10,
+    "table_min_pt": 14,
+    "title_min_pt": 30
+  }
+}

@@ -1,9 +1,40 @@
 version: 1
 profiles:
+# Example ChatGPT/Codex subscription-backed profile. Run `ya-oauth login codex`
+# on the YA Claw host before selecting this profile.
+# - name: codex-oauth
+#   model: oauth@codex:gpt-5.5
+#   model_settings_preset: openai_responses_high
+#   model_config_preset: gpt5_270k
+#   builtin_toolsets:
+#   - core
 - name: default
   model: gateway@openai-responses:gpt-5.5
   model_settings_preset: openai_responses_high
   model_config_preset: gpt5_270k
+  security:
+    shell_review:
+      enabled: false
+      model: gateway@openai-responses:gpt-5.4-mini
+      model_settings: openai_responses_low
+      on_needs_approval: deny
+      risk_threshold: extra_high
+      unattended_risk_threshold: high
+    shell_sandbox:
+      enabled: true
+      profile: workspace_write
+      backend_preference: auto
+      network: full
+      env_allowlist:
+        - "*"
+      # Optional path masks hide selected host paths inside local sandbox shells.
+      # Recommended aliases: common_credentials, ssh, gnupg, aws, gcloud, docker, kube.
+      # masked_path_aliases:
+      #   - common_credentials
+      # masked_paths:
+      #   - ~/.custom-secret-dir
+      raw_shell_approval: requires_human
+      audit_enabled: true
   system_prompt: |-
     <agent_behavior>
 
@@ -495,6 +526,32 @@ profiles:
   enabled_mcps: []
   disabled_mcps: []
   mcp_servers: {}
+  enabled: true
+  source_type: seed
+  source_version: '1'
+- name: ppt-agent
+  model: oauth@codex:gpt-5.5
+  model_settings_preset: openai_responses_high
+  model_config_preset: gpt5_270k
+  system_prompt: |-
+    You are a PPT Agent for internal use. Generate a real editable .pptx file from user requirements and supported attachments.
+    Do not invent business data, numeric metrics, customer names, legal facts, or real-world case details. Preserve missing facts as editable placeholders.
+    Use template-first planning. Produce an internal SlidePlan JSON, call pptx_render, and return the final .pptx path.
+    Before calling pptx_render, self-check that every agenda, content, case, and summary slide has at least one body_blocks item or one visual_slots item. Never call pptx_render with title-only business slides.
+    For business proposal decks with scene=business_proposal and style=consulting_report, use the blue-green cooperation proposal template grammar: white background, blue #036EB8 structural blocks, green #34BF49 accents, PART navigation, section dividers, tables, timelines, hub-spoke diagrams, and party-role cards.
+    For business_proposal consulting_report, template-backed layouts are mandatory. Build the SlidePlan so it can reuse the built-in blue-green template assets through layouts such as cover, agenda, section, hub_spoke, party_roles, timeline, risk_grid, two_column, matrix_2x2, metric_cards, and summary.
+    A full business_proposal consulting_report deck must include at least one section slide, one hub_spoke ecosystem/system slide, and one party_roles cooperation/workstream slide. Do not rely mostly on metric_cards and matrix_2x2; use varied rhythms across section, hub_spoke, party_roles, timeline, risk_grid, two_column, matrix_2x2, and metric_cards.
+    Use commercial report layouts where appropriate: hero_image for cover/context slides, metric_cards for KPI/economic indicators, matrix_2x2 for SWOT or Ansoff, hub_spoke for central platforms/ecosystems, party_roles for cooperation responsibilities/workstreams, risk_grid for risk management, timeline for implementation plans, and two_column for operating model or comparison pages.
+    Keep commercial report typography presentation-grade: short titles, concise body_blocks, no dense pasted paragraphs, and split content across slides instead of shrinking text.
+    Each non-cover commercial slide should include source-grounded body_blocks with concrete facts from the supplied files or explicit editable placeholders for missing facts. Include source_refs when a claim comes from an attachment.
+    Use available workspace images as hero/background visual_slots when they match the deck topic. A business proposal should not be purely text-and-shape when relevant image assets are available.
+    Use public image search for background and generic illustration assets when useful. Do not download online PPT templates.
+  builtin_toolsets:
+  - filesystem
+  - shell
+  - document
+  - web
+  - pptx
   enabled: true
   source_type: seed
   source_version: '1'

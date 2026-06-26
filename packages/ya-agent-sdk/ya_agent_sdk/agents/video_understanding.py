@@ -15,12 +15,13 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, BinaryContent, ModelSettings, VideoUrl
 from pydantic_ai.models import Model
+from pydantic_ai.usage import RunUsage
 
 from ya_agent_sdk._config import AgentSettings
 from ya_agent_sdk._logger import logger
 from ya_agent_sdk.agents.models import infer_model
 from ya_agent_sdk.presets import resolve_model_settings
-from ya_agent_sdk.usage import InternalUsage
+from ya_agent_sdk.usage import coerce_run_usage
 
 
 class VideoError(Exception):
@@ -85,8 +86,10 @@ Include:
 - Any audio content: speech (transcribe it), music, sound effects
 - The context, purpose, or intent behind what's shown
 - Any notable details, transitions, or key moments
+- Details that are unclear, low-confidence, too small, too fast, hidden, cropped, inaudible, or summarized at a high level
+- Useful follow-up focuses a downstream agent could request with more specific view instructions
 
-Be thorough and comprehensive. The more detail, the better.
+Be thorough and comprehensive. The more detail, the better. Explicitly name any moments or regions where a focused second pass could reveal more detail.
 """
 
 
@@ -217,8 +220,7 @@ def get_video_understanding_agent(
         output_type=VideoDescription,
         system_prompt=system_prompt,
         model_settings=model_settings,
-        retries=3,
-        output_retries=3,
+        retries={"tools": 3, "output": 3},
     )
 
 
@@ -232,7 +234,7 @@ async def get_video_description(
     max_video_size: int = DEFAULT_MAX_VIDEO_SIZE,
     model_wrapper: Callable[[Model, str, dict[str, Any]], Model | Awaitable[Model]] | None = None,
     wrapper_metadata: dict[str, Any] | None = None,
-) -> tuple[str, InternalUsage]:
+) -> tuple[str, str, RunUsage]:
     """Analyze a video and get a structured description.
 
     Args:
@@ -247,7 +249,7 @@ async def get_video_description(
         wrapper_metadata: Context dict passed to model_wrapper (e.g., from ctx.get_wrapper_metadata()).
 
     Returns:
-        Tuple of (description string, InternalUsage with model_id and usage).
+        Tuple of (description string, model_id, usage).
 
     Raises:
         VideoInputError: If video input is invalid.
@@ -284,4 +286,4 @@ async def get_video_description(
     # Get model_id from agent's model
     model_id = cast(Model, agent.model).model_name
 
-    return result.output.description, InternalUsage(model_id=model_id, usage=result.usage())
+    return result.output.description, model_id, coerce_run_usage(result.usage)

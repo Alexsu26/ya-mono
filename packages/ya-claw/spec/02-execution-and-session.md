@@ -34,7 +34,7 @@ Suggested session fields:
 - `id`
 - `parent_session_id`
 - `profile_name`
-- `metadata`
+- `metadata` including optional `workspace` binding
 - `head_run_id`
 - `head_success_run_id`
 - `active_run_id`
@@ -54,6 +54,14 @@ A high-level session continuation follows this rule:
 1. use explicit `restore_from_run_id` when provided
 2. otherwise use `head_success_run_id`
 
+### Session Workspace Rule
+
+A session can carry a durable workspace binding in `metadata["workspace"]`. The binding describes mounted folders, the default mount, and the default cwd for every continuation in the session.
+
+Session creation can accept `workspace` as a first-class request field. The controller stores that value in session metadata. Session continuation inherits the session workspace and can accept a run-level override for one execution.
+
+Workspace mount-set details live in [10-workspace-mount-sets.md](10-workspace-mount-sets.md).
+
 ## Run Model
 
 A run is one execution attempt inside a session.
@@ -68,9 +76,8 @@ Suggested run fields:
 - `trigger_type`
 - `profile_name`
 - `input_parts`
-- `metadata`
+- `metadata` including optional run-level `workspace` override
 - `output_text`
-- `output_summary`
 - `error_message`
 - `termination_reason`
 - `created_at`
@@ -108,6 +115,7 @@ It enables:
 
 - API acceptance before execution begins
 - unified execution for API, schedules, heartbeat, and bridges
+- trigger-specific Docker sandbox scope for conversation and automatic runs
 - concurrency control and future worker scaling
 - cancellation before claim
 - restart recovery and claim scans after process restart
@@ -152,6 +160,14 @@ Responsibilities:
 - persist best-effort checkpoints
 - commit final continuity blobs
 - advance run and session pointers through the execution state machine
+
+Workspace resolution uses session metadata plus run metadata. A run inherits the session workspace binding by default. A run-level `metadata["workspace"]` value replaces the session binding for that run.
+
+Docker sandbox scope follows trigger type:
+
+- API, bridge, and memory runs use the session-scoped Docker sandbox generation
+- schedule and heartbeat runs use run-scoped Docker sandboxes and close them at terminal state
+- local backend runs use resolved path bindings and skip Docker sandbox lifecycle
 
 ## Execution Registry and Runtime State
 
@@ -218,7 +234,7 @@ A successful commit should:
 
 1. persist `state.json` for the run
 2. persist compacted AGUI replay events to `message.json`
-3. persist final `output_text` and `output_summary` on the run record
+3. persist final `output_text` on the run record
 4. set `committed_at`
 5. set session `head_success_run_id`
 6. clear session `active_run_id`

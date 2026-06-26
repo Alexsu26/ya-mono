@@ -4,12 +4,14 @@ import asyncio
 import contextlib
 import os
 import shlex
+import shutil
 import signal
+import sys
 from pathlib import Path
 
 import pytest
 from inline_snapshot import snapshot
-from y_agent_environment import FileOperationError, PathNotAllowedError, ShellTimeoutError
+from ya_agent_environment import FileOperationError, PathNotAllowedError, ShellTimeoutError
 from ya_agent_sdk.environment import (
     LocalEnvironment,
     LocalFileOperator,
@@ -244,75 +246,6 @@ async def test_file_operator_stat_dir(tmp_path: Path) -> None:
     assert stat["is_dir"] is True
 
 
-async def test_file_operator_glob_relative(tmp_path: Path) -> None:
-    """Should glob files with relative pattern."""
-    (tmp_path / "a.txt").write_text("a")
-    (tmp_path / "b.txt").write_text("b")
-    (tmp_path / "c.py").write_text("c")
-    op = LocalFileOperator(default_path=tmp_path, allowed_paths=[tmp_path])
-    matches = await op.glob("*.txt")
-    assert set(matches) == {"a.txt", "b.txt"}
-
-
-async def test_file_operator_glob_recursive(tmp_path: Path) -> None:
-    """Should glob files recursively with ** pattern."""
-    (tmp_path / "a.txt").write_text("a")
-    subdir = tmp_path / "sub"
-    subdir.mkdir()
-    (subdir / "b.txt").write_text("b")
-    op = LocalFileOperator(default_path=tmp_path, allowed_paths=[tmp_path])
-    matches = await op.glob("**/*.txt")
-    assert "sub/b.txt" in matches
-
-
-async def test_file_operator_glob_absolute_path(tmp_path: Path) -> None:
-    """Should glob files with absolute path pattern."""
-    (tmp_path / "test.txt").write_text("test")
-    op = LocalFileOperator(default_path=tmp_path, allowed_paths=[tmp_path])
-    pattern = str(tmp_path / "*.txt")
-    matches = await op.glob(pattern)
-    assert len(matches) == 1
-    assert str(tmp_path / "test.txt") in matches
-
-
-async def test_file_operator_glob_absolute_path_security(tmp_path: Path) -> None:
-    """Should filter absolute glob results by allowed_paths."""
-    # Create a file in tmp_path
-    (tmp_path / "allowed.txt").write_text("allowed")
-
-    # Create another directory NOT in allowed_paths
-    other_dir = tmp_path / "other"
-    other_dir.mkdir()
-    (other_dir / "not_allowed.txt").write_text("not allowed")
-
-    # Only tmp_path is allowed, not other_dir
-    op = LocalFileOperator(default_path=tmp_path, allowed_paths=[tmp_path])
-
-    # Glob for files in other_dir should return empty (security filter)
-    pattern = str(other_dir / "*.txt")
-    matches = await op.glob(pattern)
-
-    # other_dir is a subdirectory of tmp_path, so it IS allowed
-    # This test verifies the security check works for truly outside paths
-    assert len(matches) == 1  # other_dir is under tmp_path, so it's allowed
-
-
-async def test_file_operator_glob_sorted_by_mtime(tmp_path: Path) -> None:
-    """Should return glob results sorted by modification time (newest first)."""
-    import time
-
-    (tmp_path / "old.txt").write_text("old")
-    time.sleep(0.1)
-    (tmp_path / "new.txt").write_text("new")
-
-    op = LocalFileOperator(default_path=tmp_path, allowed_paths=[tmp_path])
-    matches = await op.glob("*.txt")
-
-    # Newest file should be first
-    assert matches[0] == "new.txt"
-    assert matches[1] == "old.txt"
-
-
 async def test_file_operator_get_context_instructions(tmp_path: Path) -> None:
     """Should return context instructions in XML format with file tree."""
     (tmp_path / "src").mkdir()
@@ -358,7 +291,10 @@ def _process_is_running(pid: int) -> bool:
 
     proc_stat = Path(f"/proc/{pid}/stat")
     if proc_stat.exists():
-        parts = proc_stat.read_text().split()
+        try:
+            parts = proc_stat.read_text().split()
+        except (FileNotFoundError, ProcessLookupError):
+            return False
         if len(parts) >= 3 and parts[2] == "Z":
             return False
 
@@ -439,6 +375,7 @@ async def test_shell_execute_timeout(tmp_path: Path) -> None:
         await shell.execute("sleep 10", timeout=0.1)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX shell process tree test")
 async def test_shell_background_kill_terminates_child_process(tmp_path: Path) -> None:
     """Killing a background shell process should terminate spawned child processes."""
     shell = LocalShell(default_cwd=tmp_path, allowed_paths=[tmp_path])
@@ -464,7 +401,7 @@ async def test_shell_execute_command_not_found(tmp_path: Path) -> None:
     shell = LocalShell(default_cwd=tmp_path, allowed_paths=[tmp_path])
     exit_code, _, stderr = await shell.execute("nonexistent_command_xyz")
     assert exit_code != 0
-    assert "not found" in stderr.lower()
+    assert "not found" in stderr.lower() or "not recognized" in stderr.lower()
 
 
 async def test_shell_execute_returns_stderr(tmp_path: Path) -> None:
@@ -475,13 +412,74 @@ async def test_shell_execute_returns_stderr(tmp_path: Path) -> None:
     assert stderr
 
 
+async def test_shell_get_context_instructions_with_platform_default_shell() -> None:
+    """Should describe platform default shell execution when no executable is configured."""
+    shell = LocalShell(
+        default_cwd=Path("/workspace"),
+        allowed_paths=[Path("/workspace")],
+        default_timeout=30.0,
+        shell_executable="",
+    )
+    instructions = await shell.get_context_instructions()
+
+    assert instructions is not None
+    assert "<shell-environment>" in instructions
+    assert f"<platform>{sys.platform}</platform>" in instructions
+    assert "<shell-type>platform-default</shell-type>" in instructions
+    assert "<shell-executable>" not in instructions
+
+
+async def test_shell_uses_bash_by_default_on_posix() -> None:
+    """Should use Bash as the default shell executable on POSIX when available."""
+    shell = LocalShell(default_cwd=Path("/workspace"), allowed_paths=[Path("/workspace")])
+    if os.name == "posix" and Path("/bin/bash").exists():
+        assert shell._shell_executable == "/bin/bash"
+    elif os.name == "posix":
+        assert shell._shell_executable == shutil.which("bash")
+    else:
+        assert shell._shell_executable is None
+
+
+async def test_shell_get_context_instructions_with_custom_shell() -> None:
+    """Should describe custom shell executable by basename."""
+    shell = LocalShell(
+        default_cwd=Path("/workspace"),
+        allowed_paths=[Path("/workspace")],
+        default_timeout=30.0,
+        shell_executable="/bin/zsh",
+    )
+    shell._platform_name = "linux"
+    instructions = await shell.get_context_instructions()
+
+    assert instructions is not None
+    assert "<shell-type>zsh</shell-type>" in instructions
+    assert "<shell-executable>/bin/zsh</shell-executable>" in instructions
+
+
+async def test_environment_get_context_instructions_with_custom_shell(tmp_path: Path) -> None:
+    """Should pass custom shell executable through LocalEnvironment context."""
+    async with LocalEnvironment(
+        default_path=tmp_path,
+        allowed_paths=[tmp_path],
+        shell_executable="/bin/zsh",
+    ) as env:
+        instructions = await env.shell.get_context_instructions()
+
+    assert instructions is not None
+    assert "<shell-type>zsh</shell-type>" in instructions
+    assert "<shell-executable>/bin/zsh</shell-executable>" in instructions
+
+
+@pytest.mark.skipif(os.name != "posix", reason="snapshot uses POSIX path formatting")
 async def test_shell_get_context_instructions() -> None:
     """Should return context instructions in XML format."""
     shell = LocalShell(
         default_cwd=Path("/workspace"),
         allowed_paths=[Path("/workspace")],
         default_timeout=30.0,
+        shell_executable="/bin/bash",
     )
+    shell._platform_name = "linux"
     instructions = await shell.get_context_instructions()
     assert instructions == snapshot(
         """\
@@ -490,6 +488,11 @@ async def test_shell_get_context_instructions() -> None:
     <path>/workspace</path>
   </allowed-working-directories>
   <default-working-directory>/workspace</default-working-directory>
+  <shell-environment>
+    <platform>linux</platform>
+    <shell-type>bash</shell-type>
+    <shell-executable>/bin/bash</shell-executable>
+  </shell-environment>
   <default-timeout>30.0s</default-timeout>
   <note>Commands will be executed with the working directory validated.</note>
 </shell-execution>"""

@@ -65,6 +65,7 @@ Example:
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -83,6 +84,7 @@ from pydantic_ai import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     ModelSettings,
+    OutputToolResultEvent,
     PartDeltaEvent,
     PartEndEvent,
     PartStartEvent,
@@ -96,6 +98,8 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
     ModelResponseStreamEvent,
+    NativeToolCallPart,
+    NativeToolReturnPart,
     RetryPromptPart,
     ToolCallPart,
     ToolReturnPart,
@@ -103,18 +107,11 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from y_agent_environment import Environment, FileOperator, ResourceRegistry, Shell
+from ya_agent_environment import Environment, FileOperator, ResourceRegistry, Shell
 
 from ya_agent_sdk.agents.lifecycle import LifecycleExtension
 from ya_agent_sdk.events import AgentEvent, UsageSnapshotEvent
-from ya_agent_sdk.usage import (
-    ExtraUsageRecord,
-    InternalUsage,
-    UsageAgentTotal,
-    UsageSnapshot,
-    UsageSnapshotEntry,
-    coerce_run_usage,
-)
+from ya_agent_sdk.usage import UsageAgentTotal, UsageSnapshot, UsageSnapshotEntry, coerce_run_usage
 from ya_agent_sdk.utils import get_latest_request_usage
 
 from .bus import BusMessage, MessageBus
@@ -429,12 +426,13 @@ class ToolIdWrapper:
         match event:
             case FunctionToolCallEvent():
                 event.part.tool_call_id = self.upsert_tool_call_id(event.tool_call_id)
-            case FunctionToolResultEvent():
-                result_part = getattr(event, "part", None) or getattr(event, "result", None)
-                if isinstance(result_part, (ToolReturnPart, RetryPromptPart)):
-                    result_part.tool_call_id = self.upsert_tool_call_id(event.tool_call_id)
+            case FunctionToolResultEvent() | OutputToolResultEvent():
+                event.part.tool_call_id = self.upsert_tool_call_id(event.tool_call_id)
             case PartStartEvent() | PartEndEvent():
-                if isinstance(event.part, (ToolCallPart, ToolReturnPart, RetryPromptPart)):
+                if isinstance(
+                    event.part,
+                    (ToolCallPart, NativeToolCallPart, ToolReturnPart, NativeToolReturnPart, RetryPromptPart),
+                ):
                     event.part.tool_call_id = self.upsert_tool_call_id(event.part.tool_call_id)
             case PartDeltaEvent():
                 if isinstance(event.delta, ToolCallPartDelta) and event.delta.tool_call_id:
@@ -460,7 +458,7 @@ class ToolIdWrapper:
 
     def wrap_messages(
         self,
-        _: RunContext[AgentContext],
+        _: RunContext[AgentContext] | None,
         message_history: list[ModelMessage],
     ) -> list[ModelMessage]:
         """Normalize all tool call IDs in the message history.
@@ -476,7 +474,9 @@ class ToolIdWrapper:
         """
         for m in message_history:
             for p in m.parts:
-                if isinstance(p, (ToolCallPart, ToolReturnPart, RetryPromptPart)):
+                if isinstance(
+                    p, (ToolCallPart, NativeToolCallPart, ToolReturnPart, NativeToolReturnPart, RetryPromptPart)
+                ):
                     p.tool_call_id = self.upsert_tool_call_id(p.tool_call_id)
         return message_history
 
@@ -525,7 +525,10 @@ class ShellReviewConfig(BaseModel):
 
     @field_validator("model_settings", mode="before")
     @classmethod
-    def resolve_model_settings_preset(cls, value: Any) -> dict[str, Any] | None:
+    def resolve_model_settings_preset(
+        cls,
+        value: ModelSettings | str | dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
         """Resolve model settings preset names at the SDK config boundary."""
         if value is None:
             return None
@@ -627,6 +630,50 @@ class ToolConfig(BaseModel):
 
     view_max_text_file_size: int = 10 * 1024 * 1024
     """Maximum text file size in bytes that the view tool will inspect."""
+
+    view_relaxed_text_patterns: Sequence[str] = Field(default_factory=tuple)
+    """Ripgrep-style glob patterns or re: patterns where text view uses relaxed truncation limits.
+
+    Glob patterns use the same semantics as filesystem glob/grep. Patterns prefixed with
+    re: are matched as regular expressions against the agent-facing file path.
+    """
+
+    view_relaxed_text_dynamic_patterns: dict[str, tuple[str, ...]] = Field(default_factory=dict, exclude=True)
+    """Runtime-registered relaxed text patterns keyed by source/toolset id."""
+
+    def iter_view_relaxed_text_patterns(self) -> tuple[str, ...]:
+        """Return static and runtime-registered relaxed text patterns."""
+        dynamic_patterns = tuple(
+            pattern for patterns in self.view_relaxed_text_dynamic_patterns.values() for pattern in patterns
+        )
+        return (*self.view_relaxed_text_patterns, *dynamic_patterns)
+
+    def register_view_relaxed_text_patterns(self, source: str, patterns: Sequence[str]) -> None:
+        """Register runtime relaxed text patterns for a source id."""
+        normalized = tuple(pattern.strip() for pattern in patterns if pattern.strip())
+        if normalized:
+            self.view_relaxed_text_dynamic_patterns[source] = normalized
+        else:
+            self.view_relaxed_text_dynamic_patterns.pop(source, None)
+
+    def unregister_view_relaxed_text_patterns(self, source: str) -> None:
+        """Remove runtime relaxed text patterns registered by a source id."""
+        self.view_relaxed_text_dynamic_patterns.pop(source, None)
+
+    view_relaxed_text_file_size: int = 50 * 1024 * 1024
+    """Maximum text file size in bytes for paths matched by view_relaxed_text_patterns."""
+
+    view_relaxed_line_limit: int = 5000
+    """Line limit for relaxed paths when the effective line_limit is the normal default."""
+
+    view_relaxed_max_line_length: int = 20000
+    """Max line length for relaxed paths when the effective max_line_length is the normal default."""
+
+    view_max_content_chars: int = 60000
+    """Maximum returned text characters for normal view output before content truncation."""
+
+    view_relaxed_max_content_chars: int = 250000
+    """Maximum returned text characters for relaxed view output before content truncation."""
 
     edit_max_file_size: int = 20 * 1024 * 1024
     """Maximum file size in bytes that edit/multi_edit tools will process. Default: 20 MB."""
@@ -745,7 +792,7 @@ class ModelConfig(BaseModel):
     context_window: int | None = None
     """Total context window size in tokens."""
 
-    proactive_context_management_threshold: float | None = Field(default=0.5, ge=0.0, le=1.0)
+    proactive_context_management_threshold: float | None = Field(default=0.65, ge=0.0, le=1.0)
     """Proactive context management threshold. When token usage exceeds this ratio, reminders are triggered."""
 
     compact_threshold: float = Field(default=0.90, ge=0.0, le=1.0)
@@ -758,6 +805,18 @@ class ModelConfig(BaseModel):
     this value, all large tool return content is truncated before sending to
     the model, saving input token cost on cold re-encoding.
     Set to 0 to disable.
+    """
+
+    stream_resume_on_error: bool = False
+    """Whether stream_agent retries failed stream attempts by default."""
+
+    stream_resume_max_attempts: int = Field(default=3, ge=1)
+    """Default maximum total attempts for stream_agent stream recovery."""
+
+    stream_resume_prompt: str | None = None
+    """Default resume prompt for stream_agent stream recovery.
+
+    When unset, stream_agent uses its built-in resume prompt.
     """
 
     max_images: int = 20
@@ -862,11 +921,21 @@ class ResumableState(BaseModel):
     user_prompts: str | Sequence[UserContent] | None = None
     """User prompts collected during the session."""
 
+    previous_assistant_response_reference: str | None = None
+    """Visible assistant response immediately before the current user prompt.
+
+    Used by compact restore to resolve references in the current prompt such as
+    numbered items ("1", "2", "3"), "the above", or "that option".
+    """
+
     steering_messages: list[str] = Field(default_factory=list)
     """Accumulated user steering messages for compact."""
 
     handoff_message: str | None = None
     """Rendered handoff message."""
+
+    shell_env: dict[str, str] = Field(default_factory=dict)
+    """Extra environment variables restored into AgentContext.shell_env."""
 
     deferred_tool_metadata: dict[str, dict[str, Any]] = Field(default_factory=dict)
     """Metadata for deferred tool calls."""
@@ -884,7 +953,7 @@ class ResumableState(BaseModel):
     """Security-related runtime configuration."""
 
     auto_load_files: list[str] = Field(default_factory=list)
-    """Files to auto-load on next request. Set by handoff/compact, consumed by auto_load_files filter."""
+    """Files to auto-load on next request. Set by handoff/context tools or external callers."""
 
     tasks: dict[str, dict[str, Any]] = Field(default_factory=dict)
     """Serialized tasks from TaskManager, keyed by task ID."""
@@ -906,7 +975,9 @@ class ResumableState(BaseModel):
         """
         result: dict[str, list[ModelMessage]] = {}
         for key, messages_data in self.subagent_history.items():
-            result[key] = ModelMessagesTypeAdapter.validate_python(messages_data)
+            # subagent_history stores JSON-compatible ModelMessagesTypeAdapter.dump_python(..., mode="json") output.
+            # validate_json applies val_json_bytes="base64" to nested BinaryContent inside ToolReturnPart.content.
+            result[key] = ModelMessagesTypeAdapter.validate_json(json.dumps(messages_data).encode())
         return result
 
     def restore(self, ctx: AgentContext) -> None:
@@ -930,8 +1001,10 @@ class ResumableState(BaseModel):
         ctx.subagent_history = self.to_subagent_history()
         ctx.usage_snapshot_entries = dict(self.usage_snapshot_entries)
         ctx.user_prompts = self.user_prompts
+        ctx.previous_assistant_response_reference = self.previous_assistant_response_reference
         ctx.steering_messages = list(self.steering_messages)
         ctx.handoff_message = self.handoff_message
+        ctx.shell_env = {**ctx.shell_env, **self.shell_env}
         ctx.deferred_tool_metadata = dict(self.deferred_tool_metadata)
         # Restore agent_registry from serialized format
         ctx.agent_registry = {agent_id: AgentInfo(**info) for agent_id, info in self.agent_registry.items()}
@@ -957,7 +1030,7 @@ def _generate_run_id() -> str:
     return uuid4().hex
 
 
-def _string_header_value(value: Any) -> str | None:
+def _string_header_value(value: object) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
@@ -1079,6 +1152,13 @@ class AgentContext(BaseModel):
     user_prompts: str | Sequence[UserContent] | None = None
     """User prompts collected during the session for compact."""
 
+    previous_assistant_response_reference: str | None = None
+    """Visible assistant response immediately before the current user prompt.
+
+    Used by compact restore to resolve references in the current prompt such as
+    numbered items ("1", "2", "3"), "the above", or "that option".
+    """
+
     steering_messages: list[str] = Field(default_factory=list)
     """Accumulated user steering messages received via message bus.
 
@@ -1114,7 +1194,7 @@ class AgentContext(BaseModel):
 
     When a server name is in this list, all tools from that server will
     trigger the HITL approval flow before execution. The server name
-    corresponds to the tool_prefix used when creating the MCPServer.
+    corresponds to the tool_prefix used when creating the MCP toolset.
 
     Example:
         ctx.need_user_approve_mcps = ["filesystem", "github"]
@@ -1135,7 +1215,7 @@ class AgentContext(BaseModel):
     """
 
     auto_load_files: list[str] = Field(default_factory=list)
-    """Files to auto-load on next request. Set by handoff/compact tool, consumed by auto_load_files filter."""
+    """Files to auto-load on next request. Set by handoff/context tools or external callers."""
 
     task_manager: TaskManager = Field(default_factory=TaskManager)
     """Task manager for tracking tasks and dependencies within the session."""
@@ -1312,7 +1392,7 @@ class AgentContext(BaseModel):
     _stream_queue_enabled: bool = False
     _compact_depth: int = 0
 
-    def __init__(self, **data: Any) -> None:
+    def __init__(self, **data: object) -> None:
         """Initialize AgentContext."""
         super().__init__(**data)
         object.__setattr__(self, "_enter_lock", asyncio.Lock())
@@ -1635,7 +1715,7 @@ class AgentContext(BaseModel):
             - run_id, start_at, end_at
             - tool_id_wrapper, agent_stream_queues
             - usage_snapshot_entries, shell_review_records, deferred_tool_metadata
-            - force_inject_instructions
+            - force_inject_instructions, previous_assistant_response_reference
 
         Shared state (same reference as original):
             - env, model_cfg, tool_config
@@ -1658,6 +1738,7 @@ class AgentContext(BaseModel):
             "shell_review_records": deque(maxlen=10),
             "deferred_tool_metadata": {},
             "force_inject_instructions": False,
+            "previous_assistant_response_reference": None,
         }
         new_ctx = self.model_copy(update=update)
         # Reset private state for fresh lifecycle
@@ -1686,7 +1767,7 @@ class AgentContext(BaseModel):
         self,
         agent_name: str,
         agent_id: str | None = None,
-        **override: Any,
+        **override: object,
     ) -> Self:
         """Create a child context for subagent with independent timing.
 
@@ -1724,6 +1805,7 @@ class AgentContext(BaseModel):
             "end_at": None,  # Will be set by __aexit__
             "handoff_message": None,  # Subagents don't inherit handoff state
             "user_prompts": None,  # Subagent has its own initial prompt (set by caller)
+            "previous_assistant_response_reference": None,
             "steering_messages": [],  # Subagent has its own steering queue
             "tool_id_wrapper": ToolIdWrapper(),  # Fresh wrapper for subagent
             "tool_tags": set(),  # Fresh tags for subagent (recomputed by its own Toolset)
@@ -1801,7 +1883,7 @@ class AgentContext(BaseModel):
         agent_id: str,
         agent_name: str,
         model_id: str,
-        usage: object,
+        usage: RunUsage,
         usage_id: str | None = None,
         source: str = "model_request",
         ledger_key: str | None = None,
@@ -1862,38 +1944,13 @@ class AgentContext(BaseModel):
             )
         )
 
-    @property
-    def extra_usages(self) -> list[ExtraUsageRecord]:
-        """Backward-compatible view over the unified usage ledger."""
-        return [
-            ExtraUsageRecord(
-                uuid=entry.usage_id or key,
-                agent=entry.agent_id,
-                model_id=entry.model_id,
-                usage=entry.usage,
-            )
-            for key, entry in self.usage_snapshot_entries.items()
-        ]
-
-    def add_extra_usage(self, *, agent: str, internal_usage: InternalUsage, uuid: str) -> None:
-        """Backward-compatible helper that writes into the unified usage ledger."""
-        self.update_usage_snapshot_entry(
-            ledger_key=uuid,
-            agent_id=agent,
-            agent_name=agent,
-            model_id=internal_usage.model_id,
-            usage=internal_usage.usage,
-            usage_id=uuid,
-            source=agent,
-        )
-
     async def emit_usage_snapshot(
         self,
         *,
         agent_id: str,
         agent_name: str,
         model_id: str,
-        usage: object,
+        usage: RunUsage,
         source: str = "model_request",
         usage_id: str | None = None,
         ledger_key: str | None = None,
@@ -1925,7 +1982,7 @@ class AgentContext(BaseModel):
         automatically enabled when using stream_agent().
 
         Args:
-            event: Any event object (AgentEvent subclass, pydantic-ai events, or custom).
+            event: Arbitrary event object (AgentEvent subclass, pydantic-ai events, or custom).
 
         Example::
 
@@ -2097,8 +2154,10 @@ class AgentContext(BaseModel):
             subagent_history=serialized_history,
             usage_snapshot_entries=dict(self.usage_snapshot_entries) if include_usage_ledger else {},
             user_prompts=self.user_prompts,
+            previous_assistant_response_reference=self.previous_assistant_response_reference,
             steering_messages=list(self.steering_messages),
             handoff_message=self.handoff_message,
+            shell_env=dict(self.shell_env),
             deferred_tool_metadata=dict(self.deferred_tool_metadata),
             agent_registry=serialized_registry,
             need_user_approve_tools=list(self.need_user_approve_tools),

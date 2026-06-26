@@ -15,10 +15,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, Generic, cast
 
 import jinja2
-from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, UsageLimits, UserError
+from pydantic_ai import Agent, AgentRetries, DeferredToolRequests, DeferredToolResults, UsageLimits, UserError
 from pydantic_ai._agent_graph import CallToolsNode, ModelRequestNode
 from pydantic_ai.capabilities import AbstractCapability, ProcessHistory
 from pydantic_ai.messages import (
@@ -26,7 +27,18 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    ModelResponsePart,
+    NativeToolCallPart,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
     RetryPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
     ToolReturnPart,
     UserContent,
 )
@@ -34,13 +46,14 @@ from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.output import OutputSpec
 from pydantic_ai.run import AgentRun
 from typing_extensions import TypeVar
-from y_agent_environment import Environment
+from ya_agent_environment import Environment
 
 from ya_agent_sdk._logger import get_logger
 from ya_agent_sdk.agents.compact import create_cache_friendly_compact_filter, create_compact_filter
 from ya_agent_sdk.agents.guards import attach_message_bus_guard
 from ya_agent_sdk.agents.lifecycle import AgentErrorContext, BaseLifecycleExtension, run_extension_method
 from ya_agent_sdk.agents.models import infer_model
+from ya_agent_sdk.agents.retry_recovery import recover_retry_message_history
 from ya_agent_sdk.context import (
     AgentContext,
     AgentInfo,
@@ -51,6 +64,7 @@ from ya_agent_sdk.context import (
     StreamEvent,
     SubagentWrapper,
     ToolConfig,
+    ToolIdWrapper,
 )
 from ya_agent_sdk.environment.local import LocalEnvironment
 from ya_agent_sdk.events import (
@@ -71,7 +85,6 @@ from ya_agent_sdk.filters.environment_instructions import create_environment_ins
 from ya_agent_sdk.filters.runtime_instructions import inject_runtime_instructions
 from ya_agent_sdk.filters.system_prompt import create_system_prompt_filter
 from ya_agent_sdk.toolsets.core.base import BaseTool, GlobalHooks, Toolset
-from ya_agent_sdk.usage import coerce_run_usage
 from ya_agent_sdk.utils import AgentDepsT, EnvT, add_toolset_instructions
 
 from .capabilities import is_process_history_for
@@ -103,12 +116,51 @@ def _has_tool_call_parts(parts: Sequence[object]) -> bool:
     return any(isinstance(part, BaseToolCallPart) for part in parts)
 
 
-def _agent_retry_kwargs(*, retries: int, output_retries: int) -> dict[str, Any]:
-    signature = inspect.signature(Agent.__init__)
-    output_param = signature.parameters.get("output_retries")
-    if output_param is not None and output_param.kind is not inspect.Parameter.VAR_KEYWORD:
-        return {"retries": retries, "output_retries": output_retries}
-    return {"retries": {"tools": retries, "output": output_retries}}
+_PREVIOUS_ASSISTANT_RESPONSE_REFERENCE_MAX_CHARS = 32000
+_PREVIOUS_ASSISTANT_RESPONSE_REFERENCE_KEEP_HEAD = 24000
+_PREVIOUS_ASSISTANT_RESPONSE_REFERENCE_KEEP_TAIL = 6000
+
+
+def _truncate_previous_assistant_response_reference(text: str) -> str:
+    """Bound previous assistant visible output used as compact restore reference.
+
+    The cap is intentionally generous because numbered execution plans and
+    option lists often live in the previous assistant response and may be needed
+    to resolve terse follow-up prompts such as "do 1, 2, and 3".
+    """
+    stripped = text.strip()
+    if len(stripped) <= _PREVIOUS_ASSISTANT_RESPONSE_REFERENCE_MAX_CHARS:
+        return stripped
+
+    head = stripped[:_PREVIOUS_ASSISTANT_RESPONSE_REFERENCE_KEEP_HEAD]
+    tail = stripped[-_PREVIOUS_ASSISTANT_RESPONSE_REFERENCE_KEEP_TAIL:]
+    truncated_count = (
+        len(stripped)
+        - _PREVIOUS_ASSISTANT_RESPONSE_REFERENCE_KEEP_HEAD
+        - _PREVIOUS_ASSISTANT_RESPONSE_REFERENCE_KEEP_TAIL
+    )
+    return f"{head}\n[... {truncated_count} chars truncated from previous assistant response ...]\n{tail}"
+
+
+def _extract_previous_assistant_response_reference(
+    message_history: Sequence[ModelMessage] | None,
+) -> str | None:
+    """Extract visible text from the assistant response before the current user prompt.
+
+    The reference is used only for compact restore to resolve references in the
+    current prompt, e.g. "1,2,3", "the above", or "that option". It intentionally
+    excludes thinking, tool calls, tool returns, and other non-visible content.
+    """
+    if not message_history:
+        return None
+
+    for message in reversed(message_history):
+        if not isinstance(message, ModelResponse):
+            continue
+        chunks = [part.content for part in message.parts if isinstance(part, TextPart) and part.content.strip()]
+        if chunks:
+            return _truncate_previous_assistant_response_reference("\n\n".join(chunks))
+    return None
 
 
 def _suspend_current_task_cancellation() -> tuple[asyncio.Task[Any] | None, int]:
@@ -150,6 +202,22 @@ def _filter_delegation_toolset(
     if isinstance(toolset, Toolset):
         return toolset.exclude_tags(delegation_tags)
     return toolset
+
+
+def _resolve_agent_retries(retries: int | AgentRetries | None, output_retries: int | None) -> int | AgentRetries:
+    """Resolve SDK retry defaults into Pydantic AI's unified AgentRetries form."""
+    default_retries: AgentRetries = {"tools": 1, "output": 3}
+    if isinstance(retries, dict):
+        resolved: AgentRetries = {**default_retries, **retries}
+    elif retries is None:
+        resolved = default_retries.copy()
+    else:
+        resolved = {"tools": retries, "output": retries}
+
+    if output_retries is not None:
+        resolved["output"] = output_retries
+
+    return resolved
 
 
 # =============================================================================
@@ -281,7 +349,7 @@ class AgentRuntime(Generic[AgentDepsT, OutputT, EnvT]):
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
-        exc_tb: Any,
+        exc_tb: TracebackType | None,
     ) -> bool | None:
         """Exit the runtime, cleaning up only what we entered.
 
@@ -399,8 +467,8 @@ def create_agent(
     agent_name: str = "main",
     system_prompt: str | None = None,
     system_prompt_template_vars: dict[str, Any] | None = None,
-    retries: int = 1,
-    output_retries: int = 3,
+    retries: int | AgentRetries | None = None,
+    output_retries: int | None = None,
     defer_model_check: bool = False,
     end_strategy: str = "exhaustive",
     lifecycle_extensions: Sequence[BaseLifecycleExtension[AgentDepsT, EnvT]] | None = None,
@@ -469,8 +537,9 @@ def create_agent(
             rendered as a Jinja2 template, supporting conditionals and default values.
         system_prompt_template_vars: Variables for Jinja2 template rendering. Works with
             both custom system_prompt strings and the default template file.
-        retries: Number of retries for agent run. Defaults to 1.
-        output_retries: Number of retries for output parsing. Defaults to 3.
+        retries: Retry budget for tools and structured output. Int sets both budgets;
+            AgentRetries can set tools and output independently. Defaults to tools=1, output=3.
+        output_retries: Deprecated compatibility override for output retries.
         defer_model_check: Defer model validation. Defaults to False.
         end_strategy: Strategy for ending agent run. Defaults to "exhaustive".
     Returns:
@@ -657,6 +726,8 @@ def create_agent(
 
     # --- Create Agent ---
     logger.debug("Creating agent with model=%s, output_type=%s", model, output_type)
+    agent_retries = _resolve_agent_retries(retries, output_retries)
+
     delegation_tags = frozenset({"delegation"})
     if core_toolset.has_tags(delegation_tags):
         self_fork_toolsets = [_filter_delegation_toolset(toolset, delegation_tags) for toolset in all_toolsets]
@@ -676,7 +747,7 @@ def create_agent(
                     *cast(list[AbstractCapability[Any]], all_capabilities),
                     ProcessHistory(create_system_prompt_filter(system_prompt=effective_system_prompt)),
                 ],
-                **_agent_retry_kwargs(retries=retries, output_retries=output_retries),
+                retries=agent_retries,
                 defer_model_check=defer_model_check,
                 end_strategy=end_strategy,  # type: ignore[arg-type]
                 name="self",
@@ -699,7 +770,7 @@ def create_agent(
                 *all_capabilities,
                 ProcessHistory(create_system_prompt_filter(system_prompt=effective_system_prompt)),
             ],
-            **_agent_retry_kwargs(retries=retries, output_retries=output_retries),
+            retries=agent_retries,
             defer_model_check=defer_model_check,
             end_strategy=end_strategy,  # type: ignore[arg-type]
             name=agent_name,
@@ -864,6 +935,107 @@ Continue the task from the available conversation history. Avoid repeating compl
 
 
 @dataclass
+class PartialTextAccumulator:
+    """Accumulates recoverable streamed response parts for interrupted history.
+
+    Text can be recovered while still partial. Thinking and tool-call parts are
+    recovered after their closing PartEndEvent, so persisted history contains
+    whole thinking blocks and whole tool-call arguments.
+    """
+
+    _parts: dict[int, ModelResponsePart] = field(default_factory=dict)
+    _in_progress_parts: dict[
+        int, ThinkingPart | ToolCallPart | NativeToolCallPart | ThinkingPartDelta | ToolCallPartDelta
+    ] = field(default_factory=dict)
+
+    def reset(self) -> None:
+        """Start tracking a new model response."""
+        self._parts.clear()
+        self._in_progress_parts.clear()
+
+    def observe(self, event: AgentStreamEvent) -> None:
+        """Record a stream event for interrupted response recovery."""
+        if isinstance(event, PartStartEvent):
+            self._observe_part_start(event)
+        elif isinstance(event, PartDeltaEvent):
+            self._observe_part_delta(event)
+        elif isinstance(event, PartEndEvent):
+            self._observe_part_end(event)
+
+    def _observe_part_start(self, event: PartStartEvent) -> None:
+        if isinstance(event.part, TextPart):
+            self._parts[event.index] = event.part
+            self._in_progress_parts.pop(event.index, None)
+        elif isinstance(event.part, ThinkingPart | BaseToolCallPart):
+            self._parts.pop(event.index, None)
+            self._in_progress_parts[event.index] = event.part
+        else:
+            self._parts.pop(event.index, None)
+            self._in_progress_parts.pop(event.index, None)
+
+    def _observe_part_delta(self, event: PartDeltaEvent) -> None:
+        if isinstance(event.delta, TextPartDelta):
+            part = self._parts.get(event.index)
+            if isinstance(part, TextPart):
+                self._parts[event.index] = event.delta.apply(part)
+            else:
+                self._parts[event.index] = TextPart(
+                    content=event.delta.content_delta,
+                    provider_name=event.delta.provider_name,
+                    provider_details=event.delta.provider_details,
+                )
+            self._in_progress_parts.pop(event.index, None)
+        elif isinstance(event.delta, ThinkingPartDelta):
+            self._observe_thinking_delta(event.index, event.delta)
+        elif isinstance(event.delta, ToolCallPartDelta):
+            self._observe_tool_call_delta(event.index, event.delta)
+        else:
+            self._parts.pop(event.index, None)
+            self._in_progress_parts.pop(event.index, None)
+
+    def _observe_thinking_delta(self, index: int, delta: ThinkingPartDelta) -> None:
+        part = self._in_progress_parts.get(index)
+        if isinstance(part, (ThinkingPart, ThinkingPartDelta)):
+            self._in_progress_parts[index] = delta.apply(part)
+        else:
+            self._in_progress_parts[index] = delta
+        self._parts.pop(index, None)
+
+    def _observe_tool_call_delta(self, index: int, delta: ToolCallPartDelta) -> None:
+        part = self._in_progress_parts.get(index)
+        if isinstance(part, (ToolCallPart, NativeToolCallPart, ToolCallPartDelta)):
+            self._in_progress_parts[index] = delta.apply(part)
+        else:
+            self._in_progress_parts[index] = delta.as_part() or delta
+        self._parts.pop(index, None)
+
+    def _observe_part_end(self, event: PartEndEvent) -> None:
+        if isinstance(event.part, (TextPart, ThinkingPart, BaseToolCallPart)):
+            self._parts[event.index] = event.part
+        else:
+            self._parts.pop(event.index, None)
+        self._in_progress_parts.pop(event.index, None)
+
+    def build_response(self) -> ModelResponse | None:
+        """Build a recoverable partial ModelResponse from stream progress."""
+        parts = [self._parts[index] for index in sorted(self._parts) if self._is_non_empty_part(self._parts[index])]
+        if not parts:
+            return None
+        return ModelResponse(
+            parts=parts,
+            metadata={"ya_agent_sdk": {"partial": True, "reason": "stream_interrupted"}},
+        )
+
+    @staticmethod
+    def _is_non_empty_part(part: ModelResponsePart) -> bool:
+        if isinstance(part, TextPart | ThinkingPart):
+            return bool(part.content)
+        if isinstance(part, BaseToolCallPart):
+            return bool(part.tool_name)
+        return True
+
+
+@dataclass
 class AgentStreamer(Generic[AgentDepsT, OutputT]):
     """Async iterator for streaming agent events with interrupt capability.
 
@@ -899,9 +1071,33 @@ class AgentStreamer(Generic[AgentDepsT, OutputT]):
     _main_task: asyncio.Task[None]
     _poll_done: asyncio.Event
     _tasks: list[asyncio.Task[None]] = field(default_factory=list)
+    _partial_text: PartialTextAccumulator = field(default_factory=PartialTextAccumulator)
+    _tool_id_wrapper: ToolIdWrapper | None = None
     run: AgentRun[AgentDepsT, OutputT] | None = None
     exception: BaseException | None = None
     _interrupted: bool = False
+
+    def recoverable_messages(self) -> list[ModelMessage]:
+        """Return run history plus safe text-only partial output.
+
+        Completed runs return `run.all_messages()` unchanged. Interrupted or failed
+        streams may have emitted assistant text before pydantic-ai finalized the
+        ModelResponse; when the emitted response contains text parts only, that
+        text is appended as a partial ModelResponse so callers can persist it.
+        """
+        messages: list[ModelMessage] = []
+        if self.run is not None:
+            messages = list(self.run.all_messages())
+            if self._tool_id_wrapper is not None:
+                messages = self._tool_id_wrapper.wrap_messages(None, messages)
+            if messages and isinstance(messages[-1], ModelResponse):
+                return messages
+        partial_response = self._partial_text.build_response()
+        if partial_response is not None:
+            messages.append(partial_response)
+            if self._tool_id_wrapper is not None:
+                messages = self._tool_id_wrapper.wrap_messages(None, messages)
+        return messages
 
     def interrupt(self) -> None:
         """Interrupt the stream immediately, cancelling all running tasks.
@@ -911,6 +1107,7 @@ class AgentStreamer(Generic[AgentDepsT, OutputT]):
         AgentInterrupted will be raised.
         """
         self._interrupted = True
+        self.exception = AgentInterrupted("Agent execution was interrupted")
         for task in self._tasks:
             if not task.done():
                 task.cancel()
@@ -923,7 +1120,7 @@ class AgentStreamer(Generic[AgentDepsT, OutputT]):
 
         Raises:
             AgentInterrupted: If interrupt() was called.
-            BaseException: Any other exception that occurred during streaming.
+            BaseException: Additional exception that occurred during streaming.
         """
         # Check stored exception first
         if self.exception is not None:
@@ -1012,8 +1209,8 @@ async def stream_agent(  # noqa: C901
     post_event_hook: EventHook[AgentDepsT, OutputT] | None = None,
     # Error handling
     raise_on_error: bool = True,
-    resume_on_error: bool = False,
-    resume_max_attempts: int = 2,
+    resume_on_error: bool | None = None,
+    resume_max_attempts: int | None = None,
     resume_prompt: UserPromptT | None = None,
     resume_prompt_factory: ResumePromptFactory | None = None,
     # Lifecycle events
@@ -1062,8 +1259,11 @@ async def stream_agent(  # noqa: C901
             immediately. If False, exceptions are captured in streamer.exception
             and can be checked after iteration via raise_if_exception().
         resume_on_error: If True, retry failed stream attempts inside the same stream.
+            If None, uses ctx.model_cfg.stream_resume_on_error.
         resume_max_attempts: Maximum total attempts when resume_on_error is enabled.
-        resume_prompt: Prompt sent after a recoverable stream failure.
+            If None, uses ctx.model_cfg.stream_resume_max_attempts.
+        resume_prompt: Prompt sent after a recoverable stream failure. If unset,
+            uses ctx.model_cfg.stream_resume_prompt, then the built-in default.
         resume_prompt_factory: Callable that builds a resume prompt from the exception,
             next attempt index, and recovered message history.
         emit_lifecycle_events: If True (default), emit built-in lifecycle events
@@ -1118,6 +1318,7 @@ async def stream_agent(  # noqa: C901
     output_queue: asyncio.Queue[StreamEvent] = asyncio.Queue()
     main_done = asyncio.Event()
     poll_done = asyncio.Event()
+    partial_text = PartialTextAccumulator()
 
     logger.debug(
         "Starting stream_agent with user_prompt=%s",
@@ -1149,11 +1350,13 @@ async def stream_agent(  # noqa: C901
                     if pre_event_hook:
                         await pre_event_hook(event_ctx)
 
+                    wrapped_event = ctx.tool_id_wrapper.wrap_event(event)
+                    partial_text.observe(wrapped_event)
                     await output_queue.put(
                         StreamEvent(
                             agent_id=main_agent_info.agent_id,
                             agent_name=main_agent_info.agent_name,
-                            event=ctx.tool_id_wrapper.wrap_event(event),
+                            event=wrapped_event,
                         )
                     )
 
@@ -1219,6 +1422,7 @@ async def stream_agent(  # noqa: C901
             ModelRequestStartEvent(event_id=ctx.run_id, loop_index=current_loop, message_count=len(run.all_messages()))
         )
 
+        partial_text.reset()
         await process_node(node, run)
 
         base_model = cast(Model, agent.model)
@@ -1226,7 +1430,7 @@ async def stream_agent(  # noqa: C901
             agent_id=main_agent_info.agent_id,
             agent_name=main_agent_info.agent_name,
             model_id=base_model.model_name,
-            usage=coerce_run_usage(run.usage),
+            usage=run.usage,
             source="main_model_request",
         )
 
@@ -1433,6 +1637,8 @@ async def stream_agent(  # noqa: C901
             return cast(UserPromptT, value)
         if resume_prompt is not None:
             return resume_prompt
+        if ctx.model_cfg.stream_resume_prompt is not None:
+            return ctx.model_cfg.stream_resume_prompt
         return _DEFAULT_RESUME_PROMPT
 
     async def emit_execution_failed_event(
@@ -1464,7 +1670,11 @@ async def stream_agent(  # noqa: C901
         effective_deferred_tool_results: DeferredToolResults | None,
         stream_start_time: float,
     ) -> None:
-        max_attempts = max(1, resume_max_attempts) if resume_on_error else 1
+        effective_resume_on_error = ctx.model_cfg.stream_resume_on_error if resume_on_error is None else resume_on_error
+        effective_resume_max_attempts = (
+            ctx.model_cfg.stream_resume_max_attempts if resume_max_attempts is None else resume_max_attempts
+        )
+        max_attempts = max(1, effective_resume_max_attempts) if effective_resume_on_error else 1
         attempt_index = 0
         current_user_prompt = effective_user_prompt
         current_deferred_tool_results = effective_deferred_tool_results
@@ -1501,6 +1711,14 @@ async def stream_agent(  # noqa: C901
                     extract_resume_history(streamer.run, current_message_history),
                     error_str,
                 )
+                recovery = recover_retry_message_history(e, resume_history, ctx)
+                resume_history = recovery.history
+                if recovery.changed:
+                    logger.info(
+                        "Applied retry recovery before resume attempt=%s reasons=%s",
+                        next_attempt_index,
+                        ",".join(recovery.reasons),
+                    )
                 if resume_history:
                     next_user_prompt = await resolve_resume_prompt(e, next_attempt_index, resume_history)
                     next_message_history: Sequence[ModelMessage] | None = resume_history
@@ -1539,6 +1757,7 @@ async def stream_agent(  # noqa: C901
             effective_user_prompt = await user_prompt_factory(runtime)
 
         ctx.user_prompts = effective_user_prompt
+        ctx.previous_assistant_response_reference = _extract_previous_assistant_response_reference(message_history)
 
         ready_ctx = RuntimeReadyContext(
             runtime=runtime,
@@ -1648,6 +1867,8 @@ async def stream_agent(  # noqa: C901
         _main_task=main_task,
         _poll_done=poll_done,
         _tasks=[main_task, poll_task],
+        _partial_text=partial_text,
+        _tool_id_wrapper=ctx.tool_id_wrapper,
     )
 
     try:

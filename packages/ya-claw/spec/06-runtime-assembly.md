@@ -8,10 +8,12 @@ The runtime assembly path should make each boundary explicit:
 
 1. resolve profile
 2. resolve workspace binding
-3. build environment
-4. construct `ClawAgentContext`
-5. create `AgentRuntime`
-6. execute through one `RunCoordinator`
+3. resolve Docker sandbox generation when the binding is Docker-backed
+4. resolve shell sandbox policy from profile, binding, and request metadata
+5. build environment
+6. construct `ClawAgentContext`
+7. create `AgentRuntime`
+8. execute through one `RunCoordinator`
 
 ## Assembly Objects
 
@@ -37,15 +39,18 @@ Suggested fields:
 
 ### WorkspaceBinding
 
-`WorkspaceBinding` is a declarative single-workspace value object.
+`WorkspaceBinding` is a declarative workspace value object with a default mount and optional additional mounts.
 
 Suggested fields:
 
 - `host_path`
 - `virtual_path`
 - `cwd`
+- `mounts`
 - `readable_paths`
 - `writable_paths`
+- `fingerprint`
+- `generation`
 - `environment_overrides`
 - `metadata`
 - `backend_hint`
@@ -58,6 +63,7 @@ Suggested fields:
 
 - `virtual_path`
 - `cwd`
+- `mounts`
 - `readable_paths`
 - `writable_paths`
 - `metadata`
@@ -91,6 +97,7 @@ Suggested inputs:
 - optional `ResumableState`
 - run and session metadata
 - source metadata such as API, schedule, heartbeat, or bridge ingress
+- resolved workspace fingerprint and sandbox generation when present
 
 Suggested output:
 
@@ -109,14 +116,32 @@ sequenceDiagram
 
     COORD->>PROF: resolve(profile_name)
     PROF-->>COORD: ResolvedProfile
-    COORD->>WP: resolve(metadata)
+    COORD->>WP: resolve(session metadata + run metadata)
     WP-->>COORD: WorkspaceBinding
-    COORD->>EF: build(binding, profile)
+    COORD->>COORD: resolve sandbox generation for Docker binding
+    COORD->>COORD: resolve shell sandbox policy
+    COORD->>EF: build(binding, profile, shell sandbox policy)
     EF-->>COORD: Environment
     COORD->>RB: build(profile, binding, environment, restore_state, run metadata)
     RB->>SDK: create_agent(...)
     RB-->>COORD: AgentRuntime
 ```
+
+## Sandbox Generation Rule
+
+Docker-backed bindings resolve sandbox scope before environment construction. API, bridge, and memory runs use a session-owned sandbox generation. Schedule and heartbeat runs use a run-owned sandbox generation and terminal cleanup.
+
+For session-scoped sandboxes, the coordinator compares the current workspace fingerprint with the current session sandbox state. A matching fingerprint reuses the generation. A changed fingerprint increments the generation and replaces the session sandbox state.
+
+Local bindings use workspace path policy directly and skip Docker sandbox generation.
+
+Run state stores the resolved workspace snapshot with fingerprint, sandbox scope, and generation.
+
+## Shell Sandbox Policy Rule
+
+Local and mounted shell environments resolve a shell sandbox policy before environment construction. The policy combines profile defaults, workspace binding mounts, request metadata, and source kind into a concrete sandbox snapshot. The default profile is `workspace_write` with bounded workspace writes, full networking, inherited environment variables, time limits, output limits, and audit enabled.
+
+The full shell sandbox contract lives in [12-shell-sandbox.md](12-shell-sandbox.md).
 
 ## Environment Construction Rule
 
@@ -163,15 +188,15 @@ Recommended context construction inputs:
 
 YA Claw has two workspace guidance files:
 
-| File                      | Loaded for                                              | Purpose                              |
-| ------------------------- | ------------------------------------------------------- | ------------------------------------ |
-| `/workspace/AGENTS.md`    | normal runs, schedule runs, heartbeat runs, bridge runs | general workspace guidance           |
-| `/workspace/HEARTBEAT.md` | heartbeat runs only                                     | runtime-owned heartbeat instructions |
+| File                           | Loaded for                                              | Purpose                              |
+| ------------------------------ | ------------------------------------------------------- | ------------------------------------ |
+| `<default_mount>/AGENTS.md`    | normal runs, schedule runs, heartbeat runs, bridge runs | general workspace guidance           |
+| `<default_mount>/HEARTBEAT.md` | heartbeat runs only                                     | runtime-owned heartbeat instructions |
 
 Heartbeat guidance should be injected as a tagged block:
 
 ```xml
-<heartbeat-guidance path="/workspace/HEARTBEAT.md">
+<heartbeat-guidance path="/workspace/main/HEARTBEAT.md">
 ...
 </heartbeat-guidance>
 ```
@@ -207,6 +232,8 @@ runtime = runtime_builder.build(
     run_id=run.id,
     source_kind=run.trigger_type,
     source_metadata=run.metadata.get("source", {}),
+    workspace_metadata=resolved_workspace_metadata,
+    sandbox_generation=workspace_binding.generation,
 )
 ```
 

@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from y_agent_environment import FileOperator
+from ya_agent_environment import FileOperator
 
 from ya_agent_sdk.toolsets.core.filesystem import _ripgrep_core
 from ya_agent_sdk.toolsets.core.filesystem._types import GrepMatch

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from inline_snapshot import snapshot
+from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from ya_claw.app import create_app
 from ya_claw.config import get_settings
@@ -78,7 +79,6 @@ def _mark_run_completed(session_id: str, run_id: str, *, output_text: str | None
                     assert isinstance(run_record, RunRecord)
                     run_record.status = "completed"
                     run_record.output_text = output_text
-                    run_record.output_summary = output_text[:4000] if isinstance(output_text, str) else None
                     run_record.started_at = now - timedelta(seconds=2)
                     run_record.finished_at = now - timedelta(seconds=1)
                     run_record.committed_at = now
@@ -185,6 +185,81 @@ def test_session_and_run_endpoints_support_rerun_controls_and_events() -> None:
     assert "ya_claw.run_interrupted" in run_events_response.text
 
 
+def test_submit_uses_session_events_for_streaming_and_run_create_rejects_running_session() -> None:
+    _create_schema()
+
+    app = create_app()
+    settings = get_settings()
+    with TestClient(app) as client:
+        app.state.execution_supervisor = None
+        create_session_response = client.post(
+            "/api/v1/sessions",
+            headers=_auth_headers(),
+            json={"input_parts": [{"type": "text", "text": "first"}]},
+        )
+        assert create_session_response.status_code == 201
+        session_id = create_session_response.json()["session"]["id"]
+        run_id = create_session_response.json()["run"]["id"]
+
+        submit_response = client.post(
+            f"/api/v1/sessions/{session_id}/submit",
+            headers=_auth_headers(),
+            json={"input_parts": [{"type": "text", "text": "second"}]},
+        )
+        assert submit_response.status_code == 202
+        assert submit_response.json()["delivery"] == "merged"
+        assert app.state.runtime_state.get_session_run_handle(session_id) is not None
+        assert app.state.runtime_state.get_run_handle(run_id) is not None
+
+        async def _mark_running() -> None:
+            session_factory = app.state.db_session_factory
+            async with session_factory() as db_session:
+                run_record = await db_session.get(RunRecord, run_id)
+                assert isinstance(run_record, RunRecord)
+                session_record = await db_session.get(SessionRecord, session_id)
+                assert isinstance(session_record, SessionRecord)
+                run_record.status = "running"
+                session_record.active_run_id = run_id
+                await db_session.commit()
+
+        asyncio.run(_mark_running())
+
+        create_run_response = client.post(
+            f"/api/v1/sessions/{session_id}/runs",
+            headers=_auth_headers(),
+            json={"input_parts": [{"type": "text", "text": "run should reject"}]},
+        )
+        create_run_stream_response = client.post(
+            f"/api/v1/sessions/{session_id}/runs:stream",
+            headers=_auth_headers(),
+            json={"input_parts": [{"type": "text", "text": "run stream should reject"}]},
+        )
+        assert create_run_response.status_code == 409
+        assert create_run_stream_response.status_code == 409
+
+    async def _assert_no_side_effects() -> None:
+        engine = create_engine(settings.resolved_database_url)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as db_session:
+                runs = (
+                    (await db_session.execute(select(RunRecord).where(RunRecord.session_id == session_id)))
+                    .scalars()
+                    .all()
+                )
+                assert len(runs) == 1
+                assert runs[0].id == run_id
+                assert runs[0].input_parts == [
+                    {"type": "text", "text": "first", "metadata": None},
+                    {"type": "text", "text": "second", "metadata": None},
+                ]
+                assert app.state.runtime_state.consume_steering_inputs(run_id) == []
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_assert_no_side_effects())
+
+
 def test_session_create_uses_single_workspace_response_shape() -> None:
     _create_schema()
 
@@ -214,7 +289,10 @@ def test_session_create_uses_single_workspace_response_shape() -> None:
         "session_type",
         "source_session_id",
         "status",
+        "status_detail",
+        "status_reason",
         "updated_at",
+        "workspace_state",
     ])
     assert sorted(payload["run"]) == snapshot([
         "committed_at",
@@ -228,7 +306,6 @@ def test_session_create_uses_single_workspace_response_shape() -> None:
         "input_preview",
         "message",
         "metadata",
-        "output_summary",
         "output_text",
         "profile_name",
         "restore_from_run_id",
@@ -520,26 +597,40 @@ def test_session_turns_return_completed_runs_with_raw_input_and_output() -> None
             f"/api/v1/sessions/{session_id}/turns?limit=1&before_sequence_no=3",
             headers=_auth_headers(),
         )
+        page_2_cursor_response = client.get(
+            f"/api/v1/sessions/{session_id}/turns?limit=1&cursor={second_run_id}",
+            headers=_auth_headers(),
+        )
 
     assert page_1_response.status_code == 200
     page_1_payload = page_1_response.json()
     assert page_1_payload["session_id"] == session_id
     assert page_1_payload["has_more"] is True
+    assert page_1_payload["next_cursor"] == second_run_id
     assert page_1_payload["next_before_sequence_no"] == 3
     assert len(page_1_payload["turns"]) == 1
     assert page_1_payload["turns"][0]["run_id"] == second_run_id
     assert page_1_payload["turns"][0]["input_parts"] == [{"type": "text", "text": "completed-2", "metadata": None}]
     assert page_1_payload["turns"][0]["output_text"] == "answer-2"
-    assert page_1_payload["turns"][0]["output_summary"] == "answer-2"
 
     assert page_2_response.status_code == 200
     page_2_payload = page_2_response.json()
     assert page_2_payload["has_more"] is False
+    assert page_2_payload["next_cursor"] is None
     assert [turn["run_id"] for turn in page_2_payload["turns"]] == [first_run_id]
     assert page_2_payload["turns"][0]["output_text"] == "answer-1"
 
+    assert page_2_cursor_response.status_code == 200
+    page_2_cursor_payload = page_2_cursor_response.json()
+    assert page_2_cursor_payload["has_more"] is False
+    assert page_2_cursor_payload["next_cursor"] is None
+    assert [turn["run_id"] for turn in page_2_cursor_payload["turns"]] == [first_run_id]
+    assert page_2_cursor_payload["turns"][0]["output_text"] == "answer-1"
 
-def test_list_sessions_hides_memory_sessions_by_default() -> None:
+
+def test_list_sessions_hides_memory_sessions_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("YA_CLAW_AGENCY_ENABLED", "false")
+    get_settings.cache_clear()
     _create_schema()
 
     settings = get_settings()
@@ -585,8 +676,59 @@ def test_list_sessions_hides_memory_sessions_by_default() -> None:
     assert {session["id"] for session in internal_response.json()} == {"source-session", "memory-session"}
 
 
+def test_list_sessions_include_internal_exposes_agency_session() -> None:
+    _create_schema()
+
+    settings = get_settings()
+
+    async def _run() -> None:
+        engine = create_engine(settings.resolved_database_url)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as db_session:
+                source_session = SessionRecord(id="source-session", profile_name="general", session_metadata={})
+                agency_session = SessionRecord(
+                    id="agency-session",
+                    profile_name="general",
+                    session_type="agency",
+                    source_session_id="19aafc63e85a06fb38321a895de724d0",
+                    session_metadata={
+                        "agency": {
+                            "kind": "claw_agency_session",
+                            "scope": "global",
+                            "scope_key": "agency:global",
+                            "version": 1,
+                        }
+                    },
+                )
+                db_session.add_all([source_session, agency_session])
+                await db_session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+    app = create_app()
+    with TestClient(app) as client:
+        app.state.agency_dispatcher = None
+        default_response = client.get("/api/v1/sessions", headers=_auth_headers())
+        internal_response = client.get("/api/v1/sessions?include_internal=true", headers=_auth_headers())
+
+    assert default_response.status_code == 200
+    assert [session["id"] for session in default_response.json()] == ["source-session"]
+    assert internal_response.status_code == 200
+    internal_ids = {session["id"] for session in internal_response.json()}
+    assert {"source-session", "agency-session"}.issubset(internal_ids)
+    assert any(
+        session["session_type"] == "agency"
+        and session["metadata"].get("agency", {}).get("scope_key") == "agency:global"
+        for session in internal_response.json()
+    )
+
+
 def test_memory_api_enqueues_jobs_exposes_state_and_uses_filetree_for_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("YA_CLAW_MEMORY_ENABLED", "true")
+    monkeypatch.setenv("YA_CLAW_AGENCY_ENABLED", "false")
     get_settings.cache_clear()
     _create_schema()
 

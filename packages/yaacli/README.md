@@ -1,32 +1,44 @@
-# YAACLI
+# YAACLI CLI
 
 TUI reference implementation for [ya-agent-sdk](https://github.com/wh1isper/ya-mono/tree/main/packages/ya-agent-sdk).
 
+The macOS React/Tauri presentation adapter lives in
+[`apps/yaacli-desktop`](../../apps/yaacli-desktop). It reuses the same Python
+execution boundary and persistence formats; the Textual TUI remains supported.
+
 ## Usage
 
-Run from the workspace with uvx:
+Run with uvx:
 
 ```bash
-uvx --from ./packages/yaacli yaacli
+uvx --from 'yaacli[rs]' yaacli
 ```
 
-Install globally from the workspace with uv:
+Install with uv:
 
 ```bash
-uv tool install ./packages/yaacli
+uv tool install 'yaacli[rs]'
 yaacli
 ```
 
-Update the global install from the workspace with uv:
+`[rs]` installs the native Rust filesystem search binding. The equivalent extra-dependency form is:
 
 ```bash
-uv tool install --force ./packages/yaacli
+uv tool install yaacli --with ya-ripgrep-core
+```
+
+`ya-ripgrep-core` is a library dependency, so `--with` is the matching uv form; `--with-executables-from` applies to companion packages that also expose CLI executables.
+
+Update with uv:
+
+```bash
+uv tool upgrade yaacli
 ```
 
 Install with pip:
 
 ```bash
-pip install ./packages/yaacli
+pip install 'yaacli[rs]'
 yaacli
 ```
 
@@ -36,9 +48,12 @@ Run as a module:
 python -m yaacli
 ```
 
-## Configuration
+## Display Theme
 
-YAACLI stores global configuration under `~/.yaacli/` and project-level configuration under `.yaacli/`.
+The Textual console supports runtime theme switching with `/theme`,
+`/theme light`, `/theme dark`, and `/theme cappuccino`. The selected theme is
+persisted to the active `config.toml`; set `display.theme = "light"` to start
+in light mode.
 
 ## Built-in Skills
 
@@ -61,7 +76,7 @@ cp packages/yaacli/.env.example packages/yaacli/.env
 
 YAACLI loads `.env` from `packages/yaacli/.env` and the current working directory.
 Provider API keys can live in that `.env` file or in `~/.yaacli/config.toml` under `[env]`.
-SDK and tool variables such as `YA_AGENT_*`, `YA_AGENT_BROWSER_USE_*`, and search API keys can also live in that same `.env` file because YAACLI loads it into the process environment at startup.
+SDK and tool variables such as `YA_AGENT_*` and search API keys can also live in that same `.env` file because YAACLI loads it into the process environment at startup.
 Use [`packages/ya-agent-sdk/.env.example`](../ya-agent-sdk/.env.example) as the reference list for SDK and tool variables.
 
 Codex OAuth credentials can be created once and reused from YAACLI:

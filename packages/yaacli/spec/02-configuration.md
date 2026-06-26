@@ -36,6 +36,8 @@ auto_mode = true
 max_requests = 200
 
 [display]
+# Interactive console color theme ("dark", "light", or "cappuccino")
+theme = "dark"
 # Code highlighting theme ("dark" or "light")
 code_theme = "dark"
 # Maximum lines to show for tool results
@@ -46,18 +48,6 @@ max_arg_length = 100
 show_token_usage = true
 # Show elapsed time
 show_elapsed_time = true
-
-[browser]
-# CDP URL for browser automation
-# Options:
-#   - null: Disable browser features
-#   - "auto": Auto-start Docker browser sandbox
-#   - "ws://localhost:9222": Use existing browser
-cdp_url = null
-# Docker image for auto-start browser
-browser_image = "zenika/alpine-chrome:latest"
-# Browser startup timeout in seconds
-browser_timeout = 30
 
 [tools]
 # Tools requiring user approval before execution
@@ -142,16 +132,12 @@ class GeneralConfig(BaseModel):
     max_requests: int = 200
 
 class DisplayConfig(BaseModel):
+    theme: Literal["dark", "light", "cappuccino"] = "dark"
     code_theme: Literal["dark", "light"] = "dark"
     max_tool_result_lines: int = 5
     max_arg_length: int = 100
     show_token_usage: bool = True
     show_elapsed_time: bool = True
-
-class BrowserConfig(BaseModel):
-    cdp_url: str | None = None  # None, "auto", or explicit URL
-    browser_image: str = "zenika/alpine-chrome:latest"
-    browser_timeout: int = 30
 
 class ToolsConfig(BaseModel):
     need_approval: list[str] = Field(default_factory=lambda: ["shell_sandbox"])
@@ -188,7 +174,6 @@ class YaacliConfig(BaseModel):
     """Complete configuration model."""
     general: GeneralConfig = Field(default_factory=GeneralConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)
-    browser: BrowserConfig = Field(default_factory=BrowserConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     steering: SteeringConfig = Field(default_factory=SteeringConfig)
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
@@ -355,7 +340,6 @@ class ConfigManager:
         env_mappings = {
             "YAACLI_MODEL": ("general", "model"),
             "YAACLI_AUTO_MODE": ("general", "auto_mode"),
-            "YAACLI_CDP_URL": ("browser", "cdp_url"),
             "YAACLI_SESSION_DIR": ("session", "session_dir"),
         }
 
@@ -402,10 +386,6 @@ max_requests = 200
 [display]
 code_theme = "dark"
 show_token_usage = true
-
-[browser]
-# Set to "auto" to auto-start Docker browser
-# cdp_url = "auto"
 
 [steering]
 enabled = true

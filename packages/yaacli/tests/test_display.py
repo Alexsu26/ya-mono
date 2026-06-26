@@ -164,6 +164,18 @@ def test_tracker_complete_call():
     assert info.end_time is not None
 
 
+def test_tracker_preserves_explicit_end_time_on_later_implicit_completion():
+    """Test AGUI explicit timing is not overwritten by later raw stream completion."""
+    tracker = ToolCallTracker()
+    tracker.start_call("call-1", "grep", start_time=1.0)
+    tracker.complete_call("call-1", result="Found 5 matches", end_time=2.5)
+    tracker.complete_call("call-1", result="Found 5 matches")
+
+    info = tracker.tool_calls["call-1"]
+    assert info.end_time == 2.5
+    assert abs(info.duration() - 1.5) < 0.01
+
+
 def test_tracker_complete_nonexistent():
     """Test completing a non-existent call does nothing."""
     tracker = ToolCallTracker()
@@ -518,8 +530,7 @@ def test_event_renderer_render_tool_call_start():
     """Test rendering tool call start."""
     renderer = EventRenderer()
     result = renderer.render_tool_call_start("grep", "call-123")
-    assert "●" in result
-    assert "running" in result
+    assert "Calling" in result
     assert "grep" in result
 
 
@@ -534,8 +545,7 @@ def test_event_renderer_render_tool_call_complete_normal():
     )
     result = renderer.render_tool_call_complete(msg, duration=1.2)
     assert "grep" in result
-    assert "●" in result
-    assert "done" in result
+    assert "Complete" in result
 
 
 def test_event_renderer_render_tool_call_complete_special():
@@ -640,7 +650,7 @@ def test_full_tool_lifecycle():
     start_output = renderer.render_tool_call_start("view", "call-1")
     renderer.tracker.start_call("call-1", "view", {"file_path": "test.py"})
 
-    assert "running" in start_output
+    assert "Calling" in start_output
     assert renderer.tracker.has_active_calls()
 
     # Complete tool
@@ -843,5 +853,5 @@ def test_edit_tool_no_longer_special_panel():
     )
     # Should now use inline text format, not special panel
     result = renderer.render_tool_call_complete(msg, duration=0.1)
-    assert "done" in result
+    assert "Complete:" in result
     assert "edit" in result

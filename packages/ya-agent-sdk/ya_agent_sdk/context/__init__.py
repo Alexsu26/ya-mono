@@ -23,8 +23,6 @@ Example:
                 await ctx.file_operator.read_file("test.txt")
 """
 
-from ya_agent_sdk.usage import ExtraUsageRecord
-
 from .agent import (
     ENVIRONMENT_CONTEXT_TAG,
     PROJECT_GUIDANCE_TAG,
@@ -38,6 +36,7 @@ from .agent import (
     ModelConfig,
     ModelWrapper,
     ResumableState,
+    SecurityConfig,
     ShellReviewAction,
     ShellReviewConfig,
     ShellReviewRiskLevel,
@@ -60,7 +59,6 @@ __all__ = [
     "AgentInfo",
     "AgentStreamEvent",
     "BusMessage",
-    "ExtraUsageRecord",
     "MediaToUrlHook",
     "MessageBus",
     "ModelCapability",
@@ -68,6 +66,7 @@ __all__ = [
     "ModelWrapper",
     "NoteManager",
     "ResumableState",
+    "SecurityConfig",
     "ShellReviewAction",
     "ShellReviewConfig",
     "ShellReviewRiskLevel",

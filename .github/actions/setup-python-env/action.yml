@@ -9,7 +9,7 @@ inputs:
   uv-version:
     description: "uv version to use"
     required: true
-    default: "0.6.2"
+    default: "0.11.14"
   extras:
     description: "Optional extras to install (comma-separated, e.g., 'docker')"
     required: false
@@ -18,12 +18,12 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@v6
       with:
         python-version: ${{ inputs.python-version }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v6
       with:
         version: ${{ inputs.uv-version }}
         enable-cache: 'true'

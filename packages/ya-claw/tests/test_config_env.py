@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from ya_agent_sdk.environment.virtual_path import normalize_virtual_path
 from ya_claw import config as config_module
 from ya_claw.bridge import BridgeAdapterType, BridgeDispatchMode
 from ya_claw.config import ClawSettings
@@ -106,6 +107,18 @@ def test_settings_service_build_metadata_can_be_configured() -> None:
     assert settings.resolved_service_revision == "dev+abcdef123456"
 
 
+def test_settings_agency_disabled_by_default() -> None:
+    settings = ClawSettings(api_token="test-token", _env_file=None)  # noqa: S106
+
+    assert settings.agency_enabled is False
+
+
+def test_settings_stream_resume_max_attempts_defaults_to_three() -> None:
+    settings = ClawSettings(api_token="test-token", _env_file=None)  # noqa: S106
+
+    assert settings.agent_stream_resume_max_attempts == 3
+
+
 def test_settings_session_prune_defaults() -> None:
     settings = ClawSettings(api_token="test-token", _env_file=None)  # noqa: S106
 
@@ -113,6 +126,7 @@ def test_settings_session_prune_defaults() -> None:
     assert settings.session_prune_run_keep_recent == 10
     assert settings.session_prune_generated_sessions_enabled is False
     assert settings.session_prune_schedule_keep_recent == 10
+    assert settings.session_prune_once_schedules_hide_after_days == 7
     assert settings.session_prune_heartbeat_keep_recent == 10
     assert settings.session_prune_fire_records_older_than_days == 0
     assert settings.session_prune_orphans_enabled is True
@@ -145,7 +159,10 @@ def test_settings_workspace_docker_host_workspace_dir_can_be_configured(tmp_path
 def test_settings_default_workspace_docker_identity_uses_process_uid_gid(monkeypatch) -> None:
     monkeypatch.delenv("YA_CLAW_WORKSPACE_PROVIDER_DOCKER_UID", raising=False)
     monkeypatch.delenv("YA_CLAW_WORKSPACE_PROVIDER_DOCKER_GID", raising=False)
-    with patch.object(os, "getuid", return_value=1234), patch.object(os, "getgid", return_value=2345):
+    with (
+        patch.object(os, "getuid", Mock(return_value=1234), create=True),
+        patch.object(os, "getgid", Mock(return_value=2345), create=True),
+    ):
         settings = ClawSettings(api_token="test-token", _env_file=None)  # noqa: S106
         assert settings.resolved_workspace_provider_docker_uid == 1234
         assert settings.resolved_workspace_provider_docker_gid == 2345
@@ -228,6 +245,7 @@ def test_settings_resolves_bridge_and_lark_cli_environment(monkeypatch) -> None:
         "im.chat.member.user.added_v1",
         "im.message.receive_v1",
         "drive.notice.comment_add_v1",
+        "card.action.trigger",
     ]
     assert settings.resolved_bridge_lark_profile == "lark-profile"
     assert settings.resolved_lark_cli_environment == {
@@ -314,8 +332,8 @@ def test_settings_resolves_docker_extra_mounts(tmp_path: Path) -> None:
     mounts = settings.resolved_workspace_provider_docker_extra_mounts
 
     assert [(mount.host_path, mount.container_path, mount.mode) for mount in mounts] == [
-        (home_dir, Path("/home/claw"), "rw"),
-        (cache_dir, Path("/cache"), "ro"),
+        (home_dir, normalize_virtual_path("/home/claw"), "rw"),
+        (cache_dir, normalize_virtual_path("/cache"), "ro"),
     ]
 
 
@@ -329,7 +347,7 @@ def test_settings_rejects_invalid_docker_extra_mounts() -> None:
     try:
         _ = settings.resolved_workspace_provider_docker_extra_mounts
     except ValueError as exc:
-        assert "container_path must be absolute" in str(exc)
+        assert "Docker extra mounts" in str(exc) or "container_path must be absolute" in str(exc)
     else:
         raise AssertionError("Expected invalid Docker extra mount to raise ValueError")
 
