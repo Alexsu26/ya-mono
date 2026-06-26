@@ -468,17 +468,17 @@ def _create_unified_subagent_tool(
                 self_call_func=_self_call_func,
             )
 
-    def _get_roster_instruction(ctx: RunContext[AgentContext]) -> str | None:
-        return _get_unified_tool_roster_instruction(_registry, _parent_toolset, ctx)
+        @staticmethod
+        def _get_roster_instruction(ctx: RunContext[AgentContext]) -> str | None:
+            return _get_unified_tool_roster_instruction(_registry, _parent_toolset, ctx)
 
-    def _can_delegate(ctx: RunContext[AgentContext]) -> bool:
-        return _can_unified_tool_delegate(_registry, _parent_toolset, ctx)
+        @staticmethod
+        def _can_delegate(ctx: RunContext[AgentContext]) -> bool:
+            return _can_unified_tool_delegate(_registry, _parent_toolset, ctx)
 
     # Set class attributes
     UnifiedSubagentTool.name = name
     UnifiedSubagentTool.description = description
-    UnifiedSubagentTool._get_roster_instruction = staticmethod(_get_roster_instruction)
-    UnifiedSubagentTool._can_delegate = staticmethod(_can_delegate)
     UnifiedSubagentTool.__name__ = f"{_to_pascal_case(name)}Tool"
     UnifiedSubagentTool.__qualname__ = UnifiedSubagentTool.__name__
 
