@@ -157,3 +157,6 @@ yaacli/yaacli/skills/building-agents
 node_modules/
 apps/*/dist/
 *.tsbuildinfo
+
+# Generated artifacts (agent run outputs, PPTX extracts, etc.)
+outputs/
