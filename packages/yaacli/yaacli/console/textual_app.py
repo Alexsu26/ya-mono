@@ -42,9 +42,9 @@ from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import Any, ClassVar
 
-from pydantic_ai import DeferredToolRequests, DeferredToolResults, ToolDenied
+from pydantic_ai import DeferredToolRequests, DeferredToolResults, ToolDenied, UsageLimits
 from rich.console import Console as RichConsole
 from rich.console import Group, RenderableType
 from rich.segment import Segments
@@ -53,11 +53,13 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.geometry import Size
 from textual.screen import ModalScreen
 from textual.widgets import Button, RichLog, Static
+from ya_agent_sdk.agents.main import stream_agent
 from ya_agent_sdk.context import BusMessage
+from ya_agent_sdk.mcp import MCPConfig, MCPServerConfig, load_mcp_config_file
 
+from yaacli.browser import BrowserManager
 from yaacli.config import ConfigManager, YaacliConfig
 from yaacli.console.adapter import ConsoleSession
 from yaacli.console.blocks import (
@@ -78,14 +80,8 @@ from yaacli.console.discovery import (
 )
 from yaacli.console.glyphs import GLYPHS, SPINNER_FRAMES
 from yaacli.console.header import HeaderInfo
-from yaacli.console.theme import (
-    THEME_NAMES,
-    ThemeName,
-    build_textual_theme,
-    build_theme,
-    normalize_theme_name,
-)
-from yaacli.console.transcript import TranscriptStore, new_session_id, strip_legacy_tool_protocol
+from yaacli.console.theme import build_theme
+from yaacli.console.transcript import TranscriptStore, new_session_id
 from yaacli.console.widgets import (
     FooterHint,
     HeaderBar,
@@ -97,32 +93,11 @@ from yaacli.console.widgets import (
     StatusBar,
     SteeringList,
 )
-from yaacli.events import GoalCompleteReason
-from yaacli.execution import open_runtime_stream
+from yaacli.hooks import emit_context_update
 from yaacli.logging import get_logger
-from yaacli.model_profiles import (
-    build_model_profiles,
-    get_model_profile,
-    get_startup_model_profile,
-    save_selected_model_profile_id,
-)
-
-if TYPE_CHECKING:
-    from ya_agent_sdk.mcp import MCPConfig, MCPServerConfig
+from yaacli.runtime import apply_model_profile, create_tui_runtime
 
 logger = get_logger(__name__)
-
-
-def create_tui_runtime(**kwargs: Any) -> Any:
-    from yaacli.runtime import create_tui_runtime as _create_tui_runtime
-
-    return _create_tui_runtime(**kwargs)
-
-
-def apply_model_profile(runtime: Any, profile: Any) -> None:
-    from yaacli.runtime import apply_model_profile as _apply_model_profile
-
-    _apply_model_profile(runtime, profile)
 
 
 class StreamingRichLog(RichLog):
@@ -246,88 +221,6 @@ def _trim_trailing_partial_marker(text: str) -> tuple[str, str]:
     return text, ""
 
 
-def _line_has_unclosed_inline_markers(line: str) -> bool:
-    """Conservative check for inline Markdown markers that cross a line."""
-    stripped = line.rstrip()
-    if not stripped:
-        return False
-    if stripped.count("**") % 2 == 1:
-        return True
-    if stripped.replace("**", "").count("*") % 2 == 1:
-        return True
-    return "```" not in stripped and stripped.count("`") % 2 == 1
-
-
-def _line_starts_fence(line: str) -> bool:
-    stripped = line.lstrip()
-    return stripped.startswith("```") or stripped.startswith("~~~")
-
-
-def _line_looks_table(line: str) -> bool:
-    stripped = line.strip()
-    return "|" in stripped and not stripped.startswith(("```", "~~~"))
-
-
-def _split_stream_safe_prefix(text: str) -> tuple[str, str]:
-    """Split streaming Markdown into (safe_prefix, live_tail).
-
-    The prefix may be appended permanently to the log; the tail still needs
-    pop+rewrite treatment because its Markdown context may change as new
-    tokens arrive. This intentionally keeps fenced code and table-like blocks
-    together until they are closed, while letting ordinary completed lines
-    advance out of the live tail.
-    """
-    if "\n" not in text:
-        return "", text
-
-    safe_end = 0
-    pos = 0
-    in_fence = False
-    in_table = False
-    deferred_table_start: int | None = None
-    lines = text.splitlines(keepends=True)
-    for line in lines:
-        pos += len(line)
-        if not line.endswith("\n"):
-            break
-
-        stripped = line.strip()
-        if _line_starts_fence(line):
-            in_fence = not in_fence
-            if not in_fence:
-                safe_end = pos
-            continue
-
-        if in_fence:
-            continue
-
-        if _line_looks_table(line):
-            if not in_table:
-                in_table = True
-                deferred_table_start = pos - len(line)
-            continue
-
-        if in_table:
-            if stripped:
-                continue
-            in_table = False
-            deferred_table_start = None
-            safe_end = pos
-            continue
-
-        if _line_has_unclosed_inline_markers(line):
-            continue
-
-        safe_end = pos
-
-    if in_table and deferred_table_start is not None:
-        safe_end = min(safe_end, deferred_table_start)
-
-    if safe_end <= 0:
-        return "", text
-    return text[:safe_end], text[safe_end:]
-
-
 # Mirrors v1's tui.py:233 — kept here so we don't import from app/tui.py.
 STEERING_TEMPLATE = """<steering>
 {{ content }}
@@ -412,24 +305,17 @@ class TextualSink:
         live: LivePane,
         *,
         max_log_lines: int = 0,
-        theme_name: ThemeName = "dark",
     ) -> None:
-        self._output_log = log
+        self._log = log
         self._live = live
-        self._theme_name: ThemeName = theme_name
         self._max_log_lines = max(0, int(max_log_lines or 0))
         self._render_console = self._build_render_console(max(40, log.size.width or 100))
         # ----- streaming-text state -----
-        # Raw accumulated text for the current assistant response. This is
-        # persisted once on ``end_text`` so visual incremental chunks don't
-        # fragment the transcript.
-        self._stream_full_text: str = ""
-        # Raw text for the live Markdown tail only. Completed safe prefixes
-        # are appended permanently to RichLog so repaint cost stays bounded.
+        # Raw accumulated text since the current streaming block began.
+        # Empty string means no streaming block is open.
         self._stream_buffer: str = ""
         self._stream_pending_chars: int = 0
         self._stream_flush_timer: Any = None
-        self._stream_has_visible_output: bool = False
         # Total number of strips currently occupied by the live Markdown
         # render of ``_stream_buffer`` in the RichLog. Tracked so each new
         # delta can pop them and write a fresh full render — that way the
@@ -504,7 +390,7 @@ class TextualSink:
         if self._current_thinking is not None:
             self._emit_status("thinking", "")
             return
-        if self._stream_full_text:
+        if self._stream_buffer:
             self._emit_status("text", "")
             return
         self._emit_status("idle", "")
@@ -514,44 +400,22 @@ class TextualSink:
         # RichLog's vertical scrollbar occupies the right-most content
         # column when history overflows. Render one column narrower so long
         # Markdown/thinking lines don't sit underneath the scrollbar.
-        return max(40, (self._output_log.size.width or 80) - 1)
+        return max(40, (self._log.size.width or 80) - 1)
 
     def _build_render_console(self, width: int) -> RichConsole:
         return RichConsole(
-            theme=build_theme(self._theme_name),
+            theme=build_theme(),
             force_terminal=True,
             color_system="truecolor",
             width=width,
-            height=max(1, self._output_log.size.height or 25),
+            height=max(1, self._log.size.height or 25),
         )
-
-    def set_theme(self, theme_name: ThemeName) -> None:
-        """Switch Rich rendering and rebuild committed transcript history."""
-        if theme_name == self._theme_name:
-            return
-        self._cancel_stream_flush_timer()
-        self._theme_name = theme_name
-        self._live.theme_name = theme_name
-        self._render_console = self._build_render_console(self.width)
-        for entry in self._history_entries:
-            if isinstance(entry.block, ModelTextBlock):
-                entry.block.theme_name = theme_name
-        self._stream_strip_count = 0
-        self._thinking_strip_count = 0
-        self._active_operations_strip_count = 0
-        self._rebuild_history()
-        if self._current_thinking is not None:
-            self._render_thinking_buffer()
-        if self._stream_buffer:
-            self._render_streaming_buffer()
-        if self._has_active_operations():
-            self._render_active_operations(notify_history=False)
 
     def _resync_width(self) -> None:
         if self._render_console.width != self.width:
             self._render_console = self._build_render_console(self.width)
 
-    def _pop_strips(self, count: int, *, clamp_scroll: bool = True) -> None:
+    def _pop_strips(self, count: int) -> None:
         """Remove the last ``count`` strips from the RichLog.
 
         ``RichLog.write`` calls ``refresh`` internally, but mutating
@@ -561,30 +425,18 @@ class TextualSink:
         """
         popped = False
         for _ in range(count):
-            if self._output_log.lines:
-                self._output_log.lines.pop()
+            if self._log.lines:
+                self._log.lines.pop()
                 popped = True
         if popped:
-            self._sync_log_after_line_mutation(clamp_scroll=clamp_scroll)
-
-    def _sync_log_after_line_mutation(self, *, clamp_scroll: bool = True) -> None:
-        """Keep RichLog geometry consistent after mutating ``lines`` directly."""
-        self._invalidate_log_line_cache()
-        current_size = self._output_log.virtual_size
-        self._output_log.virtual_size = Size(current_size.width, len(self._output_log.lines))
-        if clamp_scroll and self._output_log.scroll_y > self._output_log.max_scroll_y:
-            self._output_log.scroll_to(
-                y=self._output_log.max_scroll_y,
-                animate=False,
-                immediate=True,
-            )
+            self._invalidate_log_line_cache()
 
     def _invalidate_log_line_cache(self) -> None:
         """Clear RichLog's private render cache after direct line mutation."""
         import contextlib
 
         with contextlib.suppress(Exception):
-            line_cache = getattr(self._output_log, "_line_cache", None)
+            line_cache = getattr(self._log, "_line_cache", None)
             if line_cache is not None:
                 line_cache.clear()
 
@@ -595,12 +447,12 @@ class TextualSink:
         even when focus is on the input. ``refresh()`` alone marks the
         widget dirty. We also clear RichLog's private line cache when
         direct line mutation has happened, so the new strips are pulled
-        from ``self._output_log.lines`` without needing a focus/style change.
+        from ``self._log.lines`` without needing a focus/style change.
         """
         import contextlib
 
         with contextlib.suppress(Exception):
-            self._output_log.refresh(layout=True)
+            self._log.refresh(layout=True)
 
     def _commit(
         self,
@@ -610,15 +462,14 @@ class TextualSink:
         search_text: str = "",
         label: str = "",
         block: Any | None = None,
-        persist_entry: bool = True,
     ) -> None:
         """Render through themed Console and push to the RichLog."""
-        self._pop_active_operations_render(clamp_scroll=False)
+        self._pop_active_operations_render()
         self._resync_width()
-        before = len(self._output_log.lines)
+        before = len(self._log.lines)
         segments = list(self._render_console.render(renderable))
-        self._output_log.write(Segments(segments), width=self.width)
-        after = len(self._output_log.lines)
+        self._log.write(Segments(segments), width=self.width)
+        after = len(self._log.lines)
         entry = _HistoryEntry(
             kind=kind,
             text=search_text,
@@ -630,7 +481,7 @@ class TextualSink:
         )
         self._history_entries.append(entry)
         self._trim_history_lines()
-        if persist_entry and callable(self._on_entry_committed):
+        if callable(self._on_entry_committed):
             self._on_entry_committed(entry)
         if callable(self._on_history_grew):
             self._on_history_grew()
@@ -640,11 +491,11 @@ class TextualSink:
     def _trim_history_lines(self) -> None:
         if self._max_log_lines <= 0:
             return
-        overflow = len(self._output_log.lines) - self._max_log_lines
+        overflow = len(self._log.lines) - self._max_log_lines
         if overflow <= 0:
             return
-        del self._output_log.lines[:overflow]
-        self._sync_log_after_line_mutation()
+        del self._log.lines[:overflow]
+        self._invalidate_log_line_cache()
         adjusted: list[_HistoryEntry] = []
         for entry in self._history_entries:
             if entry.line_end <= overflow:
@@ -654,8 +505,8 @@ class TextualSink:
             adjusted.append(entry)
         self._history_entries = adjusted
         try:
-            self._output_log.scroll_to(
-                y=max(0, self._output_log.scroll_y - overflow),
+            self._log.scroll_to(
+                y=max(0, self._log.scroll_y - overflow),
                 animate=False,
                 immediate=True,
             )
@@ -665,70 +516,24 @@ class TextualSink:
     def _write_strips_counted(self, renderable: RenderableType) -> int:
         """Render + write a renderable; return the number of strips it occupied."""
         self._resync_width()
-        before = len(self._output_log.lines)
-        self._output_log.write(
+        before = len(self._log.lines)
+        self._log.write(
             Segments(list(self._render_console.render(renderable))),
             width=self.width,
         )
-        return max(0, len(self._output_log.lines) - before)
-
-    def _model_text_block(self, text: str, *, show_header: bool) -> ModelTextBlock:
-        block = ModelTextBlock(theme_name=self._theme_name, show_header=show_header)
-        block.append(text)
-        return block
-
-    def _commit_streaming_prefix(self, text: str) -> None:
-        if not text:
-            return
-        block = self._model_text_block(text, show_header=not self._stream_has_visible_output)
-        self._commit(
-            block.render(self.width),
-            kind="assistant",
-            search_text=text,
-            label="assistant",
-            block=block,
-            persist_entry=False,
-        )
-        self._stream_has_visible_output = True
-
-    def _persist_streaming_response(self) -> None:
-        if not self._stream_full_text or not callable(self._on_entry_committed):
-            return
-        block = self._model_text_block(self._stream_full_text, show_header=True)
-        entry = _HistoryEntry(
-            kind="assistant",
-            text=self._stream_full_text,
-            label="assistant",
-            line_start=0,
-            line_end=0,
-            block=block,
-            renderable=None,
-        )
-        self._on_entry_committed(entry)
-
-    def _commit_safe_streaming_prefix(self) -> None:
-        prefix, tail = _split_stream_safe_prefix(self._stream_buffer)
-        if not prefix:
-            return
-        self._pop_strips(self._stream_strip_count, clamp_scroll=False)
-        self._stream_strip_count = 0
-        self._stream_buffer = tail
-        self._commit_streaming_prefix(prefix)
+        return max(0, len(self._log.lines) - before)
 
     def _render_streaming_buffer(self) -> None:
         """Render the current streaming text snapshot into the RichLog."""
-        if not self._stream_buffer:
-            self._stream_strip_count = 0
-            self._refresh_log()
-            return
         safe_text, _hidden = _trim_trailing_partial_marker(self._stream_buffer)
         renderable_text = _close_open_markdown_markers(safe_text)
-        block = self._model_text_block(renderable_text, show_header=not self._stream_has_visible_output)
+        block = ModelTextBlock()
+        block.append(renderable_text)
         self._stream_strip_count = self._write_strips_counted(block.render(self.width))
         self._refresh_log()
 
     def _replace_streaming_render(self) -> None:
-        self._pop_strips(self._stream_strip_count, clamp_scroll=False)
+        self._pop_strips(self._stream_strip_count)
         self._stream_strip_count = 0
         self._render_streaming_buffer()
         self._stream_pending_chars = 0
@@ -746,7 +551,7 @@ class TextualSink:
         if self._stream_flush_timer is not None:
             return
         try:
-            self._stream_flush_timer = self._output_log.set_timer(
+            self._stream_flush_timer = self._log.set_timer(
                 self.STREAM_BATCH_DELAY,
                 self._flush_streaming_render_timer,
             )
@@ -757,7 +562,6 @@ class TextualSink:
         self._stream_flush_timer = None
         if not self._stream_buffer or self._stream_pending_chars <= 0:
             return
-        self._commit_safe_streaming_prefix()
         self._replace_streaming_render()
         if callable(self._on_history_grew):
             self._on_history_grew()
@@ -766,10 +570,6 @@ class TextualSink:
         """Re-render any in-flight RichLog stream after terminal resize."""
         did_reflow = False
         self._cancel_stream_flush_timer()
-        if self._stream_has_visible_output:
-            self._stream_strip_count = 0
-            self._rebuild_history()
-            did_reflow = True
         if self._stream_buffer:
             self._replace_streaming_render()
             did_reflow = True
@@ -787,7 +587,7 @@ class TextualSink:
         self._refresh_log()
 
     def _replace_thinking_render(self) -> None:
-        self._pop_strips(self._thinking_strip_count, clamp_scroll=False)
+        self._pop_strips(self._thinking_strip_count)
         self._thinking_strip_count = 0
         self._render_thinking_buffer()
 
@@ -808,7 +608,7 @@ class TextualSink:
         if self._active_operations_timer is not None:
             return
         try:
-            self._active_operations_timer = self._output_log.set_interval(
+            self._active_operations_timer = self._log.set_interval(
                 0.1,
                 self._tick_active_operations,
             )
@@ -831,10 +631,10 @@ class TextualSink:
         self._active_operations_frame = (self._active_operations_frame + 1) % len(SPINNER_FRAMES)
         self._replace_active_operations_render(notify_history=False)
 
-    def _pop_active_operations_render(self, *, clamp_scroll: bool = True) -> bool:
+    def _pop_active_operations_render(self) -> bool:
         if self._active_operations_strip_count <= 0:
             return False
-        self._pop_strips(self._active_operations_strip_count, clamp_scroll=clamp_scroll)
+        self._pop_strips(self._active_operations_strip_count)
         self._active_operations_strip_count = 0
         return True
 
@@ -851,7 +651,7 @@ class TextualSink:
             self._on_history_grew()
 
     def _replace_active_operations_render(self, *, notify_history: bool) -> None:
-        self._pop_active_operations_render(clamp_scroll=False)
+        self._pop_active_operations_render()
         self._render_active_operations(notify_history=notify_history)
 
     def clear_active_operations(self) -> None:
@@ -878,20 +678,22 @@ class TextualSink:
         )
 
     def handle_text_delta(self, delta: str) -> None:
-        """Live Markdown streaming with a bounded repaint tail.
+        """Live Markdown streaming: each delta repaints the full buffer.
 
         Strategy:
-          1. Append delta to the full response and the live tail.
-          2. Move safe completed Markdown lines out of the live tail.
-          3. Pop+rewrite only the remaining tail, patching unfinished inline
-             markers so the user never sees raw ``**``/``` ` ```.
-          4. Persist the full assistant response once on ``end_text``.
+          1. Append delta to buffer.
+          2. Pop the strips of the previous render.
+          3. Render the buffer (with synthetic closers for unfinished
+             inline markers — see ``_close_open_markdown_markers``) so the
+             user never sees raw ``**``/``` ` ``` while streaming.
+          4. Write the resulting strips, track the count for next pop.
+          5. Force a full ``log.refresh()`` so the widget repaints regardless
+             of which widget currently has focus.
         """
         if not delta:
             return
 
-        first_delta = not self._stream_full_text
-        self._stream_full_text += delta
+        first_delta = not self._stream_buffer
         self._stream_buffer += delta
         self._stream_pending_chars += len(delta)
 
@@ -903,7 +705,6 @@ class TextualSink:
         should_flush = first_delta or self._stream_pending_chars >= self.STREAM_BATCH_MAX_CHARS or "\n" in delta
         if should_flush:
             self._cancel_stream_flush_timer()
-            self._commit_safe_streaming_prefix()
             self._replace_streaming_render()
             if callable(self._on_history_grew):
                 self._on_history_grew()
@@ -923,34 +724,27 @@ class TextualSink:
         legitimately-unclosed marker (rare) gets handled by rich.markdown
         the way it normally would. Then reset state.
         """
-        if not self._stream_full_text:
+        if not self._stream_buffer:
             self._stream_strip_count = 0
             self._stream_pending_chars = 0
             return
 
-        # Pop our synthetic-closer render and commit any remaining tail as
-        # final Markdown. Already-safe prefixes are committed visually as they
-        # stream, so this is usually a small suffix rather than the full answer.
+        # Pop our synthetic-closer render and emit a final un-patched one.
         self._cancel_stream_flush_timer()
-        self._pop_strips(self._stream_strip_count, clamp_scroll=False)
-        if self._stream_buffer:
-            block = self._model_text_block(self._stream_buffer, show_header=not self._stream_has_visible_output)
-            self._commit(
-                block.render(self.width),
-                kind="assistant",
-                search_text=self._stream_buffer,
-                label="assistant",
-                block=block,
-                persist_entry=False,
-            )
-            self._stream_has_visible_output = True
-        self._persist_streaming_response()
+        self._pop_strips(self._stream_strip_count)
+        block = ModelTextBlock()
+        block.append(self._stream_buffer)
+        self._commit(
+            block.render(self.width),
+            kind="assistant",
+            search_text=self._stream_buffer,
+            label="assistant",
+            block=block,
+        )
         self._refresh_log()
-        self._stream_full_text = ""
         self._stream_buffer = ""
         self._stream_strip_count = 0
         self._stream_pending_chars = 0
-        self._stream_has_visible_output = False
         self._refresh_status_display()
 
     def handle_thinking_delta(self, delta: str) -> None:
@@ -969,7 +763,7 @@ class TextualSink:
             return
         block = self._current_thinking
         self._current_thinking = None
-        self._pop_strips(self._thinking_strip_count, clamp_scroll=False)
+        self._pop_strips(self._thinking_strip_count)
         self._thinking_strip_count = 0
         if block.text:
             self._commit(
@@ -991,7 +785,7 @@ class TextualSink:
             self._replace_active_operations_render(notify_history=False)
             self._refresh_status_display()
             return
-        block = ToolCallBlock(name=name, args=args, tool_call_id=tool_call_id)
+        block = ToolCallBlock(name=name, args=args)
         self._tools[tool_call_id] = block
         if self._active_operations_strip_count == 0:
             self._active_operations_frame = 0
@@ -999,11 +793,10 @@ class TextualSink:
         self._refresh_status_display()
 
     def handle_tool_call_complete(self, tool_call_id: str, result: Any, *, error: bool = False) -> None:
-        self._pop_active_operations_render(clamp_scroll=False)
+        self._pop_active_operations_render()
         block = self._tools.pop(tool_call_id, None)
         if block is None:
-            self._sync_log_after_line_mutation()
-            block = ToolCallBlock(name="(unknown)", args=None, tool_call_id=tool_call_id)
+            block = ToolCallBlock(name="(unknown)", args=None)
         block.complete(result, error=error)
         # Commit the final tool block to history. If a streaming text block
         # is in progress, flush it first so the tool block appears after the
@@ -1050,10 +843,9 @@ class TextualSink:
         result_preview: str = "",
         duration_seconds: float = 0.0,
     ) -> None:
-        self._pop_active_operations_render(clamp_scroll=False)
+        self._pop_active_operations_render()
         state = self._subagent_states.pop(agent_id, None)
         if state is None:
-            self._sync_log_after_line_mutation()
             return
         # Commit a summary line to history.
         self._flush_streaming_text()
@@ -1085,8 +877,6 @@ class TextualSink:
 
     def write_block(self, block: Any) -> None:
         self._flush_streaming_text()
-        if isinstance(block, ModelTextBlock):
-            block.theme_name = self._theme_name
         kind, label, search_text = self._metadata_for_block(block)
         if isinstance(block, ToolCallBlock):
             self._tool_history.append(block)
@@ -1150,7 +940,7 @@ class TextualSink:
         if entry_index < 0 or entry_index >= len(self._history_entries):
             return False
         entry = self._history_entries[entry_index]
-        self._output_log.scroll_to(y=max(0, entry.line_start), animate=False, immediate=True)
+        self._log.scroll_to(y=max(0, entry.line_start), animate=False, immediate=True)
         return True
 
     def jump_to_marker(self, kind: str, direction: int, current_y: float) -> bool:
@@ -1212,18 +1002,18 @@ class TextualSink:
 
     def _rebuild_history(self) -> None:
         entries = list(self._history_entries)
-        self._output_log.clear()
+        self._log.clear()
         for entry in entries:
-            entry.line_start = len(self._output_log.lines)
+            entry.line_start = len(self._log.lines)
             renderable = entry.block.render(self.width) if entry.block is not None else entry.renderable
             if renderable is None:
                 renderable = Text(entry.text)
             self._resync_width()
-            self._output_log.write(
+            self._log.write(
                 Segments(list(self._render_console.render(renderable))),
                 width=self.width,
             )
-            entry.line_end = len(self._output_log.lines)
+            entry.line_end = len(self._log.lines)
         self._history_entries = entries
         self._invalidate_log_line_cache()
         self._refresh_log()
@@ -1328,16 +1118,19 @@ class YaacliTextualApp(App[None]):
     AsyncExitStack the same way the v1 TUIApp does.
     """
 
+    # Pick a modern theme registered by Textual; the user can override.
+    THEME_NAME: ClassVar[str] = "tokyo-night"
+
     CSS = """
     Screen {
-        background: $background;
+        background: #11131a;
     }
     #log, #tool_details {
         height: 1fr;
         border: none;
         padding: 1 2;
-        background: $background;
-        color: $foreground;
+        background: #11131a;
+        color: #d8dee9;
         overflow-x: hidden;
         overflow-y: auto;
         scrollbar-size-vertical: 1;
@@ -1364,9 +1157,6 @@ class YaacliTextualApp(App[None]):
         Binding("shift+f3", "search_previous", "Previous search match", show=False),
         Binding("alt+u", "jump_previous_user", "Previous user", show=False),
         Binding("alt+a", "jump_previous_assistant", "Previous assistant", show=False),
-        Binding("alt+shift+u", "jump_next_user", "Next user", show=False),
-        Binding("alt+shift+a", "jump_next_assistant", "Next assistant", show=False),
-        Binding("alt+b", "scroll_to_bottom", "Scroll to bottom", show=False),
         Binding("alt+t", "jump_previous_tool", "Previous tool", show=False),
         Binding("alt+e", "jump_next_error", "Next error", show=False),
         Binding("ctrl+o", "tool_toggle_details", "Toggle tool details", show=False),
@@ -1381,19 +1171,15 @@ class YaacliTextualApp(App[None]):
         *,
         config: YaacliConfig,
         config_manager: ConfigManager | None = None,
-        runtime: Any | None,
+        runtime: Any,
         cwd: Path,
         model_name: str | None,
         active_model_name: str | None = None,
-        runtime_initializer: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__()
         self._config = config
         self._config_manager = config_manager
         self._runtime = runtime
-        self._runtime_initializer = runtime_initializer
-        self._runtime_task: asyncio.Task[None] | None = None
-        self._oauth_refresh_task: asyncio.Task[None] | None = None
         self._cwd = cwd
         self._model_name = model_name or "(unset)"
         self._active_model_name = self._resolve_initial_active_model_name(active_model_name)
@@ -1418,12 +1204,10 @@ class YaacliTextualApp(App[None]):
         self._search_matches: list[int] = []
         self._search_match_index: int = -1
         self._tool_details_active: bool = False
-        display_config = getattr(config, "display", None)
-        self._theme_name: ThemeName = normalize_theme_name(getattr(display_config, "theme", "dark"))
 
         # Widgets — composed in compose()
         self._header = HeaderBar()
-        self._output_log = StreamingRichLog(
+        self._log = StreamingRichLog(
             id="log",
             min_width=1,
             wrap=True,
@@ -1449,12 +1233,11 @@ class YaacliTextualApp(App[None]):
         self._status = StatusBar()
         self._scroll_indicator = ScrollIndicator()
         self._sink = TextualSink(
-            self._output_log,
+            self._log,
             self._live,
             max_log_lines=getattr(getattr(config, "display", None), "max_output_lines", 0),
-            theme_name=self._theme_name,
         )
-        self._output_log.on_width_changed = self._sink.reflow_streaming_text
+        self._log.on_width_changed = self._sink.reflow_streaming_text
         # Wire the auto-scroll watchdog: each time history grows, decide
         # whether to follow it or to bump the "↓ N new lines" indicator.
         self._sink._on_history_grew = self._on_history_grew
@@ -1465,10 +1248,6 @@ class YaacliTextualApp(App[None]):
         self._sink._on_entry_committed = self._on_history_entry_committed
         self._user_scrolled_up: bool = False
         self._pending_lines_while_scrolled: int = 0
-
-    @property
-    def runtime_ready(self) -> bool:
-        return self._runtime is not None
 
     @property
     def session_id(self) -> str:
@@ -1505,7 +1284,7 @@ class YaacliTextualApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield self._header
-        yield self._output_log
+        yield self._log
         yield self._tool_details
         yield self._scroll_indicator
         yield self._mention_menu
@@ -1518,14 +1297,16 @@ class YaacliTextualApp(App[None]):
             yield self._footer
 
     def on_mount(self) -> None:
-        for theme_name in THEME_NAMES:
-            self.register_theme(build_textual_theme(theme_name))
-        self._apply_theme(self._theme_name)
+        # Apply chosen theme. Available themes were registered by Textual core.
+        try:
+            self.theme = self.THEME_NAME
+        except Exception:
+            logger.debug("Could not set theme %s", self.THEME_NAME, exc_info=True)
         # Allow text selection in the log so users can drag-select.
-        self._output_log.can_focus = True
+        self._log.can_focus = True
         self._tool_details.can_focus = True
         # Watch the log's scroll position so we can detect manual scroll.
-        self.watch(self._output_log, "scroll_y", self._on_log_scroll_y_changed, init=False)
+        self.watch(self._log, "scroll_y", self._on_log_scroll_y_changed, init=False)
         # Wire slash menu: feed it the registered commands. The menu is then
         # updated on every TextArea.Changed event (see ``on_text_area_changed``).
         from yaacli.console.palette import DEFAULT_COMMANDS
@@ -1537,53 +1318,11 @@ class YaacliTextualApp(App[None]):
         self._sync_completion_menu_offsets()
         self._refresh_header()
         self._footer.mode = self._mode
-        self._footer.state = "ready" if self.runtime_ready else "starting"
+        self._footer.state = "ready"
         self._footer.model_label = self._short_model_label()
         self._input.focus()
         # Greeting breadcrumb
-        if self.runtime_ready:
-            self._sink.show_breadcrumb("Type / for commands. /exit to quit.")
-        else:
-            self._sink.show_breadcrumb("Starting runtime. Type / for commands. /exit to quit.")
-            if self._runtime_initializer is not None:
-                self._runtime_task = asyncio.create_task(self._initialise_runtime())
-
-    async def _initialise_runtime(self) -> None:
-        if self._runtime_initializer is None:
-            return
-        try:
-            runtime = await self._runtime_initializer()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self._footer.state = "error"
-            self._sink.write_block(ErrorBlock(title="runtime startup failed", body=str(exc) or repr(exc)))
-            logger.exception("Textual runtime startup failed")
-            return
-
-        self._runtime = runtime
-        self._footer.state = "ready"
-        self._status.set_status("idle")
-        self._sink.show_breadcrumb("→ runtime ready")
-        self._refresh_header()
-
-    def _apply_theme(self, theme_name: ThemeName) -> None:
-        """Apply Textual variables and re-render Rich-backed widgets."""
-        self._theme_name = theme_name
-        self.theme = f"yaacli-{theme_name}"
-        for widget in (
-            self._header,
-            self._footer,
-            self._status,
-            self._slash_menu,
-            self._mention_menu,
-            self._steering,
-            self._live,
-        ):
-            widget.theme_name = theme_name
-        self._sink.set_theme(theme_name)
-        if self._tool_details_active:
-            self._render_tool_details_view()
+        self._sink.show_breadcrumb("Type / for commands. /exit to quit.")
 
     def on_text_area_changed(self, event: Any) -> None:
         """TextArea content changed — drive the slash menu visibility/filter."""
@@ -1744,11 +1483,6 @@ class YaacliTextualApp(App[None]):
             if handled:
                 return
             # fall through — unknown slash command becomes a regular prompt
-
-        if not self.runtime_ready:
-            self._sink.write_block(UserPromptBlock(text=text))
-            self._sink.show_breadcrumb("→ runtime is still starting")
-            return
 
         self._sink.write_block(UserPromptBlock(text=text))
         self._agent_task = asyncio.create_task(self._run_turn(agent_prompt))
@@ -1954,22 +1688,19 @@ class YaacliTextualApp(App[None]):
             return False
         if self._input.text.strip():
             return False
-        if self._output_log.max_scroll_y <= 0:
+        if self._log.max_scroll_y <= 0:
             return False
         if key == "up":
-            self._output_log.action_scroll_up()
+            self._log.action_scroll_up()
             self._pause_history_auto_scroll()
         else:
-            self._output_log.action_scroll_down()
+            self._log.action_scroll_down()
             self._handle_log_scroll()
         return True
 
     # ---------------- steering ----------------
 
     def _inject_steering(self, text: str) -> None:
-        if self._runtime is None:
-            self._sink.show_breadcrumb("→ runtime is still starting")
-            return
         try:
             self._runtime.ctx.send_message(
                 BusMessage(
@@ -2011,7 +1742,7 @@ class YaacliTextualApp(App[None]):
 
     def _is_at_bottom(self) -> bool:
         """True iff the RichLog is scrolled to the very bottom."""
-        return self._output_log.scroll_y >= max(0.0, self._output_log.max_scroll_y - 0.5)
+        return self._log.scroll_y >= max(0.0, self._log.max_scroll_y - 0.5)
 
     def _on_history_grew(self) -> None:
         """Called by TextualSink whenever a block was committed to RichLog.
@@ -2063,21 +1794,13 @@ class YaacliTextualApp(App[None]):
         if entry.kind == "user" and entry.text.lstrip().startswith("/"):
             return
         error = entry.kind == "error"
-        tool_data: dict[str, Any] | None = None
         if isinstance(entry.block, ToolCallBlock):
             error = bool(entry.block.error)
-            tool_data = {
-                "tool_call_id": entry.block.tool_call_id,
-                "name": entry.block.name,
-                "args": entry.block.args,
-                "result": entry.block.result,
-            }
         self._transcript.append_entry(
             kind=entry.kind,
             label=entry.label,
             text=entry.text,
             error=error,
-            tool=tool_data,
         )
         if self._footer.state == "working":
             if entry.kind == "tool":
@@ -2111,7 +1834,7 @@ class YaacliTextualApp(App[None]):
     def _render_transcript_entries(self, entries: list[dict[str, Any]]) -> None:
         self._restoring_transcript = True
         try:
-            self._output_log.clear()
+            self._log.clear()
             self._sink.clear_history_metadata()
             for entry in entries:
                 kind = str(entry.get("kind") or "system")
@@ -2121,27 +1844,16 @@ class YaacliTextualApp(App[None]):
                 if kind == "user":
                     self._sink.write_block(UserPromptBlock(text=text))
                 elif kind == "assistant":
-                    clean_text = strip_legacy_tool_protocol(text)
-                    if clean_text:
-                        block = ModelTextBlock()
-                        block.append(clean_text)
-                        self._sink.write_block(block)
+                    block = ModelTextBlock()
+                    block.append(text)
+                    self._sink.write_block(block)
                 elif kind == "thinking":
                     block = ThinkingBlock()
                     block.append(text)
                     self._sink.write_block(block)
                 elif kind == "tool":
-                    tool_data = entry.get("tool")
-                    if isinstance(tool_data, dict):
-                        block = ToolCallBlock(
-                            name=str(tool_data.get("name") or label or "tool"),
-                            args=tool_data.get("args"),
-                            tool_call_id=str(tool_data.get("tool_call_id") or ""),
-                        )
-                        block.complete(tool_data.get("result"), error=error)
-                    else:
-                        block = ToolCallBlock(name=label or "tool")
-                        block.complete(text, error=error)
+                    block = ToolCallBlock(name=label or "tool")
+                    block.complete(text, error=error)
                     self._sink.write_block(block)
                 elif kind == "error":
                     self._sink.write_block(ErrorBlock(title=label or "error", body=text))
@@ -2232,12 +1944,12 @@ class YaacliTextualApp(App[None]):
             self._render_tool_details_view()
         if self._is_at_bottom() and not self._user_scrolled_up:
             # Sticky to bottom — clear any indicator + ensure auto_scroll on.
-            self._output_log.auto_scroll = True
+            self._log.auto_scroll = True
             self._pending_lines_while_scrolled = 0
             self._scroll_indicator.pending = 0
             return
         # User is scrolled up — keep auto_scroll off and bump pending counter.
-        self._output_log.auto_scroll = False
+        self._log.auto_scroll = False
         self._pending_lines_while_scrolled += 1
         self._scroll_indicator.pending = self._pending_lines_while_scrolled
 
@@ -2245,29 +1957,29 @@ class YaacliTextualApp(App[None]):
         """Manual-scroll callback. Wired via the RichLog's scroll_y watcher."""
         if self._is_at_bottom():
             # User scrolled back to the bottom — re-arm.
-            self._output_log.auto_scroll = True
+            self._log.auto_scroll = True
             self._user_scrolled_up = False
             self._pending_lines_while_scrolled = 0
             self._scroll_indicator.pending = 0
         else:
             # User scrolled away from bottom — pause auto-scroll.
             self._user_scrolled_up = True
-            self._output_log.auto_scroll = False
+            self._log.auto_scroll = False
 
     def action_scroll_to_bottom(self) -> None:
         if self._tool_details_active:
             self._hide_tool_details_view()
-        self._output_log.scroll_end(animate=False)
-        self._output_log.auto_scroll = True
+        self._log.scroll_end(animate=False)
+        self._log.auto_scroll = True
         self._user_scrolled_up = False
         self._pending_lines_while_scrolled = 0
         self._scroll_indicator.pending = 0
 
     def action_page_up(self) -> None:
-        self._output_log.action_page_up()
+        self._log.action_page_up()
 
     def action_page_down(self) -> None:
-        self._output_log.action_page_down()
+        self._log.action_page_down()
 
     def action_search_prompt(self) -> None:
         self._set_prompt_text("/search ")
@@ -2286,12 +1998,6 @@ class YaacliTextualApp(App[None]):
 
     def action_jump_previous_assistant(self) -> None:
         self._jump_history_marker("assistant", -1)
-
-    def action_jump_next_user(self) -> None:
-        self._jump_history_marker("user", 1)
-
-    def action_jump_next_assistant(self) -> None:
-        self._jump_history_marker("assistant", 1)
 
     def action_jump_previous_tool(self) -> None:
         self._jump_history_marker("tool", -1)
@@ -2372,26 +2078,28 @@ class YaacliTextualApp(App[None]):
         target = self._sink.marker_entry_index(
             marker,
             direction,
-            self._output_log.scroll_y,
+            self._log.scroll_y,
             skip_entry_index=skip_entry_index,
         )
         if target is None:
             self._sink.show_breadcrumb(f"→ no {marker} marker")
             return False
         self._pause_history_auto_scroll()
+        arrow = "previous" if direction < 0 else "next"
+        self._sink.show_breadcrumb(f"→ jumped to {arrow} {marker}")
         self._sink.scroll_to_entry(target)
         self._pause_history_auto_scroll()
         return True
 
     def _pause_history_auto_scroll(self) -> None:
-        self._output_log.auto_scroll = False
+        self._log.auto_scroll = False
         self._user_scrolled_up = True
 
     def _show_tool_details_view(self) -> bool:
         if not self._render_tool_details_view():
             return False
         self._tool_details_active = True
-        self._output_log.display = False
+        self._log.display = False
         self._tool_details.display = True
         self._live.display = False
         self._tool_details.scroll_home(animate=False)
@@ -2401,7 +2109,7 @@ class YaacliTextualApp(App[None]):
     def _hide_tool_details_view(self) -> None:
         self._tool_details_active = False
         self._tool_details.display = False
-        self._output_log.display = True
+        self._log.display = True
         self._live.display = True
         self._input.focus()
 
@@ -2411,13 +2119,13 @@ class YaacliTextualApp(App[None]):
         if not blocks:
             return False
 
-        width = max(40, self._tool_details.size.width or self._output_log.size.width or 100)
+        width = max(40, self._tool_details.size.width or self._log.size.width or 100)
         console = RichConsole(
-            theme=build_theme(self._theme_name),
+            theme=build_theme(),
             force_terminal=True,
             color_system="truecolor",
             width=width,
-            height=max(1, self._tool_details.size.height or self._output_log.size.height or 25),
+            height=max(1, self._tool_details.size.height or self._log.size.height or 25),
         )
         title = Text()
         title.append("Tool Details", style="console.tool.name")
@@ -2482,16 +2190,13 @@ class YaacliTextualApp(App[None]):
         # status sat at "ready" until a delta showed up).
         self._status.set_status("thinking")
         session = ConsoleSession(sink=self._sink)
-        goal_stop_reason: GoalCompleteReason | None = None
         try:
             await self._execute_with_hitl(user_prompt, session)
         except asyncio.CancelledError:
-            goal_stop_reason = GoalCompleteReason.cancelled
             self._sink.end_text()
             self._sink.end_thinking()
             self._sink.show_breadcrumb("→ cancelled")
         except Exception as exc:
-            goal_stop_reason = GoalCompleteReason.error
             self._sink.end_text()
             self._sink.end_thinking()
             self._sink.write_block(
@@ -2512,11 +2217,6 @@ class YaacliTextualApp(App[None]):
                 self._runtime.ctx.steering_messages.clear()
             except Exception:
                 logger.debug("Could not clear steering_messages", exc_info=True)
-            ctx = self._runtime.ctx
-            if ctx.goal_active:
-                reason = goal_stop_reason or GoalCompleteReason.unverified_stop
-                self._sink.show_breadcrumb(f"→ goal stopped: {reason.value}")
-                ctx.reset_goal()
             self._footer.state = "ready"
             self._status.set_status("idle")
             self._record_turn_summary()
@@ -2528,17 +2228,21 @@ class YaacliTextualApp(App[None]):
         first = True
         result = None
         while True:
-            async with open_runtime_stream(
+            async with stream_agent(
                 self._runtime,
-                self._config,
                 user_prompt=next_input if (first and isinstance(next_input, str)) else None,
                 message_history=self._message_history if first else None,
                 deferred_tool_results=next_input if not isinstance(next_input, str) else None,
+                usage_limits=UsageLimits(request_limit=self._config.general.max_requests),
+                post_node_hook=emit_context_update,
+                resume_on_error=self._config.general.agent_stream_resume_on_error,
+                resume_max_attempts=self._config.general.agent_stream_resume_max_attempts,
+                resume_prompt=self._config.general.agent_stream_resume_prompt,
             ) as stream:
                 await session.stream(stream)
                 try:
                     if hasattr(stream, "all_messages") and callable(stream.all_messages):
-                        self._message_history = list(cast(Any, stream.all_messages()))
+                        self._message_history = list(stream.all_messages())
                         self._save_message_history_snapshot()
                 except Exception:
                     logger.debug("Could not persist message history", exc_info=True)
@@ -2615,12 +2319,11 @@ class YaacliTextualApp(App[None]):
             self._message_history = []
             self._current_context_tokens = 0
             self._refresh_context_status()
-            self._output_log.clear()
+            self._log.clear()
             self._sink.clear_history_metadata()
             if self._transcript is not None:
                 self._transcript.clear_transcript()
-                if self._runtime is not None:
-                    self._transcript.reset_context_state(self._runtime)
+                self._transcript.reset_context_state(self._runtime)
             self._search_query = ""
             self._search_matches = []
             self._search_match_index = -1
@@ -2679,7 +2382,7 @@ class YaacliTextualApp(App[None]):
                 return True
             self._transcript.load_from_folder(folder)
             self._message_history, rebuilt_context = self._transcript.load_message_history_or_transcript()
-            if self._runtime is not None and not self._transcript.restore_context_state(self._runtime):
+            if not self._transcript.restore_context_state(self._runtime):
                 self._transcript.reset_context_state(self._runtime)
             self._render_transcript_entries(self._transcript.transcript())
             suffix = " (rebuilt model context from transcript)" if rebuilt_context else ""
@@ -2698,26 +2401,6 @@ class YaacliTextualApp(App[None]):
             self._mode = "PLAN"
             self._footer.mode = self._mode
             self._sink.show_breadcrumb("→ switched to PLAN mode (no writes, no shell mutations)")
-            return True
-
-        if name == "goal":
-            self._record_recent_command(name)
-            if self._runtime is None:
-                self._sink.show_breadcrumb("→ runtime is not initialised")
-                return True
-            ctx = self._runtime.ctx
-            if ctx.goal_active:
-                self._sink.show_breadcrumb("→ a goal is already running; press Ctrl+C to stop it")
-                return True
-            if not args:
-                self._sink.show_breadcrumb("→ usage: /goal <task description>")
-                return True
-            ctx.reset_goal()
-            ctx.goal_task = args
-            ctx.goal_iteration = 0
-            ctx.goal_max_iterations = self._config.general.max_goal_iterations
-            self._sink.show_breadcrumb(f"→ goal started · max {ctx.goal_max_iterations} iterations · Ctrl+C to stop")
-            self._agent_task = asyncio.create_task(self._run_turn(args))
             return True
 
         if name == "cost":
@@ -2760,11 +2443,6 @@ class YaacliTextualApp(App[None]):
             await self._handle_model_command(args)
             return True
 
-        if name == "theme":
-            self._record_recent_command(name)
-            self._handle_theme_command(args)
-            return True
-
         if name == "skills":
             self._record_recent_command(name)
             self._show_skills(args)
@@ -2796,38 +2474,6 @@ class YaacliTextualApp(App[None]):
             return True
 
         return False
-
-    def _handle_theme_command(self, args: str) -> None:
-        requested = args.strip().lower()
-        if not requested:
-            choices = ", ".join(f"[{name}]" if name == self._theme_name else name for name in THEME_NAMES)
-            self._sink.show_breadcrumb(f"→ theme {choices}")
-            return
-        aliases = {
-            "dark": "dark",
-            "light": "light",
-            "latte": "light",
-            "cappuccino": "cappuccino",
-        }
-        selected = aliases.get(requested)
-        if selected is None:
-            self._sink.show_breadcrumb(f"→ theme must be one of {', '.join(THEME_NAMES)}")
-            return
-        theme_name = normalize_theme_name(selected)
-        self._apply_theme(theme_name)
-        display = getattr(self._config, "display", None)
-        if display is not None:
-            display.theme = theme_name
-        if self._config_manager is None:
-            self._sink.show_breadcrumb(f"→ switched to {theme_name} theme")
-            return
-        try:
-            config_file = self._config_manager.persist_display_theme(theme_name)
-        except OSError as exc:
-            logger.warning("Could not persist theme selection: %s", exc)
-            self._sink.show_breadcrumb(f"→ switched to {theme_name} theme (not saved)")
-            return
-        self._sink.show_breadcrumb(f"→ switched to {theme_name} theme · saved to {config_file}")
 
     # ---------------- skills / subagents ----------------
 
@@ -2901,8 +2547,6 @@ class YaacliTextualApp(App[None]):
                 self._config_manager.load_mcp_config(),
                 self._config_manager.get_mcp_config_file(),
             )
-
-        from ya_agent_sdk.mcp import load_mcp_config_file
 
         project_mcp = self._cwd / ConfigManager.PROJECT_CONFIG_DIR / "mcp.json"
         if project_mcp.exists():
@@ -3117,9 +2761,6 @@ class YaacliTextualApp(App[None]):
             return
 
         tool_name = "spawn_delegate" if command_name == "spawn" else "delegate"
-        if not self.runtime_ready:
-            self._sink.show_breadcrumb("→ runtime is still starting")
-            return
         agent_prompt = (
             f'Use the `{tool_name}` tool now with subagent_name="{subagent.name}" '
             "and the prompt below. Do not answer from the main agent before using "
@@ -3153,32 +2794,33 @@ class YaacliTextualApp(App[None]):
     def _resolve_initial_active_model_name(self, explicit_name: str | None) -> str:
         if explicit_name:
             return explicit_name
-        if self._config_manager is not None:
+        getter = getattr(self._config, "get_startup_model_profile", None)
+        if callable(getter):
             try:
-                profile = get_startup_model_profile(self._config, self._config_manager.config_dir)
-                if profile is not None:
-                    return profile.id
-            except (AttributeError, TypeError):
+                name, _profile = getter()
+                if name:
+                    return str(name)
+            except Exception:
                 logger.debug("Could not resolve startup model profile", exc_info=True)
-        active_model = getattr(getattr(self._config, "general", None), "active_model", None)
+        active_model = getattr(getattr(self._config, "general", None), "active_model", "")
         if active_model:
             return str(active_model)
         return self._profile_name_from_display(self._model_name)
 
     def _get_model_profiles(self) -> dict[str, Any]:
-        try:
-            return {profile.id: profile for profile in build_model_profiles(self._config)}
-        except (AttributeError, TypeError):
-            return dict(getattr(self._config, "models", None) or {})
+        getter = getattr(self._config, "get_model_profiles", None)
+        if callable(getter):
+            return dict(getter())
+        return dict(getattr(self._config, "models", None) or {})
 
     def _get_model_profile(self, name: str) -> Any:
-        try:
-            profile = get_model_profile(self._config, name)
-        except (AttributeError, TypeError):
-            profile = None
-        if profile is None:
+        getter = getattr(self._config, "get_model_profile", None)
+        if callable(getter):
+            return getter(name)
+        profiles = self._get_model_profiles()
+        if name not in profiles:
             raise KeyError(f"Unknown model profile: {name}")
-        return profile
+        return profiles[name]
 
     @staticmethod
     def _format_model_display_name(name: str, profile: Any) -> str:
@@ -3252,9 +2894,6 @@ class YaacliTextualApp(App[None]):
         if self._model_switch_is_blocked():
             self._sink.show_breadcrumb("→ cannot switch model while agent is running")
             return
-        if self._runtime is None:
-            self._sink.show_breadcrumb("→ runtime is still starting")
-            return
         try:
             profile = self._get_model_profile(model_name)
         except KeyError:
@@ -3263,8 +2902,6 @@ class YaacliTextualApp(App[None]):
 
         try:
             apply_model_profile(self._runtime, profile)
-            if self._config_manager is not None:
-                save_selected_model_profile_id(self._config_manager.config_dir, profile.id)
         except Exception as exc:
             self._sink.write_block(
                 ErrorBlock(
@@ -3279,30 +2916,6 @@ class YaacliTextualApp(App[None]):
         self._refresh_header()
         self._footer.model_label = self._short_model_label()
         self._sink.show_breadcrumb(f"→ switched model to {model_name}: {getattr(profile, 'model', '')}")
-        self._refresh_oauth_profile_after_switch(profile)
-
-    def _refresh_oauth_profile_after_switch(self, profile: Any) -> None:
-        model = getattr(profile, "model", None)
-        if not isinstance(model, str) or not model.startswith("oauth@"):
-            return
-        self._oauth_refresh_task = asyncio.create_task(self._refresh_oauth_profile_once(model))
-
-    async def _refresh_oauth_profile_once(self, model: str) -> None:
-        try:
-            from ya_oauth_provider import create_oauth_refresh_supervisor_for_models
-
-            supervisor = create_oauth_refresh_supervisor_for_models([model], refresh_on_startup=False)
-            if supervisor is None:
-                return
-            results = await supervisor.refresh_once()
-            failures = [str(result) for result in results.values() if isinstance(result, Exception)]
-            if failures:
-                self._sink.show_breadcrumb(f"→ OAuth refresh failed: {failures[0]}")
-            else:
-                self._sink.show_breadcrumb("→ OAuth token refreshed")
-        except Exception as exc:
-            logger.warning("OAuth refresh failed after model switch", exc_info=True)
-            self._sink.show_breadcrumb(f"→ OAuth refresh failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -3316,56 +2929,69 @@ async def run_textual_tui(
     *,
     verbose: bool = False,
     working_dir: Path | None = None,
-    model_profile_id: str | None = None,
 ) -> str | None:
-    """Run YaacliTextualApp while constructing the runtime in the background."""
+    """Construct the runtime then run YaacliTextualApp."""
     cwd = working_dir or Path.cwd()
     async with AsyncExitStack() as stack:
-        model_profile = get_model_profile(config, model_profile_id) if model_profile_id else None
-        if model_profile_id and model_profile is None:
-            raise ValueError(f"Unknown model profile: {model_profile_id}")
+        browser = BrowserManager(config.browser)
+        await stack.enter_async_context(browser)
+
+        mcp_config = config_manager.load_mcp_config()
+        runtime = create_tui_runtime(
+            config=config,
+            mcp_config=mcp_config,
+            browser_manager=browser,
+            working_dir=cwd,
+            config_dir=config_manager.config_dir,
+        )
+        await stack.enter_async_context(runtime)
 
         # Resolve display model name
         model_name: str | None = None
         active_model_name: str | None = None
         try:
-            profile = model_profile or get_startup_model_profile(config, config_manager.config_dir)
-            if profile is None:
-                raise ValueError("No model profile is configured")
-            active_model_name = profile.id
-            label = profile.label or profile.id
+            from yaacli.runtime import resolve_startup_model_profile
+
+            active_name, _ = resolve_startup_model_profile(config)
+            active_model_name = active_name
+            profile = config.get_model_profile(active_name)
+            label = getattr(profile, "label", None) or active_name
             model_name = f"{label} ({getattr(profile, 'model', '?')})"
         except Exception:
             logger.debug("Could not resolve startup model profile", exc_info=True)
             model_name = "(unset)"
 
-        async def initialise_runtime() -> Any:
-            runtime = create_tui_runtime(
-                config=config,
-                mcp_config=config_manager.load_mcp_config(),
-                working_dir=cwd,
-                config_dir=config_manager.config_dir,
-                model_profile=model_profile,
-            )
-            await stack.enter_async_context(runtime)
-            return runtime
+        oauth_refresh = getattr(config, "oauth_refresh", None)
+        if getattr(oauth_refresh, "enabled", False):
+            try:
+                from ya_oauth_provider import create_oauth_refresh_supervisor_for_models
+
+                supervisor = create_oauth_refresh_supervisor_for_models(
+                    (profile.model for profile in config.get_model_profiles().values()),
+                    interval_seconds=getattr(oauth_refresh, "interval_seconds", 1800),
+                    failure_retry_seconds=getattr(oauth_refresh, "failure_retry_seconds", 60),
+                    refresh_on_startup=getattr(oauth_refresh, "refresh_on_startup", True),
+                )
+                if supervisor is not None:
+                    await supervisor.start()
+                    stack.push_async_callback(supervisor.shutdown)
+                    logger.info(
+                        "OAuth refresh supervisor started providers=%s",
+                        sorted(supervisor.provider_names),
+                    )
+            except Exception:
+                logger.warning("Failed to start OAuth refresh supervisor", exc_info=True)
 
         app = YaacliTextualApp(
             config=config,
             config_manager=config_manager,
-            runtime=None,
+            runtime=runtime,
             cwd=cwd,
             model_name=model_name,
             active_model_name=active_model_name,
-            runtime_initializer=initialise_runtime,
         )
         # Leave terminal mouse reporting off so ordinary left-drag text
         # selection works in the model transcript. Keyboard navigation still
         # covers scrolling, search, jump markers, and command/menu selection.
-        try:
-            await app.run_async(mouse=False)
-        finally:
-            if app._runtime_task is not None and not app._runtime_task.done():
-                app._runtime_task.cancel()
-                await asyncio.gather(app._runtime_task, return_exceptions=True)
+        await app.run_async(mouse=False)
     return app.session_id if app.has_session_data else None

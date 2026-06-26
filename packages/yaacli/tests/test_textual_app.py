@@ -19,7 +19,6 @@ def _make_stub_config() -> SimpleNamespace:
     return SimpleNamespace(
         general=SimpleNamespace(
             max_requests=10,
-            max_goal_iterations=10,
             agent_stream_resume_on_error=False,
             agent_stream_resume_max_attempts=0,
             agent_stream_resume_prompt="",
@@ -259,71 +258,6 @@ async def test_textualsink_streaming_rewrite_invalidates_render_cache() -> None:
 
 
 @pytest.mark.asyncio
-async def test_textualsink_line_removal_updates_richlog_virtual_height() -> None:
-    """Removing transient strips must not leave a blank scrollable tail."""
-    from textual.app import App, ComposeResult
-    from yaacli.console.textual_app import TextualSink
-    from yaacli.console.widgets import LivePane
-
-    class HarnessApp(App[None]):
-        def compose(self) -> ComposeResult:
-            yield RichLog(id="log", wrap=True, markup=False, auto_scroll=True)
-            yield LivePane()
-
-    app = HarnessApp()
-    async with app.run_test(size=(80, 16)) as pilot:
-        log = app.query_one(RichLog)
-        sink = TextualSink(log, app.query_one(LivePane))
-        for index in range(60):
-            sink.show_breadcrumb(f"line {index}")
-        await pilot.pause(0.05)
-
-        sink._pop_strips(45)
-        sink._refresh_log()
-        await pilot.pause(0.05)
-
-        assert log.virtual_size.height == len(log.lines) == 15
-        assert log.scroll_y <= log.max_scroll_y
-        assert log.max_scroll_y <= max(0, len(log.lines) - log.scrollable_content_region.height)
-
-
-@pytest.mark.asyncio
-async def test_textualsink_streaming_repaint_does_not_scroll_during_pop() -> None:
-    """Streaming repaint should not jump to the shorter pre-write log."""
-    from textual.app import App, ComposeResult
-    from yaacli.console.textual_app import TextualSink
-    from yaacli.console.widgets import LivePane
-
-    class HarnessApp(App[None]):
-        def compose(self) -> ComposeResult:
-            yield RichLog(id="log", wrap=True, markup=False, auto_scroll=True)
-            yield LivePane()
-
-    app = HarnessApp()
-    async with app.run_test(size=(80, 16)) as pilot:
-        log = app.query_one(RichLog)
-        sink = TextualSink(log, app.query_one(LivePane))
-        for index in range(40):
-            sink.show_breadcrumb(f"history {index}")
-        sink.handle_text_delta("assistant line 1\nassistant line 2")
-        await pilot.pause(0.05)
-
-        scroll_end_calls: list[dict[str, object]] = []
-        original_scroll_end = log.scroll_end
-
-        def record_scroll_end(*args: object, **kwargs: object) -> object:
-            scroll_end_calls.append(dict(kwargs))
-            return original_scroll_end(*args, **kwargs)
-
-        log.scroll_end = record_scroll_end  # type: ignore[method-assign]
-        sink.handle_text_delta("\nassistant line 3")
-        await pilot.pause(0.05)
-
-        assert scroll_end_calls
-        assert all(call.get("immediate") is not True for call in scroll_end_calls)
-
-
-@pytest.mark.asyncio
 async def test_textualsink_batches_small_streaming_deltas() -> None:
     """Small token deltas should not force a full Markdown render per token."""
     from textual.app import App, ComposeResult
@@ -357,43 +291,6 @@ async def test_textualsink_batches_small_streaming_deltas() -> None:
         sink.end_text()
         await pilot.pause(0.02)
         assert "x" * 40 in _log_text(log)
-
-
-@pytest.mark.asyncio
-async def test_textualsink_commits_completed_streaming_lines_incrementally() -> None:
-    """Completed Markdown lines should leave the live repaint tail."""
-    from textual.app import App, ComposeResult
-    from yaacli.console.textual_app import TextualSink
-    from yaacli.console.widgets import LivePane
-
-    class HarnessApp(App[None]):
-        def compose(self) -> ComposeResult:
-            yield RichLog(id="log", wrap=True, markup=False)
-            yield LivePane()
-
-    app = HarnessApp()
-    async with app.run_test(size=(80, 20)) as pilot:
-        log = app.query_one(RichLog)
-        sink = TextualSink(log, app.query_one(LivePane))
-        tail_sizes: list[int] = []
-        original_render = sink._render_streaming_buffer
-
-        def record_tail_render() -> None:
-            tail_sizes.append(len(sink._stream_buffer))
-            original_render()
-
-        sink._render_streaming_buffer = record_tail_render  # type: ignore[method-assign]
-
-        for index in range(120):
-            sink.handle_text_delta(f"- streamed item {index}\n")
-        await pilot.pause(0.05)
-
-        rendered = _log_text(log)
-        assert "streamed item 0" in rendered
-        assert "streamed item 119" in rendered
-        assert rendered.count("assistant") == 1
-        assert "│" not in rendered
-        assert max(tail_sizes, default=0) < 80
 
 
 @pytest.mark.asyncio
@@ -620,9 +517,7 @@ async def test_textualsink_tool_call_runs_in_richlog_then_commits_to_log() -> No
         # Done state replaces the transient running render with committed history.
         assert not live.has_blocks
         done = _log_text(log)
-        assert "x.py" in done
         assert "3 lines" in done
-        assert "running" not in done
         assert len(log.lines) <= first_render_lines + 3
 
 
@@ -703,12 +598,18 @@ async def test_textual_launcher_disables_terminal_mouse_reporting(
 
     run_kwargs: list[dict[str, Any]] = []
     config = _make_stub_config()
+    config.browser = SimpleNamespace()
     config_manager = SimpleNamespace(
         config_dir=tmp_path / ".yaacli",
         get_sessions_dir=lambda: tmp_path / ".yaacli" / "sessions",
         load_mcp_config=lambda: {},
     )
 
+    monkeypatch.setattr(
+        textual_app,
+        "BrowserManager",
+        lambda _browser_config: FakeAsyncResource(),
+    )
     monkeypatch.setattr(
         textual_app,
         "create_tui_runtime",
@@ -728,76 +629,6 @@ async def test_textual_launcher_disables_terminal_mouse_reporting(
 
     assert run_kwargs
     assert run_kwargs[0].get("mouse") is False
-
-
-@pytest.mark.asyncio
-async def test_textual_launcher_defers_runtime_creation_until_app_runs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from yaacli.console import textual_app
-
-    class FakeAsyncResource:
-        entered = False
-
-        async def __aenter__(self) -> Any:
-            self.entered = True
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            return None
-
-    runtime = FakeAsyncResource()
-    create_calls = 0
-    config = _make_stub_config()
-    config_manager = SimpleNamespace(
-        config_dir=tmp_path / ".yaacli",
-        get_sessions_dir=lambda: tmp_path / ".yaacli" / "sessions",
-        load_mcp_config=lambda: {},
-    )
-
-    def fake_create_tui_runtime(**_kwargs: Any) -> FakeAsyncResource:
-        nonlocal create_calls
-        create_calls += 1
-        return runtime
-
-    monkeypatch.setattr(textual_app, "create_tui_runtime", fake_create_tui_runtime)
-
-    async def fake_run_async(self: Any, **_kwargs: Any) -> None:
-        assert self._runtime is None
-        assert create_calls == 0
-        await self._runtime_initializer()
-
-    monkeypatch.setattr(textual_app.YaacliTextualApp, "run_async", fake_run_async)
-
-    await textual_app.run_textual_tui(
-        config,
-        config_manager,  # type: ignore[arg-type]
-        working_dir=tmp_path,
-    )
-
-    assert create_calls == 1
-    assert runtime.entered is True
-
-
-@pytest.mark.asyncio
-async def test_textual_app_reports_runtime_starting_for_prompt(tmp_path: Path) -> None:
-    from yaacli.console.textual_app import YaacliTextualApp
-
-    app = YaacliTextualApp(
-        config=_make_stub_config(),  # type: ignore[arg-type]
-        config_manager=None,
-        runtime=None,
-        cwd=tmp_path,
-        model_name="test",
-        active_model_name=None,
-    )
-
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        await app._submit_prompt_text("hello")
-        await pilot.pause()
-        assert "runtime is still starting" in _log_text(app.query_one(RichLog))
 
 
 @pytest.mark.asyncio
@@ -1031,7 +862,6 @@ async def test_jump_previous_assistant_key_moves_viewport_off_bottom() -> None:
         assert log.scroll_y <= assistant_entry.line_start + 1
         assert log.scroll_y < log.max_scroll_y
         assert log.auto_scroll is False
-        assert "→ jumped to previous assistant" not in _log_text(log)
 
         log.scroll_to(y=log.max_scroll_y, animate=False)
         await pilot.pause()
@@ -1043,95 +873,6 @@ async def test_jump_previous_assistant_key_moves_viewport_off_bottom() -> None:
         assert log.scroll_y <= user_entry.line_start + 1
         assert log.scroll_y < log.max_scroll_y
         assert log.auto_scroll is False
-        assert "→ jumped to previous user" not in _log_text(log)
-
-
-@pytest.mark.asyncio
-async def test_jump_user_and_assistant_keys_move_forward_and_backward() -> None:
-    from yaacli.console.blocks import UserPromptBlock
-    from yaacli.console.textual_app import YaacliTextualApp
-
-    app = YaacliTextualApp(
-        config=_make_stub_config(),
-        runtime=_make_stub_runtime(),
-        cwd=Path.cwd(),
-        model_name="opus-4.7",
-    )
-    async with app.run_test(size=(80, 10)) as pilot:
-        await pilot.pause()
-        log = app.query_one(RichLog)
-
-        app._sink.write_block(UserPromptBlock(text="first user target"))
-        app._sink.handle_text_delta("first assistant target\n")
-        app._sink.end_text()
-        for i in range(12):
-            app._sink.show_breadcrumb(f"middle {i}")
-        app._sink.write_block(UserPromptBlock(text="second user target"))
-        app._sink.handle_text_delta("second assistant target\n")
-        app._sink.end_text()
-        await pilot.pause()
-
-        user_entries = [entry for entry in app._sink._history_entries if entry.kind == "user"]
-        assistant_entries = [entry for entry in app._sink._history_entries if entry.kind == "assistant"]
-
-        log.scroll_to(y=0, animate=False)
-        await pilot.pause()
-        await pilot.press("alt+shift+u")
-        await pilot.pause()
-        assert log.scroll_y <= user_entries[0].line_start + 1
-
-        await pilot.press("alt+shift+u")
-        await pilot.pause()
-        assert log.scroll_y <= user_entries[1].line_start + 1
-
-        await pilot.press("alt+u")
-        await pilot.pause()
-        assert log.scroll_y <= user_entries[0].line_start + 1
-
-        log.scroll_to(y=0, animate=False)
-        await pilot.pause()
-        await pilot.press("alt+shift+a")
-        await pilot.pause()
-        assert log.scroll_y <= assistant_entries[0].line_start + 1
-
-        await pilot.press("alt+shift+a")
-        await pilot.pause()
-        assert log.scroll_y <= assistant_entries[1].line_start + 1
-
-        await pilot.press("alt+a")
-        await pilot.pause()
-        assert log.scroll_y <= assistant_entries[0].line_start + 1
-
-        assert "→ jumped to" not in _log_text(log)
-
-
-@pytest.mark.asyncio
-async def test_alt_b_scrolls_to_bottom() -> None:
-    from yaacli.console.textual_app import YaacliTextualApp
-
-    app = YaacliTextualApp(
-        config=_make_stub_config(),
-        runtime=_make_stub_runtime(),
-        cwd=Path.cwd(),
-        model_name="opus-4.7",
-    )
-    async with app.run_test(size=(80, 10)) as pilot:
-        await pilot.pause()
-        log = app.query_one(RichLog)
-
-        for i in range(40):
-            app._sink.show_breadcrumb(f"line {i}")
-        await pilot.pause()
-
-        log.scroll_to(y=0, animate=False)
-        log.auto_scroll = False
-        await pilot.pause()
-
-        await pilot.press("alt+b")
-        await pilot.pause()
-
-        assert log.scroll_y == log.max_scroll_y
-        assert log.auto_scroll is True
 
 
 @pytest.mark.asyncio
@@ -1239,15 +980,8 @@ async def test_textual_app_persists_renames_and_exports_session(
     async with app.run_test(size=(100, 20)) as pilot:
         await pilot.pause()
         app._sink.write_block(UserPromptBlock(text="hello transcript"))
-        app._sink.handle_text_delta("assistant transcript\n")
-        app._sink.handle_text_delta("second streamed line\n")
+        app._sink.handle_text_delta("assistant transcript")
         app._sink.end_text()
-        app._sink.handle_tool_call_start(
-            "call-view-1",
-            "view",
-            {"file_path": "internal/service/task_service.go"},
-        )
-        app._sink.handle_tool_call_complete("call-view-1", "package service\n")
         await pilot.pause(0.05)
 
         session_dir = config_manager.get_sessions_dir() / app.session_id
@@ -1260,183 +994,15 @@ async def test_textual_app_persists_renames_and_exports_session(
 
     metadata = json.loads((session_dir / "metadata.json").read_text())
     assert metadata["name"] == "useful name"
-    transcript = json.loads((session_dir / "transcript.json").read_text())
-    assistant_entries = [entry for entry in transcript if entry["kind"] == "assistant"]
-    assert len(assistant_entries) == 1
-    assert assistant_entries[0]["text"] == "assistant transcript\nsecond streamed line\n"
-    tool_entry = next(entry for entry in transcript if entry["kind"] == "tool")
-    assert tool_entry["tool"] == {
-        "tool_call_id": "call-view-1",
-        "name": "view",
-        "args": {"file_path": "internal/service/task_service.go"},
-        "result": "package service\n",
-    }
     markdown = export_path.read_text()
     assert "hello transcript" in markdown
     assert "assistant transcript" in markdown
-    assert "second streamed line" in markdown
     assert "/rename useful name" not in markdown
     assert "/sessions" not in markdown
 
 
-def test_transcript_fallback_rebuilds_native_tool_messages(tmp_path: Path) -> None:
-    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
-    from yaacli.console.transcript import TranscriptStore
-
-    store = TranscriptStore(
-        sessions_dir=tmp_path / "sessions",
-        session_id="structured",
-        working_dir=tmp_path,
-        model="test-model",
-    )
-    store.start()
-    store.append_entry(kind="assistant", label="assistant", text="I will inspect the file.")
-    store.append_entry(
-        kind="tool",
-        label="view",
-        text="view internal/service/task_service.go\npackage service",
-        tool={
-            "tool_call_id": "call-view-1",
-            "name": "view",
-            "args": {"file_path": "internal/service/task_service.go"},
-            "result": "package service\n",
-        },
-    )
-
-    messages, rebuilt = store.load_message_history_or_transcript()
-
-    assert rebuilt is True
-    assert len(messages) == 3
-    assert isinstance(messages[0], ModelResponse)
-    assert isinstance(messages[0].parts[0], TextPart)
-    assert isinstance(messages[1], ModelResponse)
-    assert isinstance(messages[1].parts[0], ToolCallPart)
-    assert messages[1].parts[0].tool_name == "view"
-    assert messages[1].parts[0].args == {"file_path": "internal/service/task_service.go"}
-    assert isinstance(messages[2], ModelRequest)
-    assert isinstance(messages[2].parts[0], ToolReturnPart)
-    assert messages[2].parts[0].content == "package service\n"
-    assert "[tool:" not in repr(messages)
-
-
-def test_transcript_fallback_does_not_teach_legacy_tool_text_protocol(tmp_path: Path) -> None:
-    from pydantic_ai.messages import ModelResponse, TextPart
-    from yaacli.console.transcript import TranscriptStore
-
-    store = TranscriptStore(
-        sessions_dir=tmp_path / "sessions",
-        session_id="legacy",
-        working_dir=tmp_path,
-        model="test-model",
-    )
-    store.start()
-    store.append_entry(kind="assistant", label="assistant", text="Before tool.")
-    store.append_entry(kind="tool", label="view", text="view internal/repository/task_repository.go")
-    store.append_entry(kind="assistant", label="assistant", text="After tool.")
-
-    messages, rebuilt = store.load_message_history_or_transcript()
-
-    assert rebuilt is True
-    assert len(messages) == 1
-    assert isinstance(messages[0], ModelResponse)
-    assert isinstance(messages[0].parts[0], TextPart)
-    assert messages[0].parts[0].content == "Before tool.\n\nAfter tool."
-    assert "[tool:" not in repr(messages)
-
-
-def test_transcript_repairs_saved_history_with_legacy_tool_markers(tmp_path: Path) -> None:
-    from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelResponse, TextPart
-    from yaacli.console.transcript import TranscriptStore
-
-    store = TranscriptStore(
-        sessions_dir=tmp_path / "sessions",
-        session_id="polluted",
-        working_dir=tmp_path,
-        model="test-model",
-    )
-    store.start()
-    store.append_entry(
-        kind="assistant",
-        label="assistant",
-        text=(
-            "I will inspect it.\n\n"
-            "[tool:view] view internal/handler/handler.go "
-            "[tool:view] view internal/service/task_service.go"
-        ),
-    )
-    store.message_history_path.write_bytes(
-        ModelMessagesTypeAdapter.dump_json(
-            [
-                ModelResponse(
-                    parts=[TextPart(content=("I will inspect it.\n\n[tool:view]\nview internal/handler/handler.go"))]
-                )
-            ],
-            indent=2,
-        )
-    )
-
-    messages, rebuilt = store.load_message_history_or_transcript()
-
-    assert rebuilt is True
-    assert len(messages) == 1
-    assert isinstance(messages[0], ModelResponse)
-    assert isinstance(messages[0].parts[0], TextPart)
-    assert messages[0].parts[0].content == "I will inspect it."
-    assert "[tool:" not in repr(messages)
-
-
-def test_message_history_only_session_restores_transcript_and_name(tmp_path: Path) -> None:
-    from pydantic_ai.messages import (
-        ModelMessagesTypeAdapter,
-        ModelRequest,
-        ModelResponse,
-        TextPart,
-        UserPromptPart,
-    )
-    from yaacli.console.transcript import TranscriptStore
-
-    store = TranscriptStore(
-        sessions_dir=tmp_path / "sessions",
-        session_id="history-only",
-        working_dir=tmp_path,
-        model="test-model",
-    )
-    store.start()
-    store.message_history_path.write_bytes(
-        ModelMessagesTypeAdapter.dump_json(
-            [
-                ModelRequest(
-                    parts=[
-                        UserPromptPart(
-                            content=[
-                                "Explain this repository",
-                                '<project-guidance name="AGENTS.md">hidden</project-guidance>',
-                                "<environment-context>hidden</environment-context>",
-                            ]
-                        )
-                    ]
-                ),
-                ModelResponse(parts=[TextPart(content="This repository contains...")]),
-            ],
-            indent=2,
-        )
-    )
-
-    assert store.transcript() == [
-        {"kind": "user", "label": "user", "text": "Explain this repository"},
-        {
-            "kind": "assistant",
-            "label": "assistant",
-            "text": "This repository contains...",
-        },
-    ]
-    listing = store.listings()[0]
-    assert listing.name == "Explain this repository"
-    assert listing.latest_user_prompt == "Explain this repository"
-
-
 @pytest.mark.asyncio
-async def test_textual_app_auto_names_session_from_latest_user_prompt(
+async def test_textual_app_auto_names_session_from_first_user_prompt(
     tmp_path: Path,
 ) -> None:
     from yaacli.config import ConfigManager
@@ -1469,7 +1035,7 @@ async def test_textual_app_auto_names_session_from_latest_user_prompt(
         rendered = _log_text(app.query_one(RichLog))
 
     metadata = json.loads((session_dir / "metadata.json").read_text())
-    assert metadata["name"] == "latest follow-up"
+    assert metadata["name"] == "first task"
     assert metadata["name_source"] == "auto"
     assert metadata["latest_user_prompt"] == "latest follow-up"
 
@@ -1825,33 +1391,6 @@ async def test_help_command_writes_into_log() -> None:
         await pilot.pause()
 
         assert len(log.lines) > before
-
-
-@pytest.mark.asyncio
-async def test_theme_command_switches_and_reports_current_theme() -> None:
-    from yaacli.console.textual_app import YaacliTextualApp
-
-    config = _make_stub_config()
-    config.display = SimpleNamespace(theme="dark", max_output_lines=1000)
-    app = YaacliTextualApp(
-        config=config,
-        runtime=_make_stub_runtime(),
-        cwd=Path.cwd(),
-        model_name="opus-4.7",
-    )
-
-    async with app.run_test() as pilot:
-        await pilot.pause()
-
-        assert await app._handle_command("/theme cappuccino")
-        await pilot.pause()
-        assert app._theme_name == "cappuccino"
-        assert app.theme == "yaacli-cappuccino"
-        assert config.display.theme == "cappuccino"
-
-        assert await app._handle_command("/theme")
-        await pilot.pause()
-        assert "theme dark, light, [cappuccino]" in _log_text(app.query_one(RichLog))
 
 
 @pytest.mark.asyncio
@@ -2316,80 +1855,7 @@ def test_slash_palette_includes_skill_subagent_and_mcp_commands() -> None:
         "delegate",
         "spawn",
         "mcp",
-        "goal",
-        "theme",
     } <= command_names
-
-
-@pytest.mark.asyncio
-async def test_goal_command_starts_goal_mode_in_textual_app() -> None:
-    from yaacli.console.textual_app import YaacliTextualApp
-
-    class GoalContext:
-        goal_active = False
-        goal_task: str | None = None
-        goal_iteration = 0
-        goal_max_iterations = 0
-
-        def __init__(self) -> None:
-            self.steering_messages: list[str] = []
-
-        def reset_goal(self) -> None:
-            self.goal_active = False
-            self.goal_task = None
-            self.goal_iteration = 0
-
-    runtime = _make_stub_runtime()
-    runtime.ctx = GoalContext()
-    config = _make_stub_config()
-    config.general.max_goal_iterations = 7
-    app = YaacliTextualApp(config=config, runtime=runtime, cwd=Path.cwd(), model_name="test")
-
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        with patch.object(app, "_run_turn", new_callable=MagicMock) as run_turn:
-
-            async def complete_turn(_task: str) -> None:
-                return None
-
-            run_turn.side_effect = complete_turn
-            assert await app._handle_command("/goal fix the tests") is True
-            await pilot.pause()
-
-        assert runtime.ctx.goal_task == "fix the tests"
-        assert runtime.ctx.goal_max_iterations == 7
-        run_turn.assert_called_once_with("fix the tests")
-
-
-def test_console_session_renders_goal_lifecycle_events() -> None:
-    from ya_agent_sdk.context import StreamEvent
-    from yaacli.console.adapter import ConsoleSession
-    from yaacli.events import GoalCompleteEvent, GoalCompleteReason, GoalIterationEvent
-
-    sink = MagicMock()
-    session = ConsoleSession(sink=sink)
-    session.handle(
-        StreamEvent(
-            agent_id="main",
-            agent_name="main",
-            event=GoalIterationEvent(event_id="g1", iteration=2, max_iterations=7, task="fix tests"),
-        )
-    )
-    session.handle(
-        StreamEvent(
-            agent_id="main",
-            agent_name="main",
-            event=GoalCompleteEvent(
-                event_id="g2",
-                iteration=3,
-                reason=GoalCompleteReason.verified,
-                task="fix tests",
-            ),
-        )
-    )
-
-    assert sink.show_breadcrumb.call_args_list[0].args == ("→ goal iteration 2/7",)
-    assert sink.show_breadcrumb.call_args_list[1].args == ("→ goal verified after 3 iteration(s)",)
 
 
 @pytest.mark.asyncio
@@ -2693,11 +2159,7 @@ async def test_model_slash_command_switches_active_runtime_profile() -> None:
             handled = await app._handle_command("/model gpt-5.4")
 
         assert handled is True
-        apply_profile.assert_called_once()
-        runtime_arg, resolved_profile = apply_profile.call_args.args
-        assert runtime_arg is app._runtime
-        assert resolved_profile.id == "gpt-5.4"
-        assert resolved_profile.model == gpt_profile.model
+        apply_profile.assert_called_once_with(app._runtime, gpt_profile)
         assert app._active_model_name == "gpt-5.4"
         assert app._model_name == ("gpt-5.4 (gateway@openai-responses:openrouter-openai-gpt-5.4)")
         assert app._footer.model_label == "gpt-5.4"

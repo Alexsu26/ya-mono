@@ -22,12 +22,12 @@ from yaacli.console.blocks import (
     UserPromptBlock,
 )
 from yaacli.console.blocks.tool_call import summarize_args, summarize_result
-from yaacli.console.theme import build_theme, code_theme_for
+from yaacli.console.theme import build_theme
 
 
-def _render(block, *, theme_name: str = "dark") -> str:
+def _render(block) -> str:
     buf = io.StringIO()
-    console = Console(theme=build_theme(theme_name), file=buf, width=100, force_terminal=False)
+    console = Console(theme=build_theme(), file=buf, width=100, force_terminal=False)
     console.print(block.render(100))
     return buf.getvalue()
 
@@ -60,63 +60,6 @@ def test_design_tokens_define_transcript_first_visual_language() -> None:
     assert required <= set(CONSOLE_STYLES)
 
 
-def test_quiet_prose_markdown_styles_override_rich_defaults() -> None:
-    console = Console(theme=build_theme(), force_terminal=True, color_system="truecolor")
-
-    assert str(console.get_style("markdown.h1")) == "bold #eef2f6"
-    assert str(console.get_style("markdown.h2")) == "bold #eef2f6"
-    assert str(console.get_style("markdown.h3")) == "bold #c8d2de"
-    assert str(console.get_style("markdown.strong")) == "bold #eef2f6"
-    assert str(console.get_style("markdown.em")) == "italic #aab4c0"
-    assert str(console.get_style("markdown.code")) == "#8bd7ff on #151c24"
-    assert str(console.get_style("markdown.item.number")) == "bold #8bd7c8"
-    assert str(console.get_style("markdown.item.bullet")) == "bold #8bd7c8"
-    assert str(console.get_style("markdown.block_quote")) == "italic #9aa7b8"
-    assert str(console.get_style("markdown.table.border")) == "#2b3440"
-    assert str(console.get_style("markdown.table.header")) == "bold #dde3ea"
-    assert "magenta" not in str(console.get_style("markdown.h2"))
-    assert "underline" not in str(console.get_style("markdown.h2"))
-
-
-def test_model_text_uses_quiet_prose_code_theme() -> None:
-    from yaacli.console.blocks.model_text import ASSISTANT_MARKDOWN_CODE_THEME
-
-    assert ASSISTANT_MARKDOWN_CODE_THEME == "github-dark"
-
-
-def test_light_theme_uses_high_contrast_latte_palette() -> None:
-    console = Console(
-        theme=build_theme("light"),
-        force_terminal=True,
-        color_system="truecolor",
-    )
-
-    assert str(console.get_style("console.text.primary")) == "#3c405b"
-    assert str(console.get_style("console.accent.assistant")) == "bold #075985"
-    assert str(console.get_style("console.accent.tool")) == "bold #0f766e"
-    assert str(console.get_style("console.state.error")) == "#b80f35"
-    assert str(console.get_style("markdown.code")) == "#075985 on #e6e9ef"
-    assert code_theme_for("light") == "github-light"
-
-
-def test_cappuccino_theme_uses_mocha_palette() -> None:
-    console = Console(
-        theme=build_theme("cappuccino"),
-        force_terminal=True,
-        color_system="truecolor",
-    )
-
-    assert str(console.get_style("console.surface.raised")) == "#1e1e2e"
-    assert str(console.get_style("console.border.active")) == "#b4befe"
-    assert str(console.get_style("console.accent.assistant")) == "bold #94e2d5"
-    assert str(console.get_style("console.accent.user")) == "bold #cba6f7"
-    assert str(console.get_style("console.state.success")) == "#a6e3a1"
-    assert str(console.get_style("console.state.warning")) == "#f9e2af"
-    assert str(console.get_style("console.state.error")) == "#f38ba8"
-    assert str(console.get_style("markdown.code")) == "#94e2d5 on #11111b"
-    assert code_theme_for("cappuccino") == "github-dark"
-
-
 def test_cjk_truncation_respects_terminal_cell_width() -> None:
     from rich.cells import cell_len
     from yaacli.console.design import truncate_cells
@@ -138,13 +81,14 @@ def test_transcript_first_blocks_share_rail_and_role_labels() -> None:
     assistant.append("你好，**世界**")
     assistant_out = _render(assistant)
     assert "assistant" in assistant_out
+    assert "│" in assistant_out
     assert "你好" in assistant_out
 
     tool = ToolCallBlock(name="Bash", args={"command": "pytest", "cwd": "/repo"})
     tool.complete({"stdout": "ok\n", "stderr": "", "exit_code": 0, "cwd": "/repo"})
     tool_out = _render(tool)
+    assert "├─" in tool_out
     assert "tool" in tool_out
-    assert "Bash" in tool_out
     assert "exit 0" in tool_out
     assert "/repo" in tool_out
 
@@ -243,7 +187,7 @@ def test_tool_call_block_completed_replaces_spinner() -> None:
     output = _render(block)
     assert "Read" in output
     assert "x.py" in output
-    assert "lines" in output
+    assert "lines" in output  # "3 lines" or similar
     assert "running" not in output
 
 

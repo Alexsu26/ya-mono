@@ -11,8 +11,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
-    OutputToolCallEvent,
-    OutputToolResultEvent,
     PartDeltaEvent,
     PartStartEvent,
     TextPart,
@@ -111,8 +109,6 @@ EVENT_TYPES = {
     # Tool events
     "tool_call": FunctionToolCallEvent,
     "tool_result": FunctionToolResultEvent,
-    "output_tool_call": OutputToolCallEvent,
-    "output_tool_result": OutputToolResultEvent,
     # Lifecycle events
     "model_request_start": ModelRequestStartEvent,
     "tool_calls_start": ToolCallsStartEvent,

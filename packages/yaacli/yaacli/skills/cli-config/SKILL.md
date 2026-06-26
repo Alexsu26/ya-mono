@@ -18,7 +18,7 @@ Configuration is loaded from multiple locations with project-level priority (no 
 
 ### config.toml (Global)
 
-Main configuration file for model, display, and subagents.
+Main configuration file for model, display, browser, and subagents.
 
 ```toml
 [general]
@@ -48,6 +48,11 @@ max_tool_result_lines = 5
 max_arg_length = 100
 show_token_usage = true
 show_elapsed_time = true
+
+[browser]
+# cdp_url = "auto"            # null, "auto", or explicit URL
+browser_image = "zenika/alpine-chrome:latest"
+browser_timeout = 30
 
 [subagents]
 disabled = []                 # Subagents to disable by name
@@ -167,6 +172,7 @@ TUI settings can be overridden via `YAACLI_*` environment variables:
 
 - `YAACLI_CODE_THEME`
 - `YAACLI_SHOW_TOKEN_USAGE`
+- `YAACLI_CDP_URL`
 - `YAACLI_SESSION_DIR`
 
 ## Quick Setup

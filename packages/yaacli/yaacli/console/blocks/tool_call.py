@@ -2,9 +2,9 @@
 
 Format:
     ⏺ <ToolName> · <arg-summary>
-      ⎿ ⠼ running 1.4s
-      ⎿ <result-summary> · <duration>
-      ✗ failed · exit 1 · 12.3s
+      ⎿ ⠼ running 1.4s              # in-flight
+      ⎿ <result-summary> · <duration>   # done
+      ✗ failed · exit 1 · 12.3s     # failed
 """
 
 from __future__ import annotations
@@ -27,33 +27,6 @@ _MAX_RESULT_LEN = 100
 _MAX_DETAIL_CHARS = 4_000
 _SENSITIVE_KEYS = {"password", "secret", "token", "api_key", "apikey", "authorization"}
 _SHELL_TOOL_NAMES = {"bash", "shell", "shell_exec", "execute_bash"}
-_READ_TOOL_NAMES = {"read", "read_file", "view", "tool_view"}
-_WRITE_TOOL_NAMES = {"write", "write_file"}
-_EDIT_TOOL_NAMES = {"edit", "multi_edit", "multiedit"}
-_SEARCH_TOOL_NAMES = {"grep", "search"}
-_GLOB_TOOL_NAMES = {"glob"}
-
-
-def _tool_key(name: str) -> str:
-    return name.lower().replace("-", "_")
-
-
-def display_tool_name(name: str) -> str:
-    """Human-facing collapsed label for common tool aliases."""
-    key = _tool_key(name)
-    if key in _READ_TOOL_NAMES:
-        return "Read"
-    if key in _WRITE_TOOL_NAMES:
-        return "Write"
-    if key in _EDIT_TOOL_NAMES:
-        return "MultiEdit" if key in {"multi_edit", "multiedit"} else "Edit"
-    if key in _SEARCH_TOOL_NAMES:
-        return "Search" if key == "search" else "Grep"
-    if key in _GLOB_TOOL_NAMES:
-        return "Glob"
-    if key in _SHELL_TOOL_NAMES:
-        return "Bash" if key == "bash" else name
-    return name
 
 
 def _redact(value: Any) -> Any:
@@ -143,26 +116,26 @@ def summarize_args(name: str, args: Any) -> str:
         args = parsed
 
     args = _redact(args)
-    lname = _tool_key(name)
+    lname = name.lower()
 
     if isinstance(args, dict):
         if lname in _SHELL_TOOL_NAMES:
             cmd = args.get("command") or args.get("cmd") or ""
             return _truncate_inline(str(cmd), _MAX_ARG_LEN)
-        if lname in _READ_TOOL_NAMES:
+        if lname in {"read", "read_file"}:
             return str(args.get("path") or args.get("file_path") or "")
-        if lname in _WRITE_TOOL_NAMES:
+        if lname in {"write", "write_file"}:
             return str(args.get("path") or args.get("file_path") or "")
-        if lname in _EDIT_TOOL_NAMES:
+        if lname in {"edit", "multi_edit", "multiedit"}:
             return str(args.get("path") or args.get("file_path") or "")
-        if lname in _SEARCH_TOOL_NAMES:
+        if lname in {"grep", "search"}:
             return _truncate_inline(str(args.get("pattern") or args.get("query") or ""), _MAX_ARG_LEN)
         if lname in {"task", "subagent", "spawn_agent"}:
             agent_name = args.get("subagent_type") or args.get("agent") or args.get("name") or ""
             prompt = args.get("prompt") or args.get("description") or ""
             label = f"{agent_name}: {prompt}" if agent_name else str(prompt)
             return _truncate_inline(label, _MAX_ARG_LEN)
-        if lname in _GLOB_TOOL_NAMES:
+        if lname in {"glob"}:
             return _truncate_inline(str(args.get("pattern") or ""), _MAX_ARG_LEN)
         # Generic dict
         return _truncate_inline(json.dumps(args, ensure_ascii=False, default=str), _MAX_ARG_LEN)
@@ -183,7 +156,7 @@ def summarize_result(name: str, content: Any, error: bool) -> str:
         first = text.strip().splitlines()[0]
         return _truncate_inline(first, _MAX_RESULT_LEN)
 
-    lname = _tool_key(name)
+    lname = name.lower()
     if lname in _SHELL_TOOL_NAMES and _parse_json_mapping(content) is not None:
         exit_code = _shell_exit_code(content)
         stdout, stderr = _shell_streams(content)
@@ -203,17 +176,17 @@ def summarize_result(name: str, content: Any, error: bool) -> str:
     if lname in _SHELL_TOOL_NAMES and len(nonempty_lines) > 1:
         tail = _truncate_inline(nonempty_lines[-1], 60)
         return f"{len(nonempty_lines)} lines · last: {tail}"
-    if lname in _READ_TOOL_NAMES:
+    if lname in {"read", "read_file"}:
         nlines = len(text.splitlines()) or 1
         return f"{nlines} lines"
-    if lname in _WRITE_TOOL_NAMES:
+    if lname in {"write", "write_file"}:
         nlines = len(text.splitlines()) or 1
         return f"wrote {nlines} lines"
-    if lname in _SEARCH_TOOL_NAMES:
+    if lname in {"grep", "search"}:
         # naive — works for "N matches" outputs
         nmatches = sum(1 for line in text.splitlines() if line.strip())
         return f"{nmatches} matches"
-    if lname in _GLOB_TOOL_NAMES:
+    if lname in {"glob"}:
         nfiles = sum(1 for line in text.splitlines() if line.strip())
         return f"{nfiles} files"
 
@@ -227,7 +200,6 @@ class ToolCallBlock(BaseBlock):
 
     name: str = ""
     args: Any = None
-    tool_call_id: str = ""
     started_at: float = field(default_factory=time.monotonic)
     finished_at: float | None = None
     result: Any = None
@@ -344,12 +316,9 @@ class ToolCallBlock(BaseBlock):
         )
 
     def render(self, width: int, *, frame: int = 0) -> RenderableType:
-        lname = _tool_key(self.name)
-        display_name = display_tool_name(self.name)
-        label = f"tool {display_name}"
+        lname = self.name.lower()
         meta: list[str] = [f"{self.duration:.1f}s"]
-        arg_summary = summarize_args(self.name, self.args)
-        summary = arg_summary
+        summary = summarize_args(self.name, self.args)
         status = "running"
         status_style = "console.state.running"
         marker = ""
@@ -377,14 +346,13 @@ class ToolCallBlock(BaseBlock):
                     meta.append(f"err {_line_count(stderr)}L")
             result_summary = summarize_result(self.name, self.result, error=self.error)
             structured_shell_result = lname in _SHELL_TOOL_NAMES and _parse_json_mapping(self.result) is not None
-            if lname in _WRITE_TOOL_NAMES or lname in _EDIT_TOOL_NAMES:
-                summary = truncate_cells(arg_summary or result_summary, 72)
-            elif structured_shell_result:
-                summary = truncate_cells(arg_summary, 48)
-            else:
-                summary = truncate_cells(compact_meta([arg_summary, result_summary]), 72)
+            summary = (
+                truncate_cells(summary, 26)
+                if structured_shell_result
+                else truncate_cells(compact_meta([summary, result_summary]), 72)
+            )
             line = timeline_line(
-                label=label,
+                label=f"tool {self.name}",
                 status=status,
                 meta=meta,
                 summary=summary,
@@ -401,7 +369,7 @@ class ToolCallBlock(BaseBlock):
         # strips. The TUI sink drives this frame so transcript and status spinners
         # stay visually consistent.
         return timeline_line(
-            label=label,
+            label=f"tool {self.name}",
             status=status,
             meta=meta,
             summary=truncate_cells(summary, 64),

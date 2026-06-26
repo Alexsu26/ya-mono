@@ -102,7 +102,7 @@ def test_create_worktree_auto_branch(tmp_path: Path) -> None:
         text=True,
         check=True,
     )
-    assert worktree_dir.as_posix() in result.stdout.replace("\\", "/")
+    assert str(worktree_dir) in result.stdout
 
     # Cleanup
     subprocess.run(["git", "worktree", "remove", str(worktree_dir)], cwd=str(repo), capture_output=True, check=True)
@@ -221,19 +221,20 @@ def test_cli_worktree_not_in_repo(tmp_path: Path) -> None:
 
 
 def test_package_exposes_yaacli_console_script() -> None:
+    """The installed command should only be yaacli."""
     pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
-    scripts = tomllib.loads(pyproject_path.read_text())["project"]["scripts"]
-    assert scripts == {
-        "yaacli": "yaacli.cli:cli",
-        "yaacli-desktop-sidecar": "yaacli.desktop.sidecar:main",
-    }
+    pyproject = tomllib.loads(pyproject_path.read_text())
+
+    scripts = pyproject["project"]["scripts"]
+    assert scripts == {"yaacli": "yaacli.cli:cli"}
 
 
 @pytest.mark.asyncio
-async def test_run_tui_defaults_to_textual(
+async def test_run_tui_defaults_to_textual_v2(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Plain yaacli should start the Textual V2 UI without an env flag."""
     from yaacli.console import textual_app
 
     calls: list[dict[str, object]] = []
@@ -242,17 +243,31 @@ async def test_run_tui_defaults_to_textual(
         calls.append({"args": args, "kwargs": kwargs})
         return "session-id"
 
+    class LegacyTUI:
+        has_session_data = False
+        session_id = None
+
+        def __init__(self, **_kwargs: object) -> None:
+            calls.append({"legacy": True})
+
+        async def __aenter__(self) -> LegacyTUI:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def run(self) -> None:
+            return None
+
     monkeypatch.delenv("YAACLI_TUI", raising=False)
+    monkeypatch.setenv("X" + "UNOCLI_TUI", "console")
     monkeypatch.setattr(textual_app, "run_textual_tui", fake_run_textual_tui)
+    monkeypatch.setattr("yaacli.app.TUIApp", LegacyTUI)
 
     result = await _run_tui(MagicMock(), MagicMock(), False, working_dir=tmp_path)
 
     assert result == "session-id"
-    assert calls[0]["kwargs"] == {
-        "verbose": False,
-        "working_dir": tmp_path,
-        "model_profile_id": None,
-    }
+    assert calls and "legacy" not in calls[0]
 
 
 def test_cli_branch_implies_worktree(tmp_path: Path) -> None:

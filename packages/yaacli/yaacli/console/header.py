@@ -66,7 +66,7 @@ def _git_state(cwd: Path) -> tuple[str | None, bool]:
 
 def render_header(info: HeaderInfo) -> RenderableType:
     line1 = Text()
-    line1.append(truncate_cells(_pretty_cwd(info.cwd), 38), style="console.header.path")
+    line1.append(truncate_cells(_pretty_cwd(info.cwd), 42), style="console.header.path")
     if info.branch:
         line1.append("  git ", style="console.header.branch")
         line1.append(truncate_cells(info.branch, 18), style="console.header.branch")

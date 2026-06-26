@@ -7,15 +7,18 @@ Focus on testable components and state transitions.
 from __future__ import annotations
 
 import asyncio
-import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 from prompt_toolkit import Application
 from prompt_toolkit.application import create_app_session
+from prompt_toolkit.completion import Completion
+from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import HSplit, Layout, Window
@@ -23,50 +26,73 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.widgets import TextArea
 from pydantic_ai import BinaryContent
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
-from ya_agent_environment.shell import BackgroundProcess
-from ya_agent_sdk.agents.main import AgentInterrupted
-from ya_agent_sdk.context import TaskManager
+from pydantic_ai.messages import FunctionToolCallEvent, FunctionToolResultEvent, ToolCallPart, ToolReturnPart
+from y_agent_environment.shell import BackgroundProcess
 
 # Import the components we're testing
 from yaacli.app import TUIApp, TUIMode, TUIState
-from yaacli.app.tui import PendingAttachment, _is_benign_contextvar_cleanup_error
+from yaacli.app.tui import (
+    PendingAttachment,
+    SlashCommandCompleter,
+    _is_benign_contextvar_cleanup_error,
+    _is_shift_enter_event_data,
+)
 from yaacli.clipboard import ClipboardImage, ClipboardImageReadResult
-from yaacli.config import CommandDefinition, GeneralConfig, ModelProfileConfig, YaacliConfig
-from yaacli.model_profiles import build_model_profiles
+from yaacli.config import CommandDefinition, ModelProfileConfig
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 @dataclass
 class MockConfig:
     """Minimal mock config for testing."""
 
-    general: object = field(
+    general: Any = field(
         default_factory=lambda: MagicMock(
             max_requests=10,
             mode="act",
         )
     )
-    display: object = field(
+    display: Any = field(
         default_factory=lambda: MagicMock(
             max_lines=500,
             mouse=True,
         )
     )
+    browser: Any = field(
+        default_factory=lambda: MagicMock(
+            mode="disabled",
+            url=None,
+        )
+    )
     commands: dict[str, CommandDefinition] = field(default_factory=dict)
+    models: dict[str, ModelProfileConfig] = field(default_factory=dict)
 
     def get_commands(self) -> dict[str, CommandDefinition]:
         return self.commands
+
+    def get_model_profiles(self) -> dict[str, ModelProfileConfig]:
+        return self.models
+
+    def get_model_profile(self, name: str) -> ModelProfileConfig:
+        return self.models[name]
+
+    def get_startup_model_profile(self) -> tuple[str, ModelProfileConfig] | None:
+        if self.models:
+            first_name = next(iter(self.models))
+            return first_name, self.models[first_name]
+        return None
 
 
 @dataclass
 class MockConfigManager:
     """Minimal mock config manager for testing."""
 
-    global_config_dir: object = field(default_factory=lambda: MagicMock())
-    project_config_dir: object = field(default_factory=lambda: MagicMock())
+    global_config_dir: Any = field(default_factory=lambda: MagicMock())
+    project_config_dir: Any = field(default_factory=lambda: MagicMock())
     config_dir: Path = field(default_factory=lambda: Path.cwd() / ".yaacli-test-config")
 
-    def get_sessions_dir(self) -> object:
+    def get_sessions_dir(self) -> Any:
         return MagicMock(exists=lambda: False)
 
     def get_mcp_config(self) -> None:
@@ -214,6 +240,64 @@ def test_tui_app_append_output():
     assert app._output_generation > 0
     assert len(app._block_line_counts) == 2
     assert app._total_line_count == 2
+
+
+def test_tui_app_user_prompt_uses_turn_separator():
+    """Submitted user prompts render as a distinct turn boundary."""
+    config = MockConfig()
+    config_manager = MockConfigManager()
+
+    app = TUIApp(config=config, config_manager=config_manager)
+    mock_output = MagicMock()
+    mock_output.get_size.return_value = MagicMock(columns=100, rows=24)
+    app._app = MagicMock(output=mock_output)
+
+    app._append_user_input("hello")
+
+    output = ANSI_RE.sub("", "\n".join(app._output_lines))
+    first_line = output.splitlines()[0]
+    assert "User" in output
+    assert "hello" in output
+    assert "----" in output
+    assert len(first_line) == 99
+
+
+def test_tui_app_status_bar_shows_active_model():
+    """The bottom status text includes the active model profile name."""
+    config = MockConfig(models={"deepseek": ModelProfileConfig(model="deepseek:deepseek-v4-flash")})
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    app._active_model_name = "deepseek"
+
+    status = "".join(text for _, text in app._get_status_text())
+
+    assert "State: IDLE" in status
+    assert "Model: deepseek" in status
+
+
+def test_tui_app_pinned_scroll_does_not_follow_new_output():
+    """New output does not force the viewport to tail after the user scrolls up."""
+    config = MockConfig()
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    mock_output = MagicMock()
+    mock_output.get_size.return_value = MagicMock(columns=80, rows=20)
+    app._app = MagicMock(output=mock_output)
+
+    app._append_output("\n".join(f"line {i}" for i in range(30)))
+    app._scroll_output_up(10)
+    pinned_offset = app._scroll_offset
+
+    app._append_output("new line 1\nnew line 2")
+
+    assert app._scroll_offset == pinned_offset
+    assert app._auto_scroll is False
+    assert app._unread_output_lines > 0
+
+    status = "".join(text for _, text in app._get_status_text())
+    assert "Pinned:" in status
+
+    app._follow_latest_output()
+    assert app._auto_scroll is True
+    assert app._unread_output_lines == 0
 
 
 def test_tui_app_output_line_limit():
@@ -435,7 +519,7 @@ def test_tui_app_streaming_text_lifecycle():
     assert app._streaming_line_index == 0
     assert len(app._output_lines) == 1
 
-    # Update streaming - this renders markdown so needs proper width
+    # Update streaming uses lightweight live text rendering.
     app._update_streaming_text(" World")
     assert app._streaming_text == "Hello World"
 
@@ -443,6 +527,29 @@ def test_tui_app_streaming_text_lifecycle():
     app._finalize_streaming_text()
     assert app._streaming_text == ""
     assert app._streaming_line_index is None
+
+
+def test_tui_app_streaming_text_uses_lightweight_live_render():
+    """Live token updates avoid expensive Markdown rendering until finalization."""
+    config = MockConfig()
+    config_manager = MockConfigManager()
+
+    app = TUIApp(config=config, config_manager=config_manager)
+    mock_output = MagicMock()
+    mock_output.get_size.return_value = MagicMock(columns=80, rows=24)
+    app._app = MagicMock(output=mock_output)
+
+    with patch.object(app._renderer, "render_markdown", wraps=app._renderer.render_markdown) as render_markdown:
+        app._start_streaming_text("Hello")
+        app._update_streaming_text(" **World**")
+
+        assert render_markdown.call_count == 0
+        assert "**World**" in app._output_lines[0]
+
+        app._finalize_streaming_text()
+
+    assert render_markdown.call_count == 1
+    assert app._streaming_text == ""
 
 
 def test_tui_app_empty_streaming_text_does_not_append_blank_line():
@@ -496,6 +603,33 @@ def test_tui_app_streaming_thinking_lifecycle():
     app._finalize_streaming_thinking()
     assert app._streaming_thinking == ""
     assert app._streaming_thinking_line_index is None
+
+
+def test_tui_app_tool_result_replaces_running_tool_line():
+    """A completed tool dims the original running line instead of appending another row."""
+    config = MockConfig()
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    mock_output = MagicMock()
+    mock_output.get_size.return_value = MagicMock(columns=100, rows=24)
+    app._app = MagicMock(output=mock_output)
+
+    call_event = FunctionToolCallEvent(
+        part=ToolCallPart(tool_name="grep", args={"pattern": "needle"}, tool_call_id="call-1")
+    )
+    app._handle_stream_event(MagicMock(event=call_event, agent_id="main"))
+
+    assert len(app._output_lines) == 1
+    assert "running" in app._output_lines[0]
+
+    result_event = FunctionToolResultEvent(
+        result=ToolReturnPart(tool_name="grep", content="found", tool_call_id="call-1")
+    )
+    app._handle_stream_event(MagicMock(event=result_event, agent_id="main"))
+
+    output = ANSI_RE.sub("", "\n".join(app._output_lines))
+    assert len(app._output_lines) == 1
+    assert "grep done" in output
+    assert "running" not in output
 
 
 # =============================================================================
@@ -684,7 +818,7 @@ async def test_tui_app_slash_commands_are_added_to_prompt_history():
     app = TUIApp(config=config, config_manager=config_manager)
     input_area = TextArea(multiline=True)
 
-    async def fake_run_agent(prompt: str, attachments: object = None) -> None:
+    async def fake_run_agent(prompt: str, attachments: Any = None) -> None:
         return None
 
     app._run_agent = fake_run_agent  # type: ignore[method-assign]
@@ -733,7 +867,7 @@ def test_tui_app_input_keybindings_are_eager():
 
     key_bindings = app._setup_input_keybindings(input_area)
     eager_handlers = {
-        tuple(key.value for key in binding.keys): binding.handler.__name__
+        tuple(getattr(key, "value", key) for key in binding.keys): binding.handler.__name__
         for binding in key_bindings.bindings
         if bool(binding.eager())
     }
@@ -744,6 +878,81 @@ def test_tui_app_input_keybindings_are_eager():
     assert eager_handlers[("c-n",)] == "handle_ctrl_n"
     assert eager_handlers[("c-m",)] == "handle_enter"
     assert eager_handlers[("c-j",)] == "handle_ctrl_j"
+    assert eager_handlers[("escape", "[", "1", "3", ";", "2", "u")] == "handle_shift_enter"
+    assert eager_handlers[("escape", "[", "1", "3", ";", "2", "~")] == "handle_shift_enter"
+    assert eager_handlers[("/",)] == "handle_slash"
+
+
+def test_tui_app_shift_enter_event_data_detection():
+    """Known enhanced keyboard encodings are treated as Shift+Enter."""
+    assert _is_shift_enter_event_data("\x1b[13;2u")
+    assert _is_shift_enter_event_data("\x1b[13;2~")
+    assert _is_shift_enter_event_data("\x1b[27;2;13~")
+    assert not _is_shift_enter_event_data("\r")
+
+
+def test_tui_app_history_keys_move_completion_menu_when_open():
+    """History navigation keys move completion candidates before browsing history."""
+    config = MockConfig()
+    config_manager = MockConfigManager()
+    app = TUIApp(config=config, config_manager=config_manager)
+    input_area = TextArea(multiline=True)
+    input_area.buffer.text = "/"
+    input_area.buffer.cursor_position = 1
+    input_area.buffer._set_completions([
+        Completion("/help", start_position=-1),
+        Completion("/model", start_position=-1),
+        Completion("/tasks", start_position=-1),
+    ])
+    app._prompt_history = ["previous prompt"]
+
+    key_bindings = app._setup_input_keybindings(input_area)
+    handlers = {
+        tuple(getattr(key, "value", key) for key in binding.keys): binding.handler for binding in key_bindings.bindings
+    }
+
+    handlers[("down",)](MagicMock())
+    assert input_area.buffer.complete_state is not None
+    assert input_area.buffer.complete_state.complete_index == 0
+    assert input_area.buffer.text == "/help"
+
+    handlers[("c-n",)](MagicMock())
+    assert input_area.buffer.complete_state.complete_index == 1
+    assert input_area.buffer.text == "/model"
+
+    handlers[("up",)](MagicMock())
+    assert input_area.buffer.complete_state.complete_index == 0
+    assert input_area.buffer.text == "/help"
+
+    handlers[("c-p",)](MagicMock())
+    assert input_area.buffer.complete_state.complete_index == 0
+    assert input_area.buffer.text == "/help"
+
+
+def test_tui_app_slash_command_completer_lists_and_filters_commands():
+    """Slash completer lists commands for / and filters by typed prefix."""
+    config = MockConfig(
+        commands={
+            "commit": CommandDefinition(
+                prompt="Create a git commit for the current changes.",
+                mode="act",
+                description="Commit changes",
+            )
+        }
+    )
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    completer = SlashCommandCompleter(app._get_slash_command_entries)
+
+    all_commands = list(completer.get_completions(Document("/"), MagicMock()))
+    all_texts = {completion.text for completion in all_commands}
+    assert "/model" in all_texts
+    assert "/commit" in all_texts
+
+    model_commands = list(completer.get_completions(Document("/m"), MagicMock()))
+    assert [completion.text for completion in model_commands] == ["/model"]
+
+    non_command = list(completer.get_completions(Document("hello /m"), MagicMock()))
+    assert non_command == []
 
 
 def test_tui_app_focused_input_keybindings_win_in_application_registry():
@@ -813,7 +1022,7 @@ async def test_tui_app_submit_custom_slash_command():
     input_area = TextArea(multiline=True)
     captured_prompts: list[str] = []
 
-    async def fake_run_agent(prompt: str, attachments: object = None) -> None:
+    async def fake_run_agent(prompt: str, attachments: Any = None) -> None:
         captured_prompts.append(prompt)
 
     app._run_agent = fake_run_agent  # type: ignore[method-assign]
@@ -827,6 +1036,84 @@ async def test_tui_app_submit_custom_slash_command():
     await app._agent_task
 
     assert captured_prompts == ["Create a git commit for the current changes.\n\nUser instruction: polish tests"]
+
+
+@pytest.mark.asyncio
+async def test_tui_app_model_command_lists_profiles() -> None:
+    """The bare /model command lists configured profiles."""
+    config = MockConfig(
+        models={
+            "deepseek": ModelProfileConfig(model="deepseek:deepseek-v4-flash", description="DeepSeek"),
+            "gpt": ModelProfileConfig(model="openai-chat:gpt-4o"),
+        }
+    )
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    app._active_model_name = "deepseek"
+
+    await app._handle_command_inner("/model")
+
+    output = "\n".join(app._output_lines)
+    assert "Available models:" in output
+    assert "* deepseek: deepseek:deepseek-v4-flash - DeepSeek" in output
+    assert "  gpt: openai-chat:gpt-4o" in output
+
+
+@pytest.mark.asyncio
+async def test_tui_app_model_current_shows_active_profile() -> None:
+    """The /model current command shows active profile details."""
+    config = MockConfig(
+        models={
+            "deepseek": ModelProfileConfig(
+                model="deepseek:deepseek-v4-flash",
+                model_settings="deepseek",
+                model_cfg="deepseek",
+            )
+        }
+    )
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    app._active_model_name = "deepseek"
+
+    await app._handle_command_inner("/model current")
+
+    output = "\n".join(app._output_lines)
+    assert "Current model: deepseek" in output
+    assert "model: deepseek:deepseek-v4-flash" in output
+    assert "model_settings: deepseek" in output
+    assert "model_cfg: deepseek" in output
+
+
+@pytest.mark.asyncio
+async def test_tui_app_model_switch_applies_profile() -> None:
+    """The /model <name> command switches the main agent profile."""
+    profile = ModelProfileConfig(model="openai-chat:gpt-4o", model_settings="openai_default", model_cfg="openai")
+    config = MockConfig(models={"gpt": profile})
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    app._runtime = MagicMock()
+
+    with patch("yaacli.app.tui.apply_model_profile") as apply_profile:
+        apply_profile.return_value = MagicMock(context_window=270_000)
+        await app._handle_command_inner("/model gpt")
+
+    apply_profile.assert_called_once_with(app.runtime, profile)
+    assert app._active_model_name == "gpt"
+    assert app._context_window_size == 270_000
+    assert "Model switched to gpt: openai-chat:gpt-4o" in "\n".join(app._output_lines)
+
+
+@pytest.mark.asyncio
+async def test_tui_app_model_switch_rejects_while_running() -> None:
+    """Model switching is blocked while the agent is running."""
+    profile = ModelProfileConfig(model="openai-chat:gpt-4o")
+    config = MockConfig(models={"gpt": profile})
+    app = TUIApp(config=config, config_manager=MockConfigManager())
+    app._runtime = MagicMock()
+    app._state = TUIState.RUNNING
+
+    with patch("yaacli.app.tui.apply_model_profile") as apply_profile:
+        await app._handle_command_inner("/model gpt")
+
+    apply_profile.assert_not_called()
+    assert "Cannot switch model while agent is running." in "\n".join(app._output_lines)
 
 
 @pytest.mark.asyncio
@@ -845,7 +1132,7 @@ async def test_tui_app_run_async_accepts_custom_slash_command_enter() -> None:
     app = TUIApp(config=config, config_manager=config_manager)
     captured_prompts: list[str] = []
 
-    async def fake_run_agent(prompt: str, attachments: object = None) -> None:
+    async def fake_run_agent(prompt: str, attachments: Any = None) -> None:
         captured_prompts.append(prompt)
         if app._app:
             app._app.exit()
@@ -899,15 +1186,16 @@ def test_tui_app_context_token_tracking():
 # =============================================================================
 
 
-def test_tui_app_input_mode():
-    """Test input mode tracking."""
+def test_tui_app_input_key_hint():
+    """Status text advertises Enter send and Shift+Enter newline."""
     config = MockConfig()
     config_manager = MockConfigManager()
 
     app = TUIApp(config=config, config_manager=config_manager)
 
-    # Default mode
-    assert app._input_mode == "send"
+    status = "".join(text for _, text in app._get_status_text())
+    assert "Enter:Send" in status
+    assert "Shift+Enter:Newline" in status
 
 
 def test_tui_app_mouse_enabled():
@@ -1126,18 +1414,15 @@ async def test_tui_app_paste_clipboard_image_attaches_image() -> None:
     config = MockConfig()
     config_manager = MockConfigManager()
     app = TUIApp(config=config, config_manager=config_manager)
-    input_area = TextArea(multiline=True)
 
     with patch("yaacli.app.tui.read_clipboard_image", new=AsyncMock()) as mock_read:
         mock_read.return_value = ClipboardImageReadResult(
             image=ClipboardImage(data=b"image-bytes", media_type="image/png")
         )
-        await app._paste_clipboard_image(input_area)
+        await app._paste_clipboard_image()
 
     assert len(app._pending_attachments) == 1
     assert app._pending_attachments[0].data == b"image-bytes"
-    assert app._pending_attachments[0].placeholder == "[Attached image 1: image/png 11B]"
-    assert input_area.buffer.text == "[Attached image 1: image/png 11B] "
     assert any("Attached image/png" in line for line in app._output_lines)
 
 
@@ -1212,40 +1497,6 @@ async def test_tui_app_submit_input_allows_attachment_only_message() -> None:
     assert captured_runs == [("", [attachment])]
 
 
-@pytest.mark.asyncio
-async def test_tui_app_submit_input_strips_attachment_placeholder() -> None:
-    """Submitted prompt text should omit generated clipboard image placeholders."""
-    config = MockConfig()
-    config_manager = MockConfigManager()
-    app = TUIApp(config=config, config_manager=config_manager)
-    input_area = TextArea(multiline=True)
-    attachment = PendingAttachment(
-        data=b"img",
-        media_type="image/png",
-        size_bytes=3,
-        placeholder="[Attached image 1: image/png 3B]",
-    )
-    app._pending_attachments.append(attachment)
-    captured_runs: list[tuple[str, list[PendingAttachment] | None]] = []
-
-    async def fake_run_agent(
-        prompt: str,
-        attachments: list[PendingAttachment] | None = None,
-    ) -> None:
-        captured_runs.append((prompt, attachments))
-
-    app._run_agent = fake_run_agent  # type: ignore[method-assign]
-
-    with patch.object(app, "_append_user_input") as mock_append_user_input:
-        app._submit_input("Please inspect [Attached image 1: image/png 3B]", input_area)
-
-    mock_append_user_input.assert_called_once_with("Please inspect", [attachment])
-    assert app._pending_attachments == []
-    assert app._agent_task is not None
-    await app._agent_task
-    assert captured_runs == [("Please inspect", [attachment])]
-
-
 def test_tui_app_clear_session_clears_pending_attachments() -> None:
     """Clearing the session should drop queued clipboard images."""
     config = MockConfig()
@@ -1256,22 +1507,6 @@ def test_tui_app_clear_session_clears_pending_attachments() -> None:
     app._clear_session()
 
     assert app._pending_attachments == []
-
-
-def test_tui_app_clear_session_clears_agent_tasks() -> None:
-    """Clearing the session should reset the AgentContext task manager."""
-    config = MockConfig()
-    config_manager = MockConfigManager()
-    app = TUIApp(config=config, config_manager=config_manager)
-    task_manager = TaskManager()
-    task_manager.create("Inspect issue", "Investigate stale task list after clear")
-    runtime = MagicMock()
-    runtime.ctx.task_manager = task_manager
-    app._runtime = runtime
-
-    app._clear_session()
-
-    assert runtime.ctx.task_manager.list_all() == []
 
 
 def test_tui_app_load_history_clears_pending_attachments(tmp_path: Path) -> None:
@@ -1289,71 +1524,6 @@ def test_tui_app_load_history_clears_pending_attachments(tmp_path: Path) -> None
 
     assert app._pending_attachments == []
     assert app._message_history == []
-
-
-def test_tui_app_saves_and_restores_display_messages(tmp_path: Path) -> None:
-    """Session restore should rebuild visible output from display_messages.json."""
-    config = MockConfig()
-    sessions_dir = tmp_path / "sessions"
-    config_manager = MockConfigManager()
-    config_manager.get_sessions_dir = MagicMock(return_value=sessions_dir)
-    app = TUIApp(config=config, config_manager=config_manager)
-    app._runtime = MagicMock()
-    app._runtime.ctx.export_state.return_value.model_dump_json.return_value = "{}"
-    app._message_history = []
-    app._display_replay.append({"type": "TEXT_MESSAGE_CHUNK", "messageId": "m1", "delta": "hello"})
-
-    app._save_session_snapshot(save_reason="test")
-
-    save_dir = sessions_dir / app.session_id
-    display_file = next((save_dir / "turns").iterdir()) / "display_messages.json"
-    assert display_file.exists()
-    assert json.loads(display_file.read_text()) == [{"type": "TEXT_MESSAGE_CHUNK", "messageId": "m1", "delta": "hello"}]
-
-    load_dir = tmp_path / "load"
-    load_dir.mkdir()
-    (load_dir / "message_history.json").write_bytes(b"[]")
-    (load_dir / "display_messages.json").write_text(display_file.read_text())
-
-    restored = TUIApp(config=config, config_manager=config_manager)
-    restored._load_history(str(load_dir))
-
-    assert restored._message_history == []
-    assert restored._display_replay.snapshot() == [{"type": "TEXT_MESSAGE_CHUNK", "messageId": "m1", "delta": "hello"}]
-    assert any("hello" in line for line in restored._output_lines)
-
-
-def test_tui_app_persist_stream_recoverable_state_updates_memory_only_on_interrupt():
-    """Recoverable stream state should update in-memory history without saving session files."""
-    config = MockConfig()
-    config_manager = MockConfigManager()
-    app = TUIApp(config=config, config_manager=config_manager)
-    app._runtime = MagicMock()
-    app._runtime.agent.model.model_name = "test-model"
-    app._session_usage = MagicMock()
-    app._session_usage.has_run_snapshot = True
-    app._auto_save_history = MagicMock()
-    app._save_session_snapshot = MagicMock()
-
-    history = [
-        ModelRequest(parts=[UserPromptPart(content="hello")]),
-        ModelResponse(
-            parts=[TextPart(content="partial")],
-            metadata={"ya_agent_sdk": {"partial": True, "reason": "stream_interrupted"}},
-        ),
-    ]
-    stream = MagicMock()
-    stream.run = MagicMock()
-    stream.run.usage.total_tokens = 123
-    stream.recoverable_messages.return_value = history
-    stream.exception = AgentInterrupted("Agent execution was interrupted")
-
-    assert app._persist_stream_recoverable_state(stream) is True
-
-    assert app._message_history == history
-    assert app._last_run is stream.run
-    app._auto_save_history.assert_not_called()
-    app._save_session_snapshot.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1377,68 +1547,3 @@ async def test_tui_app_run_agent_reports_saved_recovery_session():
     assert "Session state saved." in joined_output
     assert f"/session {app.session_id}" in joined_output
     assert app.state == TUIState.IDLE
-
-
-@pytest.mark.asyncio
-async def test_tui_app_model_command_opens_in_tui_selector() -> None:
-    """/model should open the embedded TUI selector without terminal dialogs."""
-    config = YaacliConfig(
-        general=GeneralConfig(model="openai-chat:gpt-4o"),
-        model_profiles={
-            "sonnet": ModelProfileConfig(label="Sonnet", model="anthropic:claude-sonnet-4-5"),
-        },
-    )
-    config_manager = MockConfigManager()
-    app = TUIApp(config=config, config_manager=config_manager)
-
-    await app._handle_command_inner("/model")
-
-    assert app._model_selector_open is True
-    assert [profile.id for profile in app._model_selector_profiles] == ["default", "sonnet"]
-    assert app._model_selector_index == 0
-    assert any("/model" in line for line in app._output_lines)
-
-
-def test_tui_app_model_selector_movement_wraps() -> None:
-    """Embedded model selector movement should stay inside TUI state."""
-    config = YaacliConfig(
-        general=GeneralConfig(model="openai-chat:gpt-4o"),
-        model_profiles={
-            "sonnet": ModelProfileConfig(label="Sonnet", model="anthropic:claude-sonnet-4-5"),
-            "gemini": ModelProfileConfig(label="Gemini", model="google-gla:gemini-2.5-pro"),
-        },
-    )
-    config_manager = MockConfigManager()
-    app = TUIApp(config=config, config_manager=config_manager)
-    app._model_selector_open = True
-    app._model_selector_profiles = build_model_profiles(config)
-    app._model_selector_index = 0
-
-    app._move_model_selector(-1)
-    assert app._model_selector_index == 2
-
-    app._move_model_selector(1)
-    assert app._model_selector_index == 0
-
-
-def test_tui_app_model_selector_text_marks_current_and_highlighted_profiles() -> None:
-    """Embedded model selector output should mark active and highlighted profiles."""
-    config = YaacliConfig(
-        general=GeneralConfig(model="openai-chat:gpt-4o"),
-        model_profiles={
-            "sonnet": ModelProfileConfig(label="Sonnet", model="anthropic:claude-sonnet-4-5"),
-        },
-    )
-    config_manager = MockConfigManager()
-    app = TUIApp(config=config, config_manager=config_manager)
-    profiles = build_model_profiles(config)
-    app._active_model_profile = profiles[1]
-    app._model_selector_open = True
-    app._model_selector_profiles = profiles
-    app._model_selector_index = 1
-
-    rendered = app._get_model_selector_text().value
-
-    assert "Select model profile" in rendered
-    assert "> * Sonnet: anthropic:claude-sonnet-4-5" in rendered
-    assert "Enter: use" in rendered

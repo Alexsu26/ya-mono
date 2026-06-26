@@ -42,7 +42,6 @@ class ApprovalUI:
         index: int,
         total: int,
         width: int | None = None,
-        metadata: dict[str, Any] | None = None,
     ) -> str:
         """Render an approval panel for a tool call.
 
@@ -51,7 +50,6 @@ class ApprovalUI:
             index: Current index (1-based).
             total: Total number of tools.
             width: Optional render width.
-            metadata: Optional approval metadata keyed by the tool call ID.
 
         Returns:
             Rendered ANSI string.
@@ -61,17 +59,6 @@ class ApprovalUI:
             Text(""),
             Text(f"Tool: {tool_call.tool_name}", style="bold yellow"),
         ]
-
-        if metadata and metadata.get("reviewer") == "shell_command_reviewer":
-            reason = metadata.get("reason")
-            risk_level = metadata.get("risk_level")
-            if reason or risk_level:
-                content_parts.append(Text(""))
-                content_parts.append(Text("Shell review:", style="bold cyan"))
-                if risk_level:
-                    content_parts.append(Text(f"Risk: {risk_level}", style="yellow"))
-                if reason:
-                    content_parts.append(Text(f"Reason: {reason}", style="yellow"))
 
         if tool_call.args:
             content_parts.append(Text(""))
@@ -142,7 +129,7 @@ class ApprovalUI:
 
     def _format_args(
         self,
-        args: object,
+        args: Any,
         max_str_len: int = 500,
         max_lines: int = 30,
     ) -> str:
@@ -157,7 +144,7 @@ class ApprovalUI:
             Formatted JSON string or fallback representation
         """
 
-        def truncate_strings(obj: object, max_len: int) -> object:
+        def truncate_strings(obj: Any, max_len: int) -> Any:
             """Recursively truncate long strings in nested structures."""
             if isinstance(obj, str):
                 if len(obj) > max_len:

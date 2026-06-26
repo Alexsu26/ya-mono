@@ -20,7 +20,7 @@ from typing import Annotated, cast
 
 from pydantic import Field
 from pydantic_ai import RunContext
-from ya_agent_environment import Shell
+from y_agent_environment import Shell
 from ya_agent_sdk.context import AgentContext
 from ya_agent_sdk.context.bus import BusMessage
 from ya_agent_sdk.events import BackgroundShellStartEvent
@@ -127,11 +127,8 @@ class SpawnDelegateTool(BaseTool):
                     prompt=prompt,
                     agent_id=agent_id,
                 )
-                monitor.enqueue_usage_snapshot(deps.build_usage_snapshot())
-                # Queue result for TUI-managed redelivery. The main SDK context
-                # clears bus state on exit, so direct send can be lost when a
-                # background task completes while the main agent is still running.
-                monitor.enqueue_message(
+                # Post result to message bus for the main agent
+                deps.send_message(
                     BusMessage(
                         content=result,
                         source=agent_id,
@@ -141,7 +138,7 @@ class SpawnDelegateTool(BaseTool):
                 logger.info("Spawned delegate '%s' (%s) completed", subagent_name, agent_id)
             except Exception as e:
                 logger.warning("Spawned delegate '%s' (%s) failed: %s", subagent_name, agent_id, e)
-                monitor.enqueue_message(
+                deps.send_message(
                     BusMessage(
                         content=f"Spawned delegate '{subagent_name}' (id: {agent_id}) failed: {e}",
                         source=agent_id,

@@ -2,15 +2,15 @@
 
 Configuration files are loaded with project-level priority (no merging):
 
-1. **config.toml** (model + TUI settings + security runtime settings):
+1. **config.toml** (model + TUI settings):
    - Global: ~/.yaacli/config.toml
    - Project: .yaacli/config.toml (overrides global entirely)
-   - Contains: model, model_settings, display, steering, session, subagents, env, security.shell_review
+   - Contains: model, model_settings, display, steering, session, browser, subagents, env
 
-2. **tools.toml** (tool permissions and project tool overrides):
+2. **tools.toml** (tool permissions):
    - Global: ~/.yaacli/tools.toml
    - Project: .yaacli/tools.toml (overrides global entirely)
-   - Contains: need_approval list and optional tool overrides
+   - Contains: need_approval list
 
 3. **mcp.json** (MCP server configurations):
    - Global: ~/.yaacli/mcp.json
@@ -23,28 +23,16 @@ Configuration files are loaded with project-level priority (no merging):
 
 from __future__ import annotations
 
-import re
 import tomllib
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Self, TypedDict
+from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, Field, PositiveInt, model_validator
+from pydantic import BaseModel, Field, PositiveInt
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-if TYPE_CHECKING:
-    from ya_agent_sdk.mcp import MCPConfig, MCPServerConfig
+from ya_agent_sdk.mcp import MCPConfig, MCPServerConfig, load_mcp_config_file
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-
-
-def __getattr__(name: str) -> Any:
-    if name in {"MCPConfig", "MCPServerConfig"}:
-        from ya_agent_sdk import mcp
-
-        return getattr(mcp, name)
-    raise AttributeError(name)
-
 
 __all__ = [
     "CommandDefinition",
@@ -54,6 +42,7 @@ __all__ = [
     "MCPConfig",
     "MCPServerConfig",
     "ModelProfileConfig",
+    "OAuthRefreshConfig",
     "SessionConfig",
     "SubagentOverride",
     "SubagentsConfig",
@@ -71,6 +60,9 @@ __all__ = [
 class GeneralConfig(BaseModel):
     """General agent configuration (global only)."""
 
+    active_model: str = ""
+    """Name of the active model profile from [models]. Empty uses legacy general.model."""
+
     model: str = ""
     """Default model for main agent. Format: 'provider:model_name'. Empty means not configured."""
 
@@ -80,16 +72,13 @@ class GeneralConfig(BaseModel):
     model_cfg: str | dict[str, Any] | None = None
     """Model config for context management: preset name (e.g., 'claude_200k', 'gpt5_1m', 'gemini_1m') or dict."""
 
-    active_model: str | None = None
-    """Legacy selected profile id, retained for existing fork configurations."""
-
     max_requests: int = 1000
     """Maximum requests per session."""
 
     agent_stream_resume_on_error: bool = True
     """Resume failed streaming attempts from recovered message history."""
 
-    agent_stream_resume_max_attempts: int = 3
+    agent_stream_resume_max_attempts: int = 2
     """Maximum total streaming attempts when resume is enabled."""
 
     agent_stream_resume_prompt: str = (
@@ -98,20 +87,11 @@ class GeneralConfig(BaseModel):
     )
     """Prompt sent when resuming a failed stream attempt."""
 
-    max_goal_iterations: int = 10
-    """Maximum iterations for /goal command."""
+    max_loop_iterations: int = 10
+    """Maximum iterations for /loop command."""
 
     system_prompt_file: str = ""
     """Path to custom system prompt file. Empty uses built-in default."""
-
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_loop_config(cls, data: object) -> object:
-        """Accept the former /loop iteration setting for existing configs."""
-        if isinstance(data, dict) and "max_goal_iterations" not in data and "max_loop_iterations" in data:
-            data = dict(data)
-            data["max_goal_iterations"] = data["max_loop_iterations"]
-        return data
 
     @property
     def is_configured(self) -> bool:
@@ -119,27 +99,8 @@ class GeneralConfig(BaseModel):
         return bool(self.model)
 
 
-class ModelProfileConfig(BaseModel):
-    """Selectable model profile configuration."""
-
-    label: str | None = None
-    """Human-friendly label shown in the model selector."""
-
-    model: str
-    """Model for main agent. Format: 'provider:model_name'."""
-
-    model_settings: str | dict[str, Any] | None = None
-    """Model settings: preset name or dict of actual values."""
-
-    model_cfg: str | dict[str, Any] | None = None
-    """Model config for context management: preset name or dict."""
-
-
 class DisplayConfig(BaseModel):
     """Display and rendering configuration."""
-
-    theme: Literal["dark", "light", "cappuccino"] = "dark"
-    """Color theme used by the interactive console."""
 
     code_theme: Literal["dark", "light"] = "dark"
     """Code highlighting theme."""
@@ -160,38 +121,43 @@ class DisplayConfig(BaseModel):
     """Show elapsed time."""
 
 
-class ShellReviewConfig(BaseModel):
-    """Shell command safety review configuration."""
+class SessionConfig(BaseModel):
+    """Local TUI session persistence configuration."""
 
-    enabled: bool = False
-    model: str | None = None
-    model_settings: str | dict[str, Any] | None = None
-    on_needs_approval: str = "defer"
-    risk_threshold: str = "high"
+    session_dir: str = ""
+    """Override directory for saved sessions. Empty uses ~/.yaacli/sessions."""
 
-    @model_validator(mode="after")
-    def validate_model_when_enabled(self) -> Self:
-        if self.enabled and (self.model is None or self.model.strip() == ""):
-            msg = "security.shell_review.model is required when shell review is enabled."
-            raise ValueError(msg)
-        return self
+    auto_save_history: bool = True
+    """Persist transcript, message history, and context state after turns."""
+
+    auto_restore: bool = False
+    """Automatically restore the latest saved session for the current workspace."""
+
+    max_sessions: int = 100
+    """Maximum local sessions retained."""
+
+
+class BrowserConfig(BaseModel):
+    """Browser automation configuration."""
+
+    cdp_url: str | None = None
+    """CDP URL for browser automation."""
+
+    browser_image: str = "zenika/alpine-chrome:latest"
+    """Docker image for auto-start browser."""
+
+    browser_timeout: int = 30
+    """Browser startup timeout in seconds."""
 
 
 class ToolsConfig(BaseModel):
-    """Tool permission configuration."""
+    """Tool permission configuration (project only)."""
 
     need_approval: list[str] = Field(default_factory=list)
     """Tools requiring user approval before execution."""
 
     need_approval_mcps: list[str] = Field(default_factory=list)
     """MCP servers requiring user approval for all tools."""
-
-
-class SecurityConfig(BaseModel):
-    """Security runtime configuration."""
-
-    shell_review: ShellReviewConfig = Field(default_factory=ShellReviewConfig)
-    """Shell command safety review configuration."""
 
 
 class SubagentOverride(BaseModel):
@@ -216,6 +182,35 @@ class SubagentsConfig(BaseModel):
 
     overrides: dict[str, SubagentOverride] = Field(default_factory=dict)
     """Override settings for specific subagents."""
+
+
+class ModelProfileConfig(BaseModel):
+    """Named model profile selectable at runtime."""
+
+    label: str | None = None
+    """Human-friendly label shown by /model. If omitted, the profile name is used."""
+
+    model: str
+    """Model string. Format: 'provider:model_name'."""
+
+    model_settings: str | dict[str, Any] | None = None
+    """Model settings: preset name or dict of actual values."""
+
+    model_cfg: str | dict[str, Any] | None = None
+    """Model config for context management: preset name or dict."""
+
+    description: str = ""
+    """Human-friendly description shown by /model."""
+
+    @classmethod
+    def from_general(cls, general: GeneralConfig) -> ModelProfileConfig:
+        """Create a model profile from legacy [general] model fields."""
+        return cls(
+            model=general.model,
+            model_settings=general.model_settings,
+            model_cfg=general.model_cfg,
+            description="Legacy [general] model",
+        )
 
 
 class CommandDefinition(BaseModel):
@@ -289,22 +284,6 @@ class MediaConfig(BaseModel):
     """S3 configuration for media upload."""
 
 
-class SessionConfig(BaseModel):
-    """Saved session retention configuration."""
-
-    session_dir: str = ""
-    """Optional legacy override for the Textual/desktop transcript directory."""
-
-    max_turns_per_session: PositiveInt = 20
-    """Maximum saved turns retained inside each session."""
-
-    max_sessions: PositiveInt = 100
-    """Maximum saved sessions retained globally."""
-
-    max_session_age_days: PositiveInt | None = None
-    """Optional maximum session age in days. Older sessions are pruned on save."""
-
-
 class OAuthRefreshConfig(BaseModel):
     """OAuth proactive refresh configuration."""
 
@@ -319,12 +298,16 @@ class YaacliConfig(BaseModel):
 
     # From global config
     general: GeneralConfig = Field(default_factory=GeneralConfig)
+    models: dict[str, ModelProfileConfig] = Field(default_factory=dict)
+    """Named model profiles selectable with /model."""
+    model_profiles: dict[str, ModelProfileConfig] = Field(default_factory=dict)
+    """Upstream-compatible alias for named model profiles selectable with /model."""
     display: DisplayConfig = Field(default_factory=DisplayConfig)
+    session: SessionConfig = Field(default_factory=SessionConfig)
+    browser: BrowserConfig = Field(default_factory=BrowserConfig)
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
     media: MediaConfig = Field(default_factory=MediaConfig)
     """Media handling configuration (S3 upload, etc.)."""
-    session: SessionConfig = Field(default_factory=SessionConfig)
-    """Saved session retention configuration."""
     oauth_refresh: OAuthRefreshConfig = Field(default_factory=OAuthRefreshConfig)
     """OAuth proactive refresh configuration."""
     env: dict[str, str] = Field(default_factory=dict)
@@ -344,32 +327,11 @@ class YaacliConfig(BaseModel):
     Set to False to prevent CLI process env vars (API keys, etc.)
     from leaking into shell subprocesses.
     """
-    security: SecurityConfig = Field(default_factory=SecurityConfig)
-    """Security runtime configuration."""
-
-    model_profiles: dict[str, ModelProfileConfig] = Field(default_factory=dict)
-    """Selectable model profiles for the /model command."""
-
     # From project config
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     # Custom slash commands
     commands: dict[str, CommandDefinition] = Field(default_factory=dict)
     """Custom slash commands (merged with defaults)."""
-
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_legacy_models(cls, data: object) -> object:
-        """Merge the fork's former ``[models.*]`` profile table."""
-        if isinstance(data, dict) and "models" in data:
-            data = dict(data)
-            legacy_profiles = data.pop("models")
-            current_profiles = data.get("model_profiles")
-            if isinstance(legacy_profiles, dict):
-                merged_profiles = dict(legacy_profiles)
-                if isinstance(current_profiles, dict):
-                    merged_profiles.update(current_profiles)
-                data["model_profiles"] = merged_profiles
-        return data
 
     def get_commands(self) -> dict[str, CommandDefinition]:
         """Get all commands (defaults + user-defined, user overrides defaults)."""
@@ -377,10 +339,37 @@ class YaacliConfig(BaseModel):
         result.update(self.commands)
         return result
 
+    def get_model_profiles(self) -> dict[str, ModelProfileConfig]:
+        """Get selectable model profiles, including legacy [general] as default."""
+        profiles = dict(self.models)
+        profiles.update(self.model_profiles)
+        if self.general.model and "default" not in profiles:
+            profiles["default"] = ModelProfileConfig.from_general(self.general)
+        return profiles
+
+    def get_model_profile(self, name: str) -> ModelProfileConfig:
+        """Get a named model profile."""
+        profiles = self.get_model_profiles()
+        if name not in profiles:
+            raise KeyError(f"Unknown model profile: {name}")
+        return profiles[name]
+
+    def get_startup_model_profile(self) -> tuple[str, ModelProfileConfig] | None:
+        """Resolve the model profile used at startup."""
+        if self.general.active_model:
+            return self.general.active_model, self.get_model_profile(self.general.active_model)
+        if self.general.model:
+            return "default", ModelProfileConfig.from_general(self.general)
+        profiles = self.get_model_profiles()
+        if profiles:
+            first_name = next(iter(profiles))
+            return first_name, profiles[first_name]
+        return None
+
     @property
     def is_configured(self) -> bool:
         """Check if minimum required configuration is present."""
-        return self.general.is_configured or bool(self.model_profiles)
+        return bool(self.general.model or self.models or self.model_profiles)
 
 
 # =============================================================================
@@ -403,10 +392,14 @@ class EnvSettings(BaseSettings):
     )
 
     # Display
-    theme: Literal["dark", "light", "cappuccino"] | None = None
     code_theme: Literal["dark", "light"] | None = None
     show_token_usage: bool | None = None
     show_elapsed_time: bool | None = None
+
+    # Browser
+    cdp_url: str | None = None
+    browser_image: str | None = None
+    browser_timeout: int | None = None
 
     # Steering
     steering_enabled: bool | None = None
@@ -416,9 +409,6 @@ class EnvSettings(BaseSettings):
     session_dir: str | None = None
     auto_save_history: bool | None = None
     auto_restore: bool | None = None
-    max_turns_per_session: PositiveInt | None = None
-    max_sessions: PositiveInt | None = None
-    max_session_age_days: PositiveInt | None = None
 
     # Agent stream recovery
     agent_stream_resume_on_error: bool | None = None
@@ -493,12 +483,16 @@ class ConfigManager:
         if project_config_file.exists():
             with open(project_config_file, "rb") as f:
                 config = tomllib.load(f)
-            merged.update(config)
+            for key in config:
+                if key != "tools":
+                    merged[key] = config[key]
             self._loaded_sources.append(str(project_config_file))
         elif global_config_file.exists():
             with open(global_config_file, "rb") as f:
                 config = tomllib.load(f)
-            merged.update(config)
+            for key in config:
+                if key != "tools":
+                    merged[key] = config[key]
             self._loaded_sources.append(str(global_config_file))
 
         # Layer 2: Environment overrides (TUI only, merged)
@@ -539,8 +533,6 @@ class ConfigManager:
 
         # Display
         display: dict[str, Any] = {}
-        if env.theme is not None:
-            display["theme"] = env.theme
         if env.code_theme is not None:
             display["code_theme"] = env.code_theme
         if env.show_token_usage is not None:
@@ -549,6 +541,17 @@ class ConfigManager:
             display["show_elapsed_time"] = env.show_elapsed_time
         if display:
             overrides["display"] = display
+
+        # Browser
+        browser: dict[str, Any] = {}
+        if env.cdp_url is not None:
+            browser["cdp_url"] = env.cdp_url
+        if env.browser_image is not None:
+            browser["browser_image"] = env.browser_image
+        if env.browser_timeout is not None:
+            browser["browser_timeout"] = env.browser_timeout
+        if browser:
+            overrides["browser"] = browser
 
         # Steering
         steering: dict[str, Any] = {}
@@ -567,12 +570,6 @@ class ConfigManager:
             session["auto_save_history"] = env.auto_save_history
         if env.auto_restore is not None:
             session["auto_restore"] = env.auto_restore
-        if env.max_turns_per_session is not None:
-            session["max_turns_per_session"] = env.max_turns_per_session
-        if env.max_sessions is not None:
-            session["max_sessions"] = env.max_sessions
-        if env.max_session_age_days is not None:
-            session["max_session_age_days"] = env.max_session_age_days
         if session:
             overrides["session"] = session
 
@@ -610,8 +607,6 @@ class ConfigManager:
         Returns:
             MCPConfig if found, None otherwise.
         """
-        from ya_agent_sdk.mcp import load_mcp_config_file
-
         # Check project first
         project_mcp = self._project_dir / self.PROJECT_CONFIG_DIR / "mcp.json"
         if project_mcp.exists():
@@ -634,9 +629,8 @@ class ConfigManager:
             return global_mcp
         return None
 
-    # Entries to exclude from file tree context in ~/.yaacli/
-    _TREEIGNORE_DIRS = frozenset({"sessions", "message_history", "worktrees"})
-    _TREEIGNORE_FILES = frozenset({"state.json"})
+    # Directories to exclude from file tree context in ~/.yaacli/
+    _TREEIGNORE_ENTRIES = frozenset({"sessions", "message_history", "worktrees"})
 
     def ensure_config_dir(self) -> None:
         """Create global config directory structure."""
@@ -651,7 +645,7 @@ class ConfigManager:
         This keeps session/history directories out of the agent's context.
         """
         gitignore_path = self._config_dir / ".gitignore"
-        needed = {f"{d}/" for d in self._TREEIGNORE_DIRS} | set(self._TREEIGNORE_FILES)
+        needed = {f"{d}/" for d in self._TREEIGNORE_ENTRIES}
         if gitignore_path.exists():
             existing = set(gitignore_path.read_text().splitlines())
             missing = needed - existing
@@ -692,52 +686,6 @@ class ConfigManager:
     def get_global_config_file(self) -> Path:
         """Get path to global config file."""
         return self._config_dir / "config.toml"
-
-    def get_active_config_file(self) -> Path:
-        """Return the config.toml that currently owns project/global settings."""
-        project_config = self._project_dir / self.PROJECT_CONFIG_DIR / "config.toml"
-        return project_config if project_config.exists() else self.get_global_config_file()
-
-    def persist_display_theme(self, theme: Literal["dark", "light", "cappuccino"]) -> Path:
-        """Persist the selected UI theme without rewriting unrelated TOML."""
-        config_file = self.get_active_config_file()
-        if not config_file.exists():
-            self.save_default_config()
-            config_file = self.get_global_config_file()
-
-        content = config_file.read_text()
-        lines = content.splitlines(keepends=True)
-        display_start: int | None = None
-        display_end = len(lines)
-        for index, line in enumerate(lines):
-            section_match = re.match(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$", line)
-            if section_match is None:
-                continue
-            if display_start is not None:
-                display_end = index
-                break
-            if section_match.group(1).strip() == "display":
-                display_start = index
-
-        setting = f'theme = "{theme}"\n'
-        if display_start is None:
-            separator = "" if not content or content.endswith("\n\n") else ("\n" if content.endswith("\n") else "\n\n")
-            config_file.write_text(f"{content}{separator}[display]\n{setting}")
-        else:
-            theme_line = None
-            for index in range(display_start + 1, display_end):
-                if re.match(r"^\s*theme\s*=", lines[index]):
-                    theme_line = index
-                    break
-            if theme_line is None:
-                lines.insert(display_start + 1, setting)
-            else:
-                newline = "\n" if lines[theme_line].endswith("\n") else ""
-                lines[theme_line] = setting.rstrip("\n") + newline
-            config_file.write_text("".join(lines))
-
-        self._config = None
-        return config_file
 
     def get_project_config_file(self) -> Path:
         """Get path to project tools config file."""

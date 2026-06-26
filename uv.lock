@@ -4331,6 +4331,20 @@ wheels = [
 ]
 
 [[package]]
+name = "y-agent-environment"
+version = "0.9.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "pathspec" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/24/f0/e3e6fbcfb3aa9ec786dd63ef00fa2aa7e3dc75f106e66cf75df4e08cf5e5/y_agent_environment-0.9.0.tar.gz", hash = "sha256:a9c6ea93916cadfab63ff7f05d22220243f701922826efe41aa108952e2a3481", size = 86811, upload-time = "2026-04-08T09:02:48.973Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1f/81/88717e75327d8dd997f00d5e38fd41556c3693d98b5c9f796c73e9ef2012/y_agent_environment-0.9.0-py3-none-any.whl", hash = "sha256:00bef093c2ab096f42e74e3c000938c73796765db28db668506b52cccd19e5f3", size = 31999, upload-time = "2026-04-08T09:02:47.913Z" },
+]
+
+[[package]]
 name = "ya-agent-environment"
 source = { editable = "packages/ya-agent-environment" }
 dependencies = [
@@ -4755,9 +4769,8 @@ dependencies = [
     { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'" },
     { name = "python-dotenv" },
     { name = "textual" },
-    { name = "ya-agent-environment" },
+    { name = "y-agent-environment" },
     { name = "ya-agent-sdk", extra = ["all"] },
-    { name = "ya-agent-stream-protocol" },
     { name = "ya-oauth" },
     { name = "ya-oauth-provider" },
 ]
@@ -4772,15 +4785,14 @@ requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "pydantic", specifier = ">=2.0" },
-    { name = "pydantic-ai", specifier = ">=1.100.0,<2" },
+    { name = "pydantic-ai", specifier = ">=1.96.0" },
     { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'", specifier = ">=10.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "textual", specifier = ">=0.87" },
-    { name = "ya-agent-environment", editable = "packages/ya-agent-environment" },
+    { name = "y-agent-environment", specifier = ">=0.1.0" },
     { name = "ya-agent-sdk", extras = ["all"], editable = "packages/ya-agent-sdk" },
     { name = "ya-agent-sdk", extras = ["all", "rs"], marker = "extra == 'rs'", editable = "packages/ya-agent-sdk" },
-    { name = "ya-agent-stream-protocol", editable = "packages/ya-agent-stream-protocol" },
     { name = "ya-oauth", editable = "packages/ya-oauth" },
     { name = "ya-oauth-provider", editable = "packages/ya-oauth-provider" },
 ]

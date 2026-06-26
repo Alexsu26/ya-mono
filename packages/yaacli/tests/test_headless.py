@@ -1,287 +1,189 @@
+"""Tests for yaacli headless print mode."""
+
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic_ai import (
-    AgentRunResult,
-    DeferredToolRequests,
-    PartDeltaEvent,
-    PartEndEvent,
-    PartStartEvent,
-    TextPartDelta,
-    ToolDenied,
-)
-from pydantic_ai.messages import ModelRequest, ModelResponse, RetryPromptPart, TextPart, ToolCallPart, UserPromptPart
-from ya_agent_sdk.context.agent import StreamEvent
-from ya_agent_sdk.events import ModelRequestStartEvent
-from yaacli.config import ConfigManager
-from yaacli.headless import run_headless_prompt
+from click.testing import CliRunner
+from pydantic_ai import DeferredToolRequests
+from yaacli.cli import cli
+from yaacli.config import GeneralConfig, YaacliConfig
 
 
-class FakeRuntime:
-    def __init__(self) -> None:
-        self.ctx = MagicMock()
-        self.ctx.injected_context_tags = ()
-        self.ctx.usage_snapshot_entries = []
-        self.ctx.export_state.return_value.model_dump_json.return_value = "{}"
+class DummyAsyncContext:
+    """Small async context helper for mocked runtime/browser/stream objects."""
 
-    async def __aenter__(self) -> FakeRuntime:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    async def __aenter__(self) -> object:
+        return self.value
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class EmptyStream:
+    """Async iterable with a final run result but no emitted events."""
+
+    def __init__(self, output: object) -> None:
+        self.run = SimpleNamespace(result=SimpleNamespace(output=output))
+
+    def __aiter__(self) -> EmptyStream:
         return self
 
-    async def __aexit__(self, *_args: object) -> None:
-        return None
+    async def __anext__(self) -> object:
+        raise StopAsyncIteration
 
 
-class FakeStreamer:
-    def __init__(self, output: object = "hello world") -> None:
-        self._history = [
-            ModelRequest(parts=[UserPromptPart(content="hello")]),
-            ModelResponse(parts=[TextPart(content="hello world")]),
-        ]
-        self.run = SimpleNamespace(result=AgentRunResult(output=output))
-
-    def __aiter__(self):  # type: ignore[no-untyped-def]
-        async def _events():
-            yield StreamEvent(
-                agent_id="main",
-                agent_name="main",
-                event=ModelRequestStartEvent(event_id="run-1", loop_index=0, message_count=0),
-            )
-            yield StreamEvent(
-                agent_id="main", agent_name="main", event=PartStartEvent(index=0, part=TextPart(content=""))
-            )
-            yield StreamEvent(
-                agent_id="main",
-                agent_name="main",
-                event=PartDeltaEvent(index=0, delta=TextPartDelta(content_delta="hello world")),
-            )
-            yield StreamEvent(
-                agent_id="main", agent_name="main", event=PartEndEvent(index=0, part=TextPart(content="hello world"))
-            )
-
-        return _events()
-
-    def raise_if_exception(self) -> None:
-        return None
-
-    def recoverable_messages(self):  # type: ignore[no-untyped-def]
-        return self._history
+def configured() -> YaacliConfig:
+    return YaacliConfig(general=GeneralConfig(model="openai-chat:gpt-4"))
 
 
-class FakeStreamContext:
-    def __init__(self, streamer: FakeStreamer) -> None:
-        self.streamer = streamer
+def test_cli_headless_option_exists() -> None:
+    runner = CliRunner()
 
-    async def __aenter__(self) -> FakeStreamer:
-        return self.streamer
+    result = runner.invoke(cli, ["--help"])
 
-    async def __aexit__(self, *_args: object) -> None:
-        return None
+    assert result.exit_code == 0
+    assert "-P, --print" in result.output
+
+
+def test_cli_headless_prompt_argument_runs_without_tui(tmp_path: Path) -> None:
+    runner = CliRunner()
+    calls: list[str] = []
+
+    async def fake_run_headless(*_args: object, prompt: str, **_kwargs: object) -> str:
+        calls.append(prompt)
+        return "final answer"
+
+    with (
+        patch("yaacli.cli.ConfigManager.load", return_value=configured()),
+        patch("yaacli.cli.ensure_builtin_assets"),
+        patch("yaacli.cli.load_env_from_config"),
+        patch("yaacli.cli._run_tui", side_effect=AssertionError("TUI should not start")),
+        patch("yaacli.cli._run_headless", side_effect=fake_run_headless),
+    ):
+        result = runner.invoke(cli, ["-P", "hello", "world"])
+
+    assert result.exit_code == 0
+    assert result.output == "final answer\n"
+    assert calls == ["hello world"]
+
+
+def test_cli_headless_reads_prompt_from_stdin() -> None:
+    runner = CliRunner()
+    calls: list[str] = []
+
+    async def fake_run_headless(*_args: object, prompt: str, **_kwargs: object) -> str:
+        calls.append(prompt)
+        return "stdin answer"
+
+    with (
+        patch("yaacli.cli.ConfigManager.load", return_value=configured()),
+        patch("yaacli.cli.ensure_builtin_assets"),
+        patch("yaacli.cli.load_env_from_config"),
+        patch("yaacli.cli._run_headless", side_effect=fake_run_headless),
+    ):
+        result = runner.invoke(cli, ["--print"], input="hello from stdin\n")
+
+    assert result.exit_code == 0
+    assert result.output == "stdin answer\n"
+    assert calls == ["hello from stdin"]
+
+
+def test_cli_headless_requires_prompt_or_stdin() -> None:
+    runner = CliRunner()
+
+    with (
+        patch("yaacli.cli.ConfigManager.load", return_value=configured()),
+        patch("yaacli.cli.ensure_builtin_assets"),
+        patch("yaacli.cli.load_env_from_config"),
+    ):
+        result = runner.invoke(cli, ["-P"], input="")
+
+    assert result.exit_code != 0
+    assert "Headless mode requires a prompt argument or stdin input" in result.output
+
+
+def test_cli_headless_unconfigured_does_not_start_setup_wizard() -> None:
+    runner = CliRunner()
+
+    with (
+        patch("yaacli.cli.ConfigManager.load", return_value=YaacliConfig()),
+        patch("yaacli.cli.ensure_builtin_assets"),
+        patch("yaacli.cli.run_setup_wizard", side_effect=AssertionError("setup wizard should not start")),
+    ):
+        result = runner.invoke(cli, ["-P", "hello"])
+
+    assert result.exit_code != 0
+    assert "yaacli is not configured" in result.output
+
+
+def test_cli_prompt_arguments_require_headless_mode() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["hello"])
+
+    assert result.exit_code != 0
+    assert "Prompt arguments require -P/--print" in result.output
 
 
 @pytest.mark.asyncio
-async def test_headless_prompt_streams_ndjson_and_saves_display_messages(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = MagicMock()
-    config.general.max_requests = 10
-    config.general.agent_stream_resume_on_error = False
-    config.general.agent_stream_resume_max_attempts = 0
-    config.general.agent_stream_resume_prompt = None
+async def test_run_headless_returns_final_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from yaacli import headless
 
-    config_manager = MagicMock(spec=ConfigManager)
-    config_manager.config_dir = tmp_path / "config"
-    config_manager.get_sessions_dir.return_value = tmp_path / "sessions"
+    stream_calls: list[dict[str, object]] = []
+    config_manager = MagicMock()
     config_manager.load_mcp_config.return_value = None
+    config_manager.config_dir = tmp_path / "config"
 
-    runtime = FakeRuntime()
-    monkeypatch.setattr("yaacli.headless.create_tui_runtime", MagicMock(return_value=runtime))
-    monkeypatch.setattr("yaacli.headless.stream_agent", MagicMock(return_value=FakeStreamContext(FakeStreamer())))
-    monkeypatch.setattr("yaacli.headless.get_latest_request_usage", MagicMock(return_value=None))
+    def fake_stream_agent(runtime: object, user_prompt: str, **kwargs: object) -> DummyAsyncContext:
+        stream_calls.append({"runtime": runtime, "prompt": user_prompt, "kwargs": kwargs})
+        return DummyAsyncContext(EmptyStream("final output"))
 
-    result = await run_headless_prompt(
-        config=config,
-        config_manager=config_manager,
+    monkeypatch.setattr(headless, "BrowserManager", lambda *_args, **_kwargs: DummyAsyncContext("browser"))
+    monkeypatch.setattr(headless, "create_tui_runtime", lambda **_kwargs: "runtime")
+    monkeypatch.setattr(headless, "stream_agent", fake_stream_agent)
+
+    output = await headless.run_headless(
+        configured(),
+        config_manager,
         prompt="hello",
         working_dir=tmp_path,
     )
 
-    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert lines[0]["type"] == "RUN_STARTED"
-    assert any(event["type"] == "TEXT_MESSAGE_CHUNK" and event["delta"] == "hello world" for event in lines)
-    assert lines[-1]["type"] == "RUN_FINISHED"
-    assert lines[-1]["result"] == {"output_text": "hello world"}
-
-    display_file = (
-        next((config_manager.get_sessions_dir.return_value / result.session_id / "turns").iterdir())
-        / "display_messages.json"
-    )
-    saved_events = json.loads(display_file.read_text())
-    assert saved_events[0]["type"] == "RUN_STARTED"
-    assert any(event["type"] == "TEXT_MESSAGE_CHUNK" and event["delta"] == "hello world" for event in saved_events)
-    assert saved_events[-1]["type"] == "RUN_FINISHED"
+    assert output == "final output"
+    assert stream_calls[0]["prompt"] == "hello"
+    assert stream_calls[0]["kwargs"]["emit_lifecycle_events"] is False
 
 
 @pytest.mark.asyncio
-async def test_headless_prompt_uses_model_profile_and_auto_denies_hitl(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = MagicMock()
-    config.general.max_requests = 10
-    config.general.agent_stream_resume_on_error = False
-    config.general.agent_stream_resume_max_attempts = 0
-    config.general.agent_stream_resume_prompt = None
-    config.general.model = "openai:test-default"
-    config.general.model_settings = None
-    config.general.model_cfg = None
-    profile = MagicMock()
-    profile.label = "Fast"
-    profile.model = "openai:test-fast"
-    profile.model_settings = None
-    profile.model_cfg = None
-    config.model_profiles = {"fast": profile}
-
-    config_manager = MagicMock(spec=ConfigManager)
-    config_manager.config_dir = tmp_path / "config"
-    config_manager.get_sessions_dir.return_value = tmp_path / "sessions"
-    config_manager.load_mcp_config.return_value = None
-
-    runtime = FakeRuntime()
-    runtime_factory = MagicMock(return_value=runtime)
-    monkeypatch.setattr("yaacli.headless.create_tui_runtime", runtime_factory)
-
-    deferred = DeferredToolRequests(
-        approvals=[ToolCallPart(tool_name="edit", args={}, tool_call_id="approval-1")],
-        calls=[ToolCallPart(tool_name="fetch_secret", args={}, tool_call_id="call-1")],
-    )
-    stream_agent_mock = MagicMock(
-        side_effect=[
-            FakeStreamContext(FakeStreamer(output=deferred)),
-            FakeStreamContext(FakeStreamer(output="denied done")),
-        ]
-    )
-    monkeypatch.setattr("yaacli.headless.stream_agent", stream_agent_mock)
-    monkeypatch.setattr("yaacli.headless.get_latest_request_usage", MagicMock(return_value=None))
-
-    result = await run_headless_prompt(
-        config=config,
-        config_manager=config_manager,
-        prompt="hello",
-        working_dir=tmp_path,
-        model_profile_id="fast",
-    )
-
-    assert result.output_text == "denied done"
-    assert runtime_factory.call_args.kwargs["model_profile"].id == "fast"
-    assert runtime_factory.call_args.kwargs["enable_async_subagents"] is False
-    assert runtime_factory.call_args.kwargs["enable_delegate_subagents"] is True
-    second_call = stream_agent_mock.call_args_list[1]
-    deferred_results = second_call.kwargs["deferred_tool_results"]
-    approval_result = deferred_results.approvals["approval-1"]
-    assert isinstance(approval_result, ToolDenied)
-    assert approval_result.message == "Headless mode denies HITL requests by default."
-    call_result = deferred_results.calls["call-1"]
-    assert isinstance(call_result, RetryPromptPart)
-    assert call_result.content == "Headless mode denies HITL requests by default."
-    assert call_result.tool_name == "fetch_secret"
-    assert call_result.tool_call_id == "call-1"
-
-    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    hitl_event = next(event for event in lines if event.get("name") == "yaacli.hitl_auto_denied")
-    assert hitl_event["value"] == {
-        "approval_count": 1,
-        "approvals": ["approval-1"],
-        "call_count": 1,
-        "calls": ["call-1"],
-        "reason": "Headless mode denies HITL requests by default.",
-    }
-    assert lines[-1]["type"] == "RUN_FINISHED"
-    assert lines[-1]["result"] == {"output_text": "denied done"}
-
-
-@pytest.mark.asyncio
-async def test_headless_worker_disables_delegate_subagents(
+async def test_run_headless_rejects_deferred_tool_requests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = MagicMock()
-    config.general.max_requests = 10
-    config.general.agent_stream_resume_on_error = False
-    config.general.agent_stream_resume_max_attempts = 0
-    config.general.agent_stream_resume_prompt = None
+    from yaacli import headless
 
-    config_manager = MagicMock(spec=ConfigManager)
-    config_manager.config_dir = tmp_path / "config"
-    config_manager.get_sessions_dir.return_value = tmp_path / "sessions"
+    config_manager = MagicMock()
     config_manager.load_mcp_config.return_value = None
-
-    runtime = FakeRuntime()
-    runtime_factory = MagicMock(return_value=runtime)
-    monkeypatch.setattr("yaacli.headless.create_tui_runtime", runtime_factory)
-    monkeypatch.setattr("yaacli.headless.stream_agent", MagicMock(return_value=FakeStreamContext(FakeStreamer())))
-    monkeypatch.setattr("yaacli.headless.get_latest_request_usage", MagicMock(return_value=None))
-
-    await run_headless_prompt(
-        config=config,
-        config_manager=config_manager,
-        prompt="hello",
-        working_dir=tmp_path,
-        worker=True,
-    )
-
-    assert runtime_factory.call_args.kwargs["enable_async_subagents"] is False
-    assert runtime_factory.call_args.kwargs["enable_delegate_subagents"] is False
-
-
-@pytest.mark.asyncio
-async def test_headless_prompt_restores_session_by_prefix(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = MagicMock()
-    config.general.max_requests = 10
-    config.general.agent_stream_resume_on_error = False
-    config.general.agent_stream_resume_max_attempts = 0
-    config.general.agent_stream_resume_prompt = None
-
-    sessions_dir = tmp_path / "sessions"
-    session_dir = sessions_dir / "abcdef123456"
-    session_dir.mkdir(parents=True)
-    (session_dir / "message_history.json").write_bytes(b"[]")
-    (session_dir / "display_messages.json").write_text(
-        json.dumps([{"type": "TEXT_MESSAGE_CHUNK", "messageId": "old", "delta": "previous"}])
-    )
-
-    config_manager = MagicMock(spec=ConfigManager)
     config_manager.config_dir = tmp_path / "config"
-    config_manager.get_sessions_dir.return_value = sessions_dir
-    config_manager.load_mcp_config.return_value = None
 
-    runtime = FakeRuntime()
-    monkeypatch.setattr("yaacli.headless.create_tui_runtime", MagicMock(return_value=runtime))
-    stream_agent_mock = MagicMock(return_value=FakeStreamContext(FakeStreamer()))
-    monkeypatch.setattr("yaacli.headless.stream_agent", stream_agent_mock)
-    monkeypatch.setattr("yaacli.headless.get_latest_request_usage", MagicMock(return_value=None))
-
-    result = await run_headless_prompt(
-        config=config,
-        config_manager=config_manager,
-        prompt="hello",
-        working_dir=tmp_path,
-        session_id="abc",
+    monkeypatch.setattr(headless, "BrowserManager", lambda *_args, **_kwargs: DummyAsyncContext("browser"))
+    monkeypatch.setattr(headless, "create_tui_runtime", lambda **_kwargs: "runtime")
+    monkeypatch.setattr(
+        headless,
+        "stream_agent",
+        lambda *_args, **_kwargs: DummyAsyncContext(EmptyStream(DeferredToolRequests())),
     )
 
-    assert result.session_id == "abcdef123456"
-    assert stream_agent_mock.call_args.kwargs["message_history"] == []
-    saved_events = json.loads(next((session_dir / "turns").iterdir()).joinpath("display_messages.json").read_text())
-    assert any(event.get("delta") == "previous" for event in saved_events)
-    assert json.loads(capsys.readouterr().out.splitlines()[0])["type"] == "RUN_STARTED"
+    with pytest.raises(headless.HeadlessExecutionError, match="interactive tool approvals"):
+        await headless.run_headless(
+            configured(),
+            config_manager,
+            prompt="needs approval",
+            working_dir=tmp_path,
+        )

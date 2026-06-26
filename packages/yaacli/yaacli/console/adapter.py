@@ -49,7 +49,7 @@ from ya_agent_sdk.events import (
     SubagentStartEvent,
 )
 
-from yaacli.events import ContextUpdateEvent, GoalCompleteEvent, GoalCompleteReason, GoalIterationEvent
+from yaacli.events import ContextUpdateEvent
 
 HIDDEN_REASONING_NOTICE = "Reasoning was encrypted by the provider; no summary was returned."
 
@@ -206,20 +206,6 @@ class ConsoleSession:
                 msg.total_tokens,
                 msg.context_window_size,
             )
-            return
-
-        if isinstance(msg, GoalIterationEvent):
-            self.sink.show_breadcrumb(f"→ goal iteration {msg.iteration}/{msg.max_iterations}")
-            return
-
-        if isinstance(msg, GoalCompleteEvent):
-            if msg.reason == GoalCompleteReason.verified:
-                text = f"→ goal verified after {msg.iteration} iteration(s)"
-            elif msg.reason == GoalCompleteReason.max_iterations:
-                text = f"→ goal stopped after {msg.iteration} iteration(s): maximum reached"
-            else:
-                text = f"→ goal stopped: {msg.reason.value}"
-            self.sink.show_breadcrumb(text)
             return
 
         # Streaming text deltas
