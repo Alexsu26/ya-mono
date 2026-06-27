@@ -59,6 +59,7 @@ DEFAULT_COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("jump", "Jump to user/assistant/tool/error marker", "INSPECT", (SlashParam("marker", required=True),)),
     SlashCommand("perf", "Show performance metrics", "INSPECT"),
     SlashCommand("model", "List or switch model profiles", "INSPECT", (SlashParam("name", required=False),)),
+    SlashCommand("theme", "List or switch color theme", "INSPECT", (SlashParam("name", required=False),)),
     SlashCommand("skills", "List available skills", "INSPECT", (SlashParam("query", required=False),)),
     SlashCommand("skill", "Show skill details", "INSPECT", (SlashParam("name", required=True),)),
     SlashCommand("mcp", "List configured MCP servers", "INSPECT", (SlashParam("query", required=False),)),

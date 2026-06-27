@@ -641,16 +641,106 @@ async def test_input_hints_explain_send_and_newline() -> None:
             yield FooterHint()
 
     prompt = PromptArea()
-    assert "Enter sends" in str(prompt.placeholder)
-    assert "Shift+Enter newline" in str(prompt.placeholder)
+    assert str(prompt.placeholder) == "Message..."
 
     app = HarnessApp()
     async with app.run_test() as pilot:
         await pilot.pause()
         footer = app.query_one(FooterHint)
         rendered = str(footer.render())
-        assert "Enter sends" in rendered
-        assert "Shift+Enter newline" in rendered
+        assert "↵ send" in rendered
+        assert "⇧↵" in rendered
+        assert "/" in rendered
+
+
+@pytest.mark.asyncio
+async def test_wide_textual_composer_shows_full_input_hints() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import FooterHint
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        rendered = str(app.query_one(FooterHint).render())
+        assert "↵ send" in rendered
+        assert "⇧↵ newline" in rendered
+        assert "/ commands" in rendered
+
+
+@pytest.mark.asyncio
+async def test_textual_composer_uses_rounded_shape_when_space_allows() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        assert app.query_one("#prompt_composer").has_class("rounded")
+
+
+@pytest.mark.asyncio
+async def test_textual_composer_drops_rounded_shape_in_short_terminal() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import PromptArea, StatusBar
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        assert not app.query_one("#prompt_composer").has_class("rounded")
+        prompt = app.query_one(PromptArea)
+        status = app.query_one(StatusBar)
+        assert prompt.size.width >= 10
+        assert status.size.height == 1
+
+
+@pytest.mark.asyncio
+async def test_input_chrome_sits_flush_to_terminal_bottom() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        composer = app.query_one("#prompt_composer")
+        assert composer.region.y + composer.region.height == app.size.height
+
+
+@pytest.mark.asyncio
+async def test_status_row_aligns_with_floating_composer() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import StatusBar
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        status = app.query_one(StatusBar)
+        composer = app.query_one("#prompt_composer")
+        assert status.region.x == composer.region.x
+        assert status.region.width == composer.region.width
+        assert composer.region.y - (status.region.y + status.region.height) == 0
 
 
 @pytest.mark.asyncio
@@ -951,6 +1041,155 @@ async def test_jump_user_slash_command_does_not_target_itself() -> None:
 
         assert "→ no user marker" in _log_text(log)
         assert "→ jumped to previous user" not in _log_text(log)
+
+
+@pytest.mark.asyncio
+async def test_jump_next_keybindings_walk_forward_through_markers() -> None:
+    from yaacli.console.blocks import UserPromptBlock
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        log = app.query_one(RichLog)
+
+        for i in range(15):
+            app._sink.show_breadcrumb(f"filler {i}")
+        app._sink.write_block(UserPromptBlock(text="user turn one"))
+        app._sink.handle_text_delta("assistant turn one\n")
+        app._sink.end_text()
+        for i in range(15):
+            app._sink.show_breadcrumb(f"middle {i}")
+        app._sink.write_block(UserPromptBlock(text="user turn two"))
+        app._sink.handle_text_delta("assistant turn two\n")
+        app._sink.end_text()
+        for i in range(15):
+            app._sink.show_breadcrumb(f"after {i}")
+        await pilot.pause()
+
+        assistants = [e for e in app._sink._history_entries if e.kind == "assistant"]
+        users = [e for e in app._sink._history_entries if e.kind == "user"]
+        first_assistant, second_assistant = assistants[0], assistants[1]
+        first_user = users[0]
+
+        log.scroll_to(y=0, animate=False)
+        await pilot.pause()
+
+        # alt+shift+a walks forward through assistant turns.
+        await pilot.press("alt+shift+a")
+        await pilot.pause()
+        await pilot.pause()
+        assert first_assistant.line_start - 1 <= log.scroll_y <= first_assistant.line_start + 1
+        assert log.scroll_y < log.max_scroll_y
+        assert log.auto_scroll is False
+
+        await pilot.press("alt+shift+a")
+        await pilot.pause()
+        await pilot.pause()
+        assert log.scroll_y >= second_assistant.line_start - 1
+        assert log.scroll_y > first_assistant.line_start
+
+        # alt+shift+u walks forward to the first user prompt.
+        log.scroll_to(y=0, animate=False)
+        await pilot.pause()
+        await pilot.press("alt+shift+u")
+        await pilot.pause()
+        await pilot.pause()
+        assert first_user.line_start - 1 <= log.scroll_y <= first_user.line_start + 1
+        assert log.auto_scroll is False
+
+
+@pytest.mark.asyncio
+async def test_jump_latest_assistant_end_keybind_lands_on_tail() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        log = app.query_one(RichLog)
+
+        for i in range(15):
+            app._sink.show_breadcrumb(f"before {i}")
+        app._sink.handle_text_delta("first assistant reply\n")
+        app._sink.end_text()
+        for i in range(15):
+            app._sink.show_breadcrumb(f"middle {i}")
+        app._sink.handle_text_delta("latest assistant reply\n")
+        app._sink.end_text()
+        # Content after the latest assistant so its end is not the transcript
+        # bottom — option+b must stop at the assistant tail, not scroll past.
+        for i in range(15):
+            app._sink.show_breadcrumb(f"after {i}")
+        await pilot.pause()
+
+        assistants = [e for e in app._sink._history_entries if e.kind == "assistant"]
+        first_assistant, latest_assistant = assistants[0], assistants[1]
+        visible_height = max(1, log.size.height or 25)
+
+        log.scroll_to(y=0, animate=False)
+        await pilot.pause()
+
+        await pilot.press("alt+b")
+        await pilot.pause()
+        await pilot.pause()
+
+        # The latest assistant's tail sits inside the viewport...
+        assert log.scroll_y <= latest_assistant.line_end - 1
+        assert log.scroll_y + visible_height >= latest_assistant.line_end
+        # ...we scrolled well past the FIRST assistant (targeted the latest)...
+        assert log.scroll_y > first_assistant.line_end
+        # ...and stopped short of the transcript bottom.
+        assert log.scroll_y < log.max_scroll_y
+        assert log.auto_scroll is False
+        # Successful navigation stays silent.
+        assert "→ jumped" not in _log_text(log)
+        assert "→ no assistant marker" not in _log_text(log)
+
+
+@pytest.mark.asyncio
+async def test_jump_success_does_not_emit_breadcrumb() -> None:
+    from yaacli.console.blocks import UserPromptBlock
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        log = app.query_one(RichLog)
+
+        for i in range(20):
+            app._sink.show_breadcrumb(f"before {i}")
+        app._sink.write_block(UserPromptBlock(text="user jump target"))
+        app._sink.handle_text_delta("assistant jump target\n")
+        app._sink.end_text()
+        for i in range(20):
+            app._sink.show_breadcrumb(f"after {i}")
+        await pilot.pause()
+
+        log.scroll_to(y=log.max_scroll_y, animate=False)
+        await pilot.pause()
+        await pilot.press("alt+a")
+        await pilot.pause()
+        await pilot.pause()
+
+        # The jump moved the viewport off the bottom and left no breadcrumb.
+        assert log.scroll_y < log.max_scroll_y
+        assert log.auto_scroll is False
+        assert "→ jumped to previous assistant" not in _log_text(log)
 
 
 @pytest.mark.asyncio
@@ -1470,7 +1709,7 @@ async def test_clear_command_removes_persisted_history_and_context(tmp_path: Pat
 @pytest.mark.asyncio
 async def test_act_plan_toggle_updates_footer() -> None:
     from yaacli.console.textual_app import YaacliTextualApp
-    from yaacli.console.widgets import FooterHint, PromptArea
+    from yaacli.console.widgets import FooterHint, PromptArea, StatusBar
 
     app = YaacliTextualApp(
         config=_make_stub_config(),
@@ -1481,6 +1720,7 @@ async def test_act_plan_toggle_updates_footer() -> None:
     async with app.run_test() as pilot:
         await pilot.pause()
         footer = app.query_one(FooterHint)
+        status = app.query_one(StatusBar)
         prompt = app.query_one(PromptArea)
         prompt.focus()
 
@@ -1488,11 +1728,13 @@ async def test_act_plan_toggle_updates_footer() -> None:
         await pilot.press("enter")
         await pilot.pause()
         assert footer.mode == "PLAN"
+        assert status.mode == "PLAN"
 
         prompt.text = "/act"
         await pilot.press("enter")
         await pilot.pause()
         assert footer.mode == "ACT"
+        assert status.mode == "ACT"
 
 
 @pytest.mark.asyncio
@@ -2278,6 +2520,219 @@ async def test_model_slash_command_rejects_switch_while_agent_is_running() -> No
 
 
 @pytest.mark.asyncio
+async def test_theme_slash_command_lists_switches_and_current() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+
+        handled_list = await app._handle_command("/theme")
+        await pilot.pause(0.02)
+        handled_switch = await app._handle_command("/theme cappuccino")
+        await pilot.pause(0.02)
+        handled_current = await app._handle_command("/theme current")
+        await pilot.pause(0.02)
+
+        rendered = _log_text(app.query_one(RichLog))
+
+    assert handled_list is True
+    assert handled_switch is True
+    assert handled_current is True
+    # Default theme is tokyo-night; cappuccino is listed.
+    assert "cappuccino" in rendered
+    assert "tokyo-night" in rendered
+    # The switch landed on both layers.
+    assert app.theme_name == "cappuccino"
+    assert app._sink.theme_name == "cappuccino"
+    assert app.theme == "catppuccin-mocha"
+    # The RichLog surface follows the cappuccino base/text colors.
+    assert str(app._log.styles.background).startswith("Color(30, 30, 46")
+    assert str(app._log.styles.color).startswith("Color(205, 214, 244")
+    # /theme current reports the active palette.
+    assert "Catppuccin Mocha" in rendered
+
+
+@pytest.mark.asyncio
+async def test_theme_slash_command_recolors_log_surface_back_on_revert() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+
+        await app._handle_command("/theme cappuccino")
+        await pilot.pause(0.02)
+        cappuccino_bg = app._log.styles.background
+
+        await app._handle_command("/theme tokyo-night")
+        await pilot.pause(0.02)
+
+        assert app.theme_name == "tokyo-night"
+        assert app.theme == "tokyo-night"
+        # Reverting must actually recolor the surface, not just flip the name.
+        assert app._log.styles.background != cappuccino_bg
+        assert str(app._log.styles.background).startswith("Color(17, 19, 26")
+
+
+@pytest.mark.asyncio
+async def test_theme_slash_command_rejects_unknown_theme() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        handled = await app._handle_command("/theme nope")
+        await pilot.pause(0.02)
+
+        rendered = _log_text(app.query_one(RichLog))
+
+    assert handled is True
+    assert app.theme_name == "tokyo-night"
+    assert "→ unknown theme: nope" in rendered
+
+
+@pytest.mark.asyncio
+async def test_theme_loads_from_config_on_startup() -> None:
+    from yaacli.config import DisplayConfig, YaacliConfig
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    config = YaacliConfig(display=DisplayConfig(theme="cappuccino"))
+    app = YaacliTextualApp(
+        config=config,
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        # The sink picks up the configured theme before its first render.
+        assert app.theme_name == "cappuccino"
+        assert app._sink.theme_name == "cappuccino"
+        assert app.theme == "catppuccin-mocha"
+
+
+@pytest.mark.asyncio
+async def test_invalid_config_theme_falls_back_to_default_on_startup() -> None:
+    from yaacli.config import DisplayConfig, YaacliConfig
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    config = YaacliConfig(display=DisplayConfig(theme="garbage"))
+    app = YaacliTextualApp(
+        config=config,
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        assert app.theme_name == "tokyo-night"
+        assert app.theme == "tokyo-night"
+
+
+@pytest.mark.asyncio
+async def test_theme_switch_persists_to_config_toml(tmp_path: Path) -> None:
+    from yaacli.config import ConfigManager, DisplayConfig, YaacliConfig
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    config = YaacliConfig(display=DisplayConfig(theme="tokyo-night"))
+    config_manager = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path)
+    app = YaacliTextualApp(
+        config=config,
+        config_manager=config_manager,
+        runtime=_make_stub_runtime(),
+        cwd=tmp_path,
+        model_name="opus-4.7",
+    )
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        await app._handle_command("/theme cappuccino")
+        await pilot.pause(0.02)
+
+    # In-memory config is in sync...
+    assert config.display.theme == "cappuccino"
+    # ...and it was written to config.toml, so it reloads.
+    config_file = tmp_path / ".yaacli" / "config.toml"
+    assert config_file.exists()
+    assert 'theme = "cappuccino"' in config_file.read_text()
+    reloaded = ConfigManager(config_dir=tmp_path / ".yaacli", project_dir=tmp_path).load()
+    assert reloaded.display.theme == "cappuccino"
+
+
+@pytest.mark.asyncio
+async def test_theme_switch_without_config_manager_does_not_crash() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        # No config_manager: switch applies for the session without persisting.
+        await app._handle_command("/theme cappuccino")
+        await pilot.pause(0.02)
+        assert app.theme_name == "cappuccino"
+
+
+def test_theme_command_is_registered_in_slash_palette() -> None:
+    from yaacli.console.palette import DEFAULT_COMMANDS
+
+    commands = {cmd.name: cmd for cmd in DEFAULT_COMMANDS}
+    assert "theme" in commands
+    assert commands["theme"].group == "INSPECT"
+    params = {p.name: p for p in commands["theme"].params}
+    assert params["name"].required is False
+
+
+@pytest.mark.asyncio
+async def test_slash_menu_completes_theme_command() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import PromptArea, SlashMenu
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="opus-4.7",
+    )
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        prompt = app.query_one(PromptArea)
+        menu = app.query_one(SlashMenu)
+        prompt.focus()
+
+        prompt.text = "/the"
+        await pilot.pause()
+        names = [cmd.name for cmd in menu.visible_commands]
+        assert "theme" in names
+
+
+@pytest.mark.asyncio
 async def test_slash_enter_for_required_param_command_completes_without_submitting() -> None:
     from yaacli.console.textual_app import YaacliTextualApp
     from yaacli.console.widgets import PromptArea
@@ -2800,11 +3255,11 @@ async def test_status_bar_context_usage_is_lightweight_and_thresholded() -> None
 
         status.context_pct = 18
         await pilot.pause(0.02)
-        assert "ready · 18% ctx" in _render_plain(status.render())
+        assert "ready · ctx 18%" in _render_plain(status.render())
 
         status.context_pct = 86
         await pilot.pause(0.02)
-        assert "ready · 86% ctx · compact soon" in _render_plain(status.render())
+        assert "ready · ctx 86% · compact soon" in _render_plain(status.render())
 
 
 @pytest.mark.asyncio
@@ -2825,7 +3280,36 @@ async def test_textual_app_sink_context_update_drives_status_bar() -> None:
         app._sink.handle_context_update(180, 1000)
         await pilot.pause(0.02)
         assert status.context_pct == 18
-        assert "ready · 18% ctx" in _render_plain(status.render())
+        assert "ready · ctx 18%" in _render_plain(status.render())
+
+
+@pytest.mark.asyncio
+async def test_status_bar_renders_composer_summary_metadata() -> None:
+    from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import StatusBar
+
+    app = YaacliTextualApp(
+        config=_make_stub_config(),
+        runtime=_make_stub_runtime(),
+        cwd=Path.cwd(),
+        model_name="GLM 5.2 1M",
+    )
+    async with app.run_test(size=(140, 30)) as pilot:
+        await pilot.pause()
+        status = app.query_one(StatusBar)
+        status.model_label = "GLM 5.2 1M"
+        status.context_pct = 52
+        status.tool_count = 2
+        status.set_status("text", "streaming response")
+        await pilot.pause(0.02)
+
+        rendered = _render_plain(status.render())
+        assert "working" in rendered
+        assert "2 tools" in rendered
+        assert "ctx 52%" in rendered
+        assert "streaming response" in rendered
+        assert "ACT" in rendered
+        assert "GLM 5.2 1M" in rendered
 
 
 @pytest.mark.asyncio
@@ -2923,7 +3407,7 @@ async def test_multiline_prompt_expands_without_overlapping_status_or_footer() -
         assert prompt.text == "one\ntwo\nthree\nfour\nfive"
         assert prompt.region.height >= 5
         assert status.region.y + status.region.height <= prompt.region.y
-        assert prompt.region.y + prompt.region.height <= footer.region.y
+        assert footer.region.y + footer.region.height <= prompt.region.y + prompt.region.height
 
 
 @pytest.mark.asyncio

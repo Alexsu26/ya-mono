@@ -194,7 +194,9 @@ def _generate_instruction_from_configs(
 ) -> str | None:
     """Generate delegate instructions without eagerly constructing subagents."""
     available_configs = [
-        config for config in configs if config.name != SELF_SUBAGENT_NAME and _is_config_available(config, parent_toolset, ctx)
+        config
+        for config in configs
+        if config.name != SELF_SUBAGENT_NAME and _is_config_available(config, parent_toolset, ctx)
     ]
     self_available = _is_self_fork_available(ctx)
 

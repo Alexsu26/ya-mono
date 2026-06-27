@@ -23,6 +23,7 @@ Configuration files are loaded with project-level priority (no merging):
 
 from __future__ import annotations
 
+import re
 import tomllib
 from importlib import resources
 from pathlib import Path
@@ -104,6 +105,9 @@ class DisplayConfig(BaseModel):
 
     code_theme: Literal["dark", "light"] = "dark"
     """Code highlighting theme."""
+
+    theme: str = "tokyo-night"
+    """Console color theme name (see ``/theme``). Unknown values fall back to the default."""
 
     max_tool_result_lines: int = 5
     """Maximum lines to show for tool results."""
@@ -393,6 +397,7 @@ class EnvSettings(BaseSettings):
 
     # Display
     code_theme: Literal["dark", "light"] | None = None
+    display_theme: str | None = None
     show_token_usage: bool | None = None
     show_elapsed_time: bool | None = None
 
@@ -535,6 +540,8 @@ class ConfigManager:
         display: dict[str, Any] = {}
         if env.code_theme is not None:
             display["code_theme"] = env.code_theme
+        if env.display_theme is not None:
+            display["theme"] = env.display_theme
         if env.show_token_usage is not None:
             display["show_token_usage"] = env.show_token_usage
         if env.show_elapsed_time is not None:
@@ -691,6 +698,37 @@ class ConfigManager:
         """Get path to project tools config file."""
         return self._project_dir / self.PROJECT_CONFIG_DIR / "tools.toml"
 
+    def _active_config_file(self) -> Path:
+        """The ``config.toml`` that ``load()`` actually read, else the global one."""
+        for source in self._loaded_sources:
+            if source.endswith("config.toml"):
+                return Path(source)
+        return self._config_dir / "config.toml"
+
+    def save_display_theme(self, theme_name: str) -> Path | None:
+        """Persist the console theme under ``[display] theme`` in config.toml.
+
+        Writes to the config.toml that ``load()`` used (project or global) so the
+        choice sticks on reload; if none exists yet, a global config.toml is
+        created. Returns the path written, or ``None`` if the write failed.
+        """
+        target = self._active_config_file()
+        try:
+            if target.exists():
+                updated = _upsert_toml_table_key(
+                    target.read_text(encoding="utf-8"),
+                    "display",
+                    "theme",
+                    f'"{theme_name}"',
+                )
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                updated = f'[display]\ntheme = "{theme_name}"\n'
+            target.write_text(updated, encoding="utf-8")
+        except OSError:
+            return None
+        return target
+
     def get_sessions_dir(self) -> Path:
         """Get sessions directory for session-based storage.
 
@@ -733,6 +771,52 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             result[key] = value
     return result
+
+
+def _upsert_toml_table_key(text: str, table: str, key: str, value_literal: str) -> str:
+    """Insert or replace ``key`` under the ``[table]`` header in TOML text.
+
+    Format-preserving: when the key already exists only its value is swapped
+    (trailing inline comments are kept); when the table exists but the key does
+    not, the assignment is inserted directly under the header line; when neither
+    exists a new ``[table]`` block is appended. ``value_literal`` is the
+    already-formatted RHS (e.g. ``'"cappuccino"'`` for a string).
+    """
+    lines = text.splitlines()
+    trailing_newline = text.endswith("\n")
+    header = f"[{table}]"
+
+    header_idx = next((i for i, line in enumerate(lines) if line.strip() == header), None)
+
+    if header_idx is None:
+        # Append a fresh table block.
+        lines.extend(["", header, f"{key} = {value_literal}"])
+        return "\n".join(lines) + "\n"
+
+    # Extent of this table runs until the next header / array-of-tables line.
+    end_idx = len(lines)
+    for j in range(header_idx + 1, len(lines)):
+        if lines[j].lstrip().startswith("["):
+            end_idx = j
+            break
+
+    pattern = re.compile(
+        r"^(\s*" + re.escape(key) + r"\s*=\s*)(\".*?\"|'.*?'|[^#\n]*)()(.*)$",
+        re.DOTALL,
+    )
+    for j in range(header_idx + 1, end_idx):
+        match = pattern.match(lines[j])
+        if match:
+            prefix, _old, _empty, suffix = match.groups()
+            # Preserve any trailing inline comment, collapsed to one leading space.
+            suffix = suffix.lstrip()
+            suffix = f" {suffix}" if suffix else ""
+            lines[j] = f"{prefix}{value_literal}{suffix}"
+            return "\n".join(lines) + ("\n" if trailing_newline else "")
+
+    # Key missing in table: insert directly under the header line.
+    lines.insert(header_idx + 1, f"{key} = {value_literal}")
+    return "\n".join(lines) + ("\n" if trailing_newline else "")
 
 
 def _load_template(name: str) -> str:

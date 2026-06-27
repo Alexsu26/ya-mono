@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>YAACLI Composer Status Bar Mockup</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #1e1e2e;
+        --surface: #12131d;
+        --surface-2: #0f1018;
+        --line: #4b5168;
+        --line-soft: #34384c;
+        --text: #cdd6f4;
+        --muted: #7f849c;
+        --soft: #a6adc8;
+        --blue: #b4befe;
+        --cyan: #89dceb;
+        --green: #a6e3a1;
+        --yellow: #f9e2af;
+        --red: #f38ba8;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          "Maple Mono NF CN",
+          "JetBrains Mono",
+          "SFMono-Regular",
+          ui-monospace,
+          monospace;
+        letter-spacing: 0;
+      }
+
+      .page {
+        display: grid;
+        min-height: 100vh;
+        place-items: end center;
+        padding: 28px;
+      }
+
+      .terminal {
+        width: min(1480px, 100%);
+        background: #181927;
+        border: 1px solid #262a3a;
+        box-shadow: 0 24px 80px rgb(0 0 0 / 0.34);
+      }
+
+      .history {
+        min-height: 360px;
+        padding: 22px 28px;
+        color: var(--muted);
+      }
+
+      .history-line {
+        margin: 0 0 16px;
+        white-space: pre-wrap;
+      }
+
+      .history-line strong {
+        color: var(--text);
+        font-weight: 700;
+      }
+
+      .chrome {
+        padding: 0 28px 22px;
+      }
+
+      .state-row {
+        display: flex;
+        min-height: 50px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        color: var(--muted);
+        font-size: 27px;
+        line-height: 1;
+      }
+
+      .state-left,
+      .state-right {
+        display: flex;
+        min-width: 0;
+        align-items: center;
+        gap: 16px;
+      }
+
+      .state-right {
+        justify-content: flex-end;
+      }
+
+      .status {
+        display: inline-flex;
+        min-width: 0;
+        align-items: center;
+        gap: 14px;
+        color: var(--text);
+        font-weight: 700;
+      }
+
+      .spinner {
+        width: 18px;
+        height: 18px;
+        border: 3px solid color-mix(in srgb, var(--yellow) 38%, transparent);
+        border-left-color: var(--yellow);
+        border-radius: 999px;
+        animation: spin 0.9s linear infinite;
+      }
+
+      .ready-dot {
+        width: 14px;
+        height: 14px;
+        border-radius: 999px;
+        background: var(--green);
+        box-shadow: 0 0 16px color-mix(in srgb, var(--green) 60%, transparent);
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      .sep {
+        color: #5f647a;
+      }
+
+      .value {
+        color: var(--soft);
+        font-weight: 700;
+      }
+
+      .mode {
+        color: var(--green);
+        font-weight: 700;
+      }
+
+      .model {
+        overflow: hidden;
+        max-width: 34ch;
+        color: var(--soft);
+        font-weight: 700;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .rule {
+        height: 1px;
+        margin: 2px 0 18px;
+        background: var(--line);
+      }
+
+      .composer {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        align-items: center;
+        min-height: 78px;
+        gap: 20px;
+        padding: 0 26px;
+        background: var(--surface-2);
+        border: 1px solid #181a26;
+        border-radius: 14px;
+      }
+
+      .prompt-mark {
+        color: var(--blue);
+        font-size: 34px;
+        font-weight: 800;
+      }
+
+      .input-line {
+        display: flex;
+        min-width: 0;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .cursor {
+        width: 14px;
+        height: 32px;
+        background: var(--blue);
+        animation: blink 1.1s steps(2, start) infinite;
+      }
+
+      @keyframes blink {
+        50% {
+          opacity: 0.25;
+        }
+      }
+
+      .placeholder {
+        overflow: hidden;
+        color: #5f647a;
+        font-size: 25px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .hints {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 14px;
+        color: var(--muted);
+        font-size: 24px;
+        white-space: nowrap;
+      }
+
+      .key {
+        display: inline-grid;
+        min-width: 38px;
+        height: 34px;
+        place-items: center;
+        padding: 0 8px;
+        border: 2px solid #555b78;
+        border-radius: 8px;
+        color: var(--soft);
+        font-size: 19px;
+        font-weight: 700;
+      }
+
+      .variant {
+        margin-top: 28px;
+      }
+
+      .variant .state-row {
+        min-height: 42px;
+        font-size: 23px;
+      }
+
+      .variant .composer {
+        min-height: 64px;
+        border-radius: 10px;
+      }
+
+      .variant .prompt-mark {
+        font-size: 28px;
+      }
+
+      .variant .cursor {
+        height: 26px;
+      }
+
+      .variant .placeholder,
+      .variant .hints {
+        font-size: 20px;
+      }
+
+      @media (max-width: 900px) {
+        .page {
+          padding: 16px;
+        }
+
+        .history {
+          min-height: 240px;
+          padding: 18px;
+        }
+
+        .chrome {
+          padding: 0 14px 16px;
+        }
+
+        .state-row {
+          font-size: 18px;
+        }
+
+        .model,
+        .hide-mobile {
+          display: none;
+        }
+
+        .composer {
+          grid-template-columns: auto 1fr;
+          min-height: 64px;
+          padding: 0 18px;
+          border-radius: 10px;
+        }
+
+        .hints {
+          display: none;
+        }
+
+        .prompt-mark {
+          font-size: 27px;
+        }
+
+        .placeholder {
+          font-size: 18px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <section class="terminal" aria-label="YAACLI terminal mockup">
+        <div class="history">
+          <p class="history-line"><strong>assistant</strong> 正在检查当前 repo 的状态栏实现。</p>
+          <p class="history-line">tool call · rg status widgets · done</p>
+        </div>
+
+        <div class="chrome">
+          <div class="state-row">
+            <div class="state-left">
+              <span class="status"><span class="spinner"></span>working</span>
+              <span class="sep">·</span>
+              <span><span class="value">2</span> tools</span>
+              <span class="sep">·</span>
+              <span>ctx <span class="value">52%</span></span>
+              <span class="sep hide-mobile">·</span>
+              <span class="hide-mobile">streaming response</span>
+            </div>
+            <div class="state-right">
+              <span class="mode">ACT</span>
+              <span class="sep">·</span>
+              <span class="model">GLM 5.2 1M</span>
+              <span class="sep">---</span>
+            </div>
+          </div>
+          <div class="rule"></div>
+          <div class="composer">
+            <div class="prompt-mark">›</div>
+            <div class="input-line">
+              <div class="cursor"></div>
+              <div class="placeholder">Message...</div>
+            </div>
+            <div class="hints" aria-label="keyboard hints">
+              <span class="key">↵</span><span>send</span>
+              <span class="sep">·</span>
+              <span class="key">⇧↵</span><span>newline</span>
+              <span class="sep">·</span>
+              <span class="key">/</span><span>commands</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="chrome variant">
+          <div class="state-row">
+            <div class="state-left">
+              <span class="status"><span class="ready-dot"></span>ready</span>
+              <span class="sep">·</span>
+              <span>ctx <span class="value">18%</span></span>
+            </div>
+            <div class="state-right">
+              <span class="mode">ACT</span>
+              <span class="sep">·</span>
+              <span class="model">oauth@codex:gpt-5.5</span>
+            </div>
+          </div>
+          <div class="rule"></div>
+          <div class="composer">
+            <div class="prompt-mark">›</div>
+            <div class="input-line">
+              <div class="cursor"></div>
+              <div class="placeholder">Message... Enter sends · Shift+Enter newline · / commands</div>
+            </div>
+            <div class="hints" aria-label="keyboard hints">
+              <span class="key">↵</span><span>send</span>
+              <span class="sep">·</span>
+              <span class="key">⇧↵</span><span>newline</span>
+              <span class="sep">·</span>
+              <span class="key">/</span><span>commands</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

@@ -52,7 +52,7 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, RichLog, Static
 from ya_agent_sdk.agents.main import stream_agent
@@ -80,7 +80,7 @@ from yaacli.console.discovery import (
 )
 from yaacli.console.glyphs import GLYPHS, SPINNER_FRAMES
 from yaacli.console.header import HeaderInfo
-from yaacli.console.theme import build_theme
+from yaacli.console.theme import DEFAULT_THEME_NAME, build_theme, get_theme, list_themes, theme_exists
 from yaacli.console.transcript import TranscriptStore, new_session_id
 from yaacli.console.widgets import (
     FooterHint,
@@ -305,10 +305,12 @@ class TextualSink:
         live: LivePane,
         *,
         max_log_lines: int = 0,
+        theme_name: str = DEFAULT_THEME_NAME,
     ) -> None:
         self._log = log
         self._live = live
         self._max_log_lines = max(0, int(max_log_lines or 0))
+        self._theme_name = theme_name
         self._render_console = self._build_render_console(max(40, log.size.width or 100))
         # ----- streaming-text state -----
         # Raw accumulated text since the current streaming block began.
@@ -404,12 +406,26 @@ class TextualSink:
 
     def _build_render_console(self, width: int) -> RichConsole:
         return RichConsole(
-            theme=build_theme(),
+            theme=build_theme(self._theme_name),
             force_terminal=True,
             color_system="truecolor",
             width=width,
             height=max(1, self._log.size.height or 25),
         )
+
+    @property
+    def theme_name(self) -> str:
+        return self._theme_name
+
+    def set_theme(self, name: str) -> None:
+        """Switch the Rich console theme used for new renders.
+
+        Already-committed RichLog strips are opaque Segments, so history keeps
+        its colors; subsequent writes (including the live streaming buffer on
+        its next delta) pick up the new palette.
+        """
+        self._theme_name = name
+        self._render_console = self._build_render_console(self._render_console.width)
 
     def _resync_width(self) -> None:
         if self._render_console.width != self.width:
@@ -943,6 +959,27 @@ class TextualSink:
         self._log.scroll_to(y=max(0, entry.line_start), animate=False, immediate=True)
         return True
 
+    def scroll_to_entry_end(self, entry_index: int) -> bool:
+        """Scroll so the entry's tail sits at the bottom of the viewport.
+
+        Used for "jump to the end of the latest assistant": we want the
+        conclusion of that message visible at the bottom of the screen rather
+        than pinned to the top (which ``scroll_to_entry`` would do).
+        """
+        if entry_index < 0 or entry_index >= len(self._history_entries):
+            return False
+        entry = self._history_entries[entry_index]
+        visible_height = max(1, self._log.size.height or 25)
+        target_y = max(0, entry.line_end - visible_height)
+        self._log.scroll_to(y=target_y, animate=False, immediate=True)
+        return True
+
+    def last_assistant_entry_index(self) -> int | None:
+        for i in range(len(self._history_entries) - 1, -1, -1):
+            if self._history_entries[i].kind == "assistant":
+                return i
+        return None
+
     def jump_to_marker(self, kind: str, direction: int, current_y: float) -> bool:
         target = self.marker_entry_index(kind, direction, current_y)
         if target is None:
@@ -1118,9 +1155,6 @@ class YaacliTextualApp(App[None]):
     AsyncExitStack the same way the v1 TUIApp does.
     """
 
-    # Pick a modern theme registered by Textual; the user can override.
-    THEME_NAME: ClassVar[str] = "tokyo-night"
-
     CSS = """
     Screen {
         background: #11131a;
@@ -1138,11 +1172,43 @@ class YaacliTextualApp(App[None]):
     #input_chrome {
         dock: bottom;
         height: auto;
+        padding: 0;
+        background: #1e1e2e;
+        border: none;
     }
     #input_chrome > StatusBar,
-    #input_chrome > PromptArea,
-    #input_chrome > FooterHint {
+    #input_chrome > #prompt_composer {
         dock: none;
+    }
+    #input_chrome > StatusBar {
+        margin: 0 2 0 2;
+        margin-bottom: 0;
+    }
+    #prompt_composer {
+        height: auto;
+        min-height: 3;
+        margin: 0 2 0 2;
+        background: #0f1018;
+        border: none;
+        padding: 0 1;
+    }
+    #prompt_composer.rounded {
+        border: round #34384c;
+    }
+    #prompt_mark {
+        width: 2;
+        height: 3;
+        padding: 1 0 0 0;
+        background: #0f1018;
+        color: #b4befe;
+        text-style: bold;
+    }
+    #prompt_composer > PromptArea,
+    #prompt_composer > FooterHint {
+        dock: none;
+    }
+    #prompt_composer > PromptArea {
+        width: 1fr;
     }
     """
 
@@ -1159,6 +1225,9 @@ class YaacliTextualApp(App[None]):
         Binding("alt+a", "jump_previous_assistant", "Previous assistant", show=False),
         Binding("alt+t", "jump_previous_tool", "Previous tool", show=False),
         Binding("alt+e", "jump_next_error", "Next error", show=False),
+        Binding("alt+shift+u", "jump_next_user", "Next user", show=False),
+        Binding("alt+shift+a", "jump_next_assistant", "Next assistant", show=False),
+        Binding("alt+b", "jump_latest_assistant_end", "Jump to latest assistant", show=False),
         Binding("ctrl+o", "tool_toggle_details", "Toggle tool details", show=False),
         Binding("ctrl+shift+o", "tool_expand_all", "Expand all tools", show=False),
         Binding("ctrl+alt+c", "tool_copy_command", "Copy tool command", show=False),
@@ -1192,6 +1261,7 @@ class YaacliTextualApp(App[None]):
         self._current_context_tokens: int = 0
         self._context_window_size: int = 0
         self._mode = "ACT"
+        self._theme_name: str = self._resolve_initial_theme(config)
         self._message_history: list[Any] = []
         self._approval_session_grants: set[str] = set()
         self._agent_task: asyncio.Task[None] | None = None
@@ -1236,6 +1306,7 @@ class YaacliTextualApp(App[None]):
             self._log,
             self._live,
             max_log_lines=getattr(getattr(config, "display", None), "max_output_lines", 0),
+            theme_name=self._theme_name,
         )
         self._log.on_width_changed = self._sink.reflow_streaming_text
         # Wire the auto-scroll watchdog: each time history grows, decide
@@ -1293,15 +1364,15 @@ class YaacliTextualApp(App[None]):
         yield self._live
         with Vertical(id="input_chrome"):
             yield self._status
-            yield self._input
-            yield self._footer
+            with Horizontal(id="prompt_composer"):
+                yield Static("›", id="prompt_mark")  # noqa: RUF001
+                yield self._input
+                yield self._footer
 
     def on_mount(self) -> None:
-        # Apply chosen theme. Available themes were registered by Textual core.
-        try:
-            self.theme = self.THEME_NAME
-        except Exception:
-            logger.debug("Could not set theme %s", self.THEME_NAME, exc_info=True)
+        # Apply the active theme to both the Textual widget chrome and the
+        # RichLog surface (whose CSS defaults to the default-theme base).
+        self._apply_theme()
         # Allow text selection in the log so users can drag-select.
         self._log.can_focus = True
         self._tool_details.can_focus = True
@@ -1315,11 +1386,15 @@ class YaacliTextualApp(App[None]):
         self._slash_menu.set_subagent_provider(self._discover_subagents)
         self._slash_menu.set_recent_commands(tuple(self._recent_command_names))
         self._mention_menu.set_workspace_root(self._cwd)
+        self._sync_composer_shape()
+        self._sync_composer_hint_width()
         self._sync_completion_menu_offsets()
         self._refresh_header()
         self._footer.mode = self._mode
         self._footer.state = "ready"
         self._footer.model_label = self._short_model_label()
+        self._status.mode = self._mode
+        self._status.model_label = self._short_model_label()
         self._input.focus()
         # Greeting breadcrumb
         self._sink.show_breadcrumb("Type / for commands. /exit to quit.")
@@ -1340,13 +1415,29 @@ class YaacliTextualApp(App[None]):
                 self._slash_menu.update_query(self._input.text)
 
     def on_resize(self, _event: Any) -> None:
+        self._sync_composer_shape()
+        self._sync_composer_hint_width()
         self._sync_completion_menu_offsets()
+
+    def _sync_composer_shape(self) -> None:
+        try:
+            composer = self.query_one("#prompt_composer")
+            composer.set_class((self.size.height or 0) >= 14, "rounded")
+        except Exception:
+            logger.debug("Could not update composer shape", exc_info=True)
+
+    def _sync_composer_hint_width(self) -> None:
+        width = self.size.width or 80
+        hint_width = 38 if width >= 96 else 26
+        self._footer.styles.width = hint_width
+        self._footer.hint_width = hint_width
 
     def _sync_completion_menu_offsets(self) -> None:
         prompt_height = getattr(self._input.region, "height", 0) or self._input.size.height or 0
         status_height = getattr(self._status.region, "height", 0) or self._status.size.height or 0
         footer_height = getattr(self._footer.region, "height", 0) or self._footer.size.height or 0
-        chrome_height = max(3, prompt_height) + max(1, status_height) + max(1, footer_height)
+        composer_height = max(3, prompt_height, footer_height)
+        chrome_height = composer_height + max(1, status_height) + 1
         offset = (0, -chrome_height)
         self._mention_menu.styles.offset = offset
         self._slash_menu.styles.offset = offset
@@ -1781,6 +1872,7 @@ class YaacliTextualApp(App[None]):
             pct = self._current_context_tokens / self._context_window_size * 100
         try:
             self._status.context_pct = pct
+            self._footer.context_pct = pct
         except Exception:
             logger.debug("Could not update context status", exc_info=True)
 
@@ -1805,6 +1897,7 @@ class YaacliTextualApp(App[None]):
         if self._footer.state == "working":
             if entry.kind == "tool":
                 self._turn_tool_count += 1
+                self._status.tool_count = self._turn_tool_count
             if error:
                 self._turn_error_count += 1
 
@@ -2005,6 +2098,21 @@ class YaacliTextualApp(App[None]):
     def action_jump_next_error(self) -> None:
         self._jump_history_marker("error", 1)
 
+    def action_jump_next_user(self) -> None:
+        self._jump_history_marker("user", 1)
+
+    def action_jump_next_assistant(self) -> None:
+        self._jump_history_marker("assistant", 1)
+
+    def action_jump_latest_assistant_end(self) -> None:
+        target = self._sink.last_assistant_entry_index()
+        if target is None:
+            self._sink.show_breadcrumb("→ no assistant marker")
+            return
+        self._pause_history_auto_scroll()
+        self._sink.scroll_to_entry_end(target)
+        self._pause_history_auto_scroll()
+
     def action_tool_toggle_details(self) -> None:
         if self._tool_details_active:
             self._hide_tool_details_view()
@@ -2084,9 +2192,10 @@ class YaacliTextualApp(App[None]):
         if target is None:
             self._sink.show_breadcrumb(f"→ no {marker} marker")
             return False
+        # Successful jumps are silent: a "→ jumped to ..." line after every
+        # keystroke accumulated into transcript noise, so we move the viewport
+        # without emitting anything. The no-marker case above still reports.
         self._pause_history_auto_scroll()
-        arrow = "previous" if direction < 0 else "next"
-        self._sink.show_breadcrumb(f"→ jumped to {arrow} {marker}")
         self._sink.scroll_to_entry(target)
         self._pause_history_auto_scroll()
         return True
@@ -2121,7 +2230,7 @@ class YaacliTextualApp(App[None]):
 
         width = max(40, self._tool_details.size.width or self._log.size.width or 100)
         console = RichConsole(
-            theme=build_theme(),
+            theme=build_theme(self._theme_name),
             force_terminal=True,
             color_system="truecolor",
             width=width,
@@ -2182,6 +2291,7 @@ class YaacliTextualApp(App[None]):
             return
 
         self._footer.state = "working"
+        self._status.tool_count = 0
         self._turn_started_at = time.monotonic()
         self._turn_tool_count = 0
         self._turn_error_count = 0
@@ -2219,6 +2329,7 @@ class YaacliTextualApp(App[None]):
                 logger.debug("Could not clear steering_messages", exc_info=True)
             self._footer.state = "ready"
             self._status.set_status("idle")
+            self._status.tool_count = 0
             self._record_turn_summary()
             self._refresh_header()
 
@@ -2393,6 +2504,7 @@ class YaacliTextualApp(App[None]):
             self._record_recent_command(name)
             self._mode = "ACT"
             self._footer.mode = self._mode
+            self._status.mode = self._mode
             self._sink.show_breadcrumb("→ switched to ACT mode")
             return True
 
@@ -2400,6 +2512,7 @@ class YaacliTextualApp(App[None]):
             self._record_recent_command(name)
             self._mode = "PLAN"
             self._footer.mode = self._mode
+            self._status.mode = self._mode
             self._sink.show_breadcrumb("→ switched to PLAN mode (no writes, no shell mutations)")
             return True
 
@@ -2441,6 +2554,11 @@ class YaacliTextualApp(App[None]):
         if name == "model":
             self._record_recent_command(name)
             await self._handle_model_command(args)
+            return True
+
+        if name == "theme":
+            self._record_recent_command(name)
+            await self._handle_theme_command(args)
             return True
 
         if name == "skills":
@@ -2915,7 +3033,96 @@ class YaacliTextualApp(App[None]):
         self._model_name = self._format_model_display_name(model_name, profile)
         self._refresh_header()
         self._footer.model_label = self._short_model_label()
+        self._status.model_label = self._short_model_label()
         self._sink.show_breadcrumb(f"→ switched model to {model_name}: {getattr(profile, 'model', '')}")
+
+    # ---------------- theme ----------------
+
+    @staticmethod
+    def _resolve_initial_theme(config: Any) -> str:
+        """Pick the startup theme from ``display.theme``, falling back to default."""
+        name = str(getattr(getattr(config, "display", None), "theme", "") or "").strip()
+        return name if theme_exists(name) else DEFAULT_THEME_NAME
+
+    def _persist_theme(self, name: str) -> None:
+        """Keep the in-memory config in sync and write the choice to config.toml."""
+        display = getattr(self._config, "display", None)
+        if display is not None:
+            try:
+                display.theme = name
+            except Exception:
+                logger.debug("Could not update in-memory display.theme", exc_info=True)
+        if self._config_manager is None:
+            return
+        written = self._config_manager.save_display_theme(name)
+        if written is None:
+            self._sink.show_breadcrumb("→ theme applied for this session (not persisted)")
+
+    def _apply_theme(self) -> None:
+        """Apply the active theme to Textual chrome and the RichLog surface.
+
+        The Textual built-in theme (``theme.textual_theme``) recolors widget
+        chrome — status bar, input, borders. The RichLog / tool-details CSS
+        hardcodes the default base, so we recolor those surfaces here too.
+        """
+        theme = get_theme(self._theme_name)
+        textual_theme = theme.textual_theme
+        if textual_theme:
+            try:
+                self.theme = textual_theme
+            except Exception:
+                logger.debug("Could not set Textual theme %s", textual_theme, exc_info=True)
+        self._log.styles.background = theme.base
+        self._log.styles.color = theme.text
+        self._tool_details.styles.background = theme.base
+        self._tool_details.styles.color = theme.text
+
+    @property
+    def theme_name(self) -> str:
+        return self._theme_name
+
+    async def _handle_theme_command(self, args: str) -> None:
+        arg = args.strip()
+        if not arg:
+            self._show_theme_list()
+            return
+        if arg == "current":
+            self._show_current_theme()
+            return
+        self._switch_theme(arg)
+
+    def _show_theme_list(self) -> None:
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(style="console.state.success", no_wrap=True)
+        grid.add_column(style="console.text.primary", no_wrap=True)
+        grid.add_column(style="console.meta", no_wrap=True)
+        grid.add_column(style="console.meta")
+        for name in list_themes():
+            theme = get_theme(name)
+            marker = "●" if name == self._theme_name else " "
+            textual = theme.textual_theme or "—"
+            grid.add_row(marker, name, textual, truncate_cells(theme.description, 60))
+        self._sink.write_block(SystemBlock(title="/theme", body=grid))
+
+    def _show_current_theme(self) -> None:
+        theme = get_theme(self._theme_name)
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(style="console.meta", no_wrap=True)
+        grid.add_column(style="console.text.primary")
+        grid.add_row("name", theme.name)
+        grid.add_row("description", theme.description)
+        grid.add_row("textual theme", theme.textual_theme or "—")
+        self._sink.write_block(SystemBlock(title="/theme current", body=grid))
+
+    def _switch_theme(self, name: str) -> None:
+        if not theme_exists(name):
+            self._sink.show_breadcrumb(f"→ unknown theme: {name}")
+            return
+        self._theme_name = name
+        self._sink.set_theme(name)
+        self._apply_theme()
+        self._persist_theme(name)
+        self._sink.show_breadcrumb(f"→ switched theme to {name}")
 
 
 # ---------------------------------------------------------------------------

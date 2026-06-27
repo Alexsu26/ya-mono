@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
-from rich.cells import cell_len
 from rich.console import Console as RichConsole
 from rich.console import Group, RenderableType
 from rich.segment import Segments
@@ -155,21 +154,15 @@ class HeaderBar(Static):
 
 
 class FooterHint(Static):
-    """Bottom docked help/status line.
-
-    Two-zone layout:
-        ┌──────────────────────────────────────────────────────────┐
-        │ ↵ send · / commands · ctrl-c cancel  │  model · 18% · $0 ACT · ready │
-        └──────────────────────────────────────────────────────────┘
-        ←──── left: keyboard hints ────→        ←─ right: state ──→
-    """
+    """Composer-side keyboard hints."""
 
     DEFAULT_CSS = """
     FooterHint {
         dock: bottom;
-        height: 1;
-        padding: 0 1;
-        background: #171a23;
+        width: 26;
+        height: 3;
+        padding: 1 0 0 1;
+        background: #0f1018;
         color: #6f778a;
     }
     """
@@ -180,6 +173,7 @@ class FooterHint(Static):
     context_pct: reactive[float] = reactive(0.0)
     cost_str: reactive[str] = reactive("")
     spinner_frame: reactive[int] = reactive(0)
+    hint_width: reactive[int] = reactive(26)
 
     def watch_mode(self, _value: str) -> None:
         self.refresh_text()
@@ -194,6 +188,9 @@ class FooterHint(Static):
         self.refresh_text()
 
     def watch_cost_str(self, _value: str) -> None:
+        self.refresh_text()
+
+    def watch_hint_width(self, _value: int) -> None:
         self.refresh_text()
 
     def watch_spinner_frame(self, _value: int) -> None:
@@ -211,47 +208,24 @@ class FooterHint(Static):
             self.spinner_frame = (self.spinner_frame + 1) % len(SPINNER_FRAMES)
 
     def refresh_text(self) -> None:
-        # Build left and right halves; pad between with spaces sized to fill.
-        right = Text()
-        if self.model_label:
-            right.append(truncate_cells(self.model_label, 28), style="bold #aeb6c8")
-            right.append("  ·  ", style="#6f778a")
-        if self.context_pct > 0:
-            right.append(f"{self.context_pct:.0f}%", style="#6f778a")
-            right.append("  ·  ", style="#6f778a")
-        if self.cost_str:
-            right.append(self.cost_str, style="#6f778a")
-            right.append("  ·  ", style="#6f778a")
-        mode_style = "bold #8bd5a4" if self.mode.upper() == "ACT" else "bold #7aa2f7"
-        right.append(self.mode.upper(), style=mode_style)
-        right.append(" · ", style="#6f778a")
-        if self.state == "working":
-            spin = SPINNER_FRAMES[self.spinner_frame % len(SPINNER_FRAMES)]
-            right.append(f"working {spin}", style="#7dcfff")
-        else:
-            right.append("ready", style="#9ece6a")
-
-        width = self.size.width or 80
-        right_len = right.cell_len
-        available_left = max(10, width - right_len - 3)
-        hint_options = (
-            " Enter sends · Shift+Enter newline · / commands · @ files · Ctrl+C cancel",
-            " Enter sends · Shift+Enter newline · / · @ · Ctrl+C",
-            " Enter · Shift+Enter · / · @",
-        )
-        hint = next(
-            (option for option in hint_options if cell_len(option) <= available_left),
-            truncate_cells(hint_options[-1], available_left),
-        )
-        left = Text(hint, style="#6f778a")
-
-        # Compute padding to push right half to the far edge.
-        left_len = left.cell_len
-        gap = max(2, width - left_len - right_len - 1)
+        width = max(int(self.hint_width or 26), self.size.width or 0)
         out = Text()
-        out.append_text(left)
-        out.append(" " * gap)
-        out.append_text(right)
+        if width >= 30:
+            out.append("↵", style="bold #aeb6c8")
+            out.append(" send", style="#6f778a")
+            out.append(" · ", style="#6f778a")
+            out.append("⇧↵", style="bold #aeb6c8")
+            out.append(" newline", style="#6f778a")
+            out.append(" · ", style="#6f778a")
+            out.append("/", style="bold #aeb6c8")
+            out.append(" commands", style="#6f778a")
+        else:
+            out.append("↵", style="bold #aeb6c8")
+            out.append(" send", style="#6f778a")
+            out.append(" · ", style="#6f778a")
+            out.append("⇧↵", style="bold #aeb6c8")
+            out.append(" · ", style="#6f778a")
+            out.append("/", style="bold #aeb6c8")
         self.update(out)
 
 
@@ -720,35 +694,27 @@ class PathMentionMenu(Static):
 
 
 class StatusBar(Static):
-    """A 1-line status strip docked just above the input.
-
-    Doubles as the visible separator between the scrollable history above
-    and the input box below — so it's always visible. Content depends on
-    agent state:
-
-      * idle     →  ─────────────── ready ───────────────
-      * thinking →  ─── ⠼ thinking · 2.3s ─────── esc cancel
-      * waiting  →  ─── ⠼ waiting · next tool · 2.3s ─ esc cancel
-      * tool     →  ─── ⠼ Bash · which psql · 1.4s ─── esc cancel
-      * text     →  ─── ⠼ generating · 5.1s ──────── esc cancel
-    """
+    """One-line composer status summary."""
 
     DEFAULT_CSS = """
     StatusBar {
         dock: bottom;
         height: 1;
-        padding: 0 1;
-        background: #171a23;
+        padding: 0 0;
+        background: #1e1e2e;
         color: #d8dee9;
     }
     StatusBar.idle {
-        background: #11131a;
+        background: #1e1e2e;
         color: #6f778a;
     }
     """
 
     state: reactive[str] = reactive("idle")  # idle | thinking | waiting | tool | text
     detail: reactive[str] = reactive("")
+    mode: reactive[str] = reactive("ACT")
+    model_label: reactive[str] = reactive("")
+    tool_count: reactive[int] = reactive(0)
     started_at: reactive[float] = reactive(0.0)
     spinner_frame: reactive[int] = reactive(0)
     context_pct: reactive[float] = reactive(0.0)
@@ -776,6 +742,15 @@ class StatusBar(Static):
         self._repaint()
 
     def watch_detail(self, _value: str) -> None:
+        self._repaint()
+
+    def watch_mode(self, _value: str) -> None:
+        self._repaint()
+
+    def watch_model_label(self, _value: str) -> None:
+        self._repaint()
+
+    def watch_tool_count(self, _value: int) -> None:
         self._repaint()
 
     def watch_context_pct(self, _value: float) -> None:
@@ -818,57 +793,62 @@ class StatusBar(Static):
         pct = max(0.0, float(self.context_pct or 0.0))
         if pct <= 0:
             return Text()
-        out = Text(f"{pct:.0f}% ctx", style=self.context_style_for_pct(pct))
+        out = Text(f"ctx {pct:.0f}%", style=self.context_style_for_pct(pct))
         if pct > 85:
             out.append(" · compact soon", style="#f7768e")
         return out
 
-    def _status_label(self, label: str, *, base_style: str) -> Text:
-        out = Text(label, style=base_style)
+    def _left_status(self) -> Text:
+        out = Text()
+        if self.state == "idle":
+            out.append("●", style="#9ece6a")
+            out.append(" ready", style="bold #aeb6c8")
+        else:
+            spin = SPINNER_FRAMES[self.spinner_frame % len(SPINNER_FRAMES)]
+            out.append(spin, style="#f9e2af")
+            out.append(" working", style="bold #d8dee9")
+        tool_count = max(0, int(self.tool_count or 0))
+        if tool_count > 0:
+            out.append(" · ", style="#6f778a")
+            out.append(str(tool_count), style="bold #aeb6c8")
+            out.append(" tools" if tool_count != 1 else " tool", style="#6f778a")
         ctx = self._context_text()
         if ctx.plain:
             out.append(" · ", style="#6f778a")
             out.append_text(ctx)
+        if self.state != "idle":
+            label = self._label()
+            out.append(" · ", style="#6f778a")
+            out.append(label, style="#6f778a")
+            if self.detail:
+                out.append(" · ", style="#6f778a")
+                out.append(truncate_cells(self.detail, 42), style="#aeb6c8")
+            elapsed = max(0.0, time.monotonic() - self.started_at) if self.started_at else 0.0
+            out.append(f" · {elapsed:.1f}s", style="#6f778a")
+        return out
+
+    def _right_status(self, available: int) -> Text:
+        out = Text()
+        mode_style = "bold #8bd5a4" if self.mode.upper() == "ACT" else "bold #7aa2f7"
+        out.append(self.mode.upper(), style=mode_style)
+        if self.model_label:
+            out.append(" · ", style="#6f778a")
+            out.append(truncate_cells(self.model_label, max(0, available - out.cell_len)), style="bold #aeb6c8")
+        if self.state != "idle":
+            out.append(" · esc cancel", style="#6f778a")
         return out
 
     def _repaint(self) -> None:
         width = max(20, self.size.width or 80)
+        left = self._left_status()
+        right = self._right_status(max(12, width - left.cell_len - 4))
+        if left.cell_len + right.cell_len + 3 > width:
+            left = Text(truncate_cells(left.plain, max(8, width - right.cell_len - 3)), style="#6f778a")
+        gap = max(1, width - left.cell_len - right.cell_len)
         text = Text()
-        if self.state == "idle":
-            label = self._status_label("ready", base_style="#6f778a")
-            label.pad_left(1)
-            label.pad_right(1)
-            dash_total = max(0, width - label.cell_len - 2)
-            left = dash_total // 2
-            right = dash_total - left
-            text.append("─" * left, style="#3b4252")
-            text.append_text(label)
-            text.append("─" * right, style="#3b4252")
-        else:
-            spin = SPINNER_FRAMES[self.spinner_frame % len(SPINNER_FRAMES)]
-            label = self._label()
-            elapsed = max(0.0, time.monotonic() - self.started_at) if self.started_at else 0.0
-            hint = " esc cancel "
-            style = {
-                "thinking": "#e0af68",
-                "waiting": "#e0af68",
-                "tool": "#7dcfff",
-                "text": "#7dcfff",
-            }.get(self.state, "#7dcfff")
-            middle = Text(f" {spin} ", style=style)
-            status_label = self._status_label(label, base_style=style)
-            middle.append_text(status_label)
-            if self.detail:
-                middle.append(" · ", style="#6f778a")
-                middle.append(self.detail, style=style)
-            middle.append(f" · {elapsed:.1f}s ", style=style)
-            dash_total = max(0, width - middle.cell_len - cell_len(hint) - 2)
-            left = max(2, dash_total // 2)
-            right = max(2, dash_total - left)
-            text.append("─" * left, style="#3b4252")
-            text.append_text(middle)
-            text.append("─" * right, style="#3b4252")
-            text.append(hint, style="#6f778a")
+        text.append_text(left)
+        text.append(" " * gap)
+        text.append_text(right)
         self.update(text)
 
 
@@ -967,12 +947,14 @@ class PromptArea(TextArea):
     DEFAULT_CSS = """
     PromptArea {
         dock: bottom;
+        width: 1fr;
+        min-width: 10;
         height: auto;
         min-height: 3;
         max-height: 10;
         border: none;
-        padding: 0 1;
-        background: #171a23;
+        padding: 1 1 0 1;
+        background: #0f1018;
         color: #d8dee9;
         scrollbar-size-vertical: 0;
     }
@@ -1008,7 +990,7 @@ class PromptArea(TextArea):
             show_line_numbers=False,
             tab_behavior="focus",
             compact=True,
-            placeholder=("Message… Enter sends · Shift+Enter newline · / commands · @ files"),
+            placeholder="Message...",
         )
         self._terminal_associated_text_buffer = ""
 

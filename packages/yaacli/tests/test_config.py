@@ -704,3 +704,115 @@ def test_ensure_config_dir_gitignore_appends_missing(tmp_path: Path) -> None:
     assert "message_history/" in content
     assert "worktrees/" in content
     assert "custom_ignore/" in content  # User entries preserved
+
+
+# =============================================================================
+# Theme persistence
+# =============================================================================
+
+
+def test_upsert_toml_table_key_replaces_existing_value_and_keeps_comment() -> None:
+    from yaacli.config import _upsert_toml_table_key
+
+    text = (
+        "[display]\n"
+        'code_theme = "dark"\n'
+        'theme = "tokyo-night"  # my preferred\n'
+        "show_token_usage = true\n"
+        "[session]\nfoo = 1\n"
+    )
+    updated = _upsert_toml_table_key(text, "display", "theme", '"cappuccino"')
+
+    # Value swapped, inline comment preserved (spacing normalized to one space).
+    assert 'theme = "cappuccino" # my preferred' in updated
+    assert 'code_theme = "dark"' in updated
+    assert "show_token_usage = true" in updated
+    # Other tables survive untouched.
+    assert "[session]\nfoo = 1" in updated
+    # And it round-trips through a real TOML parser.
+    import tomllib
+
+    assert tomllib.loads(updated)["display"]["theme"] == "cappuccino"
+
+
+def test_upsert_toml_table_key_inserts_when_table_lacks_key() -> None:
+    from yaacli.config import _upsert_toml_table_key
+
+    text = '[display]\n# highlight\ncode_theme = "dark"\n'
+    updated = _upsert_toml_table_key(text, "display", "theme", '"cappuccino"')
+
+    assert 'theme = "cappuccino"' in updated
+    assert 'code_theme = "dark"' in updated
+    import tomllib
+
+    assert tomllib.loads(updated)["display"]["theme"] == "cappuccino"
+
+
+def test_upsert_toml_table_key_appends_missing_table() -> None:
+    from yaacli.config import _upsert_toml_table_key
+
+    text = '[general]\nmodel = "x"\n'
+    updated = _upsert_toml_table_key(text, "display", "theme", '"cappuccino"')
+
+    assert "[display]" in updated
+    assert 'theme = "cappuccino"' in updated
+    assert 'model = "x"' in updated
+    import tomllib
+
+    parsed = tomllib.loads(updated)
+    assert parsed["display"]["theme"] == "cappuccino"
+    assert parsed["general"]["model"] == "x"
+
+
+def test_save_display_theme_creates_and_round_trips(
+    config_manager: ConfigManager,
+    temp_config_dir: Path,
+    clean_env: None,
+) -> None:
+    """Saving a theme writes config.toml and the value reloads."""
+    config_manager.load()  # no config.toml yet -> no source file
+    written = config_manager.save_display_theme("cappuccino")
+
+    assert written is not None
+    assert written == temp_config_dir / "config.toml"
+    assert 'theme = "cappuccino"' in written.read_text()
+
+    reloaded = ConfigManager(config_dir=temp_config_dir, project_dir=config_manager.project_dir).load()
+    assert reloaded.display.theme == "cappuccino"
+
+
+def test_save_display_theme_updates_value_in_place(
+    config_manager: ConfigManager,
+    temp_config_dir: Path,
+    clean_env: None,
+) -> None:
+    config_file = temp_config_dir / "config.toml"
+    config_file.write_text('[display]\ncode_theme = "dark"\ntheme = "tokyo-night"\nshow_token_usage = true\n')
+    config_manager.load()
+
+    written = config_manager.save_display_theme("cappuccino")
+
+    assert written == config_file
+    content = config_file.read_text()
+    assert 'theme = "cappuccino"' in content
+    assert "tokyo-night" not in content
+    # Sibling keys are preserved.
+    assert 'code_theme = "dark"' in content
+    assert "show_token_usage = true" in content
+
+
+def test_display_theme_env_override(
+    config_manager: ConfigManager,
+    temp_config_dir: Path,
+    clean_env: None,
+) -> None:
+    """YAACLI_DISPLAY_THEME overrides config.toml [display] theme."""
+    (temp_config_dir / "config.toml").write_text('[display]\ntheme = "tokyo-night"\n')
+    os.environ["YAACLI_DISPLAY_THEME"] = "cappuccino"
+
+    config = config_manager.load()
+    assert config.display.theme == "cappuccino"
+
+
+def test_default_display_theme_is_tokyo_night() -> None:
+    assert YaacliConfig().display.theme == "tokyo-night"

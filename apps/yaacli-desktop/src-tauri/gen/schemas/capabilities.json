@@ -1,1 +1,16 @@
-{"default":{"identifier":"default","description":"Minimal capability set for the YAACLI Desktop main window","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","notification:default","updater:default"]}}
+{
+  "default": {
+    "description": "Minimal capability set for the YAACLI Desktop main window",
+    "identifier": "default",
+    "local": true,
+    "permissions": [
+      "core:default",
+      "dialog:allow-open",
+      "notification:default",
+      "updater:default"
+    ],
+    "windows": [
+      "main"
+    ]
+  }
+}

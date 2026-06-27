@@ -114,6 +114,8 @@ refresh_on_startup = true
 [display]
 # Code highlighting theme ("dark" or "light")
 code_theme = "dark"
+# Console color theme. Switch at runtime with /theme (e.g. cappuccino, tokyo-night)
+theme = "tokyo-night"
 # Maximum lines to show for tool results
 max_tool_result_lines = 5
 # Maximum length for tool argument display
