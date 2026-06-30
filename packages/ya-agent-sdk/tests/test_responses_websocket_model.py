@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.providers.openai import OpenAIProvider
 from ya_agent_sdk.agents.models.websocket import (
@@ -146,6 +147,94 @@ async def test_websocket_response_stream_filters_non_response_events_and_closes_
 
 
 @pytest.mark.asyncio
+async def test_websocket_response_stream_ignores_unsupported_response_events() -> None:
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+            self.closed = False
+            self._messages = iter([
+                json.dumps({
+                    "type": "response.metadata",
+                    "sequence_number": 0,
+                    "metadata": {"tool_call": {}, "tool_response": {}},
+                }),
+                json.dumps({
+                    "type": "response.preflight",
+                    "sequence_number": 0,
+                    "metadata": {"accepted": True},
+                }),
+                json.dumps({
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {
+                        "id": "resp_1",
+                        "created_at": 1,
+                        "model": "gpt-5.5",
+                        "object": "response",
+                        "output": [],
+                        "parallel_tool_calls": True,
+                        "tool_choice": "auto",
+                        "tools": [],
+                        "status": "in_progress",
+                    },
+                }),
+                json.dumps({
+                    "type": "response.completed",
+                    "sequence_number": 2,
+                    "response": {
+                        "id": "resp_1",
+                        "created_at": 1,
+                        "model": "gpt-5.5",
+                        "object": "response",
+                        "output": [],
+                        "parallel_tool_calls": True,
+                        "tool_choice": "auto",
+                        "tools": [],
+                        "status": "completed",
+                    },
+                }),
+            ])
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __anext__(self) -> str:
+            try:
+                return next(self._messages)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+        async def send(self, message: str) -> None:
+            self.sent.append(message)
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            self.closed = True
+            self.close_code = code
+            self.close_reason = reason
+
+    fake = FakeConnection()
+
+    async def connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return fake
+
+    stream = _WebsocketResponseStream(
+        url="wss://example.test/responses",
+        headers={},
+        payload={"type": "response.create"},
+        connect=connect,
+    )
+
+    async with stream:
+        events = [event async for event in stream]
+
+    assert [event.type for event in events] == ["response.created", "response.completed"]
+    assert stream.events_seen == 2
+    assert fake.closed is True
+    assert fake.close_code == 1000
+    assert fake.close_reason == "responses stream completed"
+
+
+@pytest.mark.asyncio
 async def test_websocket_response_stream_sends_cancel_on_early_scope_exit() -> None:
     class FakeConnection:
         def __init__(self) -> None:
@@ -220,6 +309,42 @@ async def test_websocket_response_stream_sends_cancel_on_early_scope_exit() -> N
         '{"type":"response.create"}',
         '{"type":"response.cancel","response_id":"resp_early"}',
     ]
+
+
+@pytest.mark.asyncio
+async def test_websocket_model_does_not_fallback_after_successful_upgrade() -> None:
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __anext__(self) -> str:
+            raise StopAsyncIteration
+
+        async def send(self, message: str) -> None:
+            self.sent.append(message)
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            pass
+
+    fake = FakeConnection()
+
+    async def connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return fake
+
+    stream = _WebsocketResponseStream(
+        url="wss://example.test/responses",
+        headers={},
+        payload={"type": "response.create"},
+        connect=connect,
+    )
+    model = WebsocketResponsesModel("gpt-5", provider=OpenAIProvider(api_key="test-key"))
+
+    async with stream:
+        assert stream.websocket_upgraded is True
+        assert model._should_fallback_from(UnexpectedModelBehavior("parse failed"), stream) is False
 
 
 @pytest.mark.asyncio
