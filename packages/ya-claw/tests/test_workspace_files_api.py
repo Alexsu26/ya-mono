@@ -100,7 +100,7 @@ def test_workspace_files_list_read_and_download_use_virtual_paths(client: TestCl
         },
     )
     mounted_workspace.mkdir(parents=True, exist_ok=True)
-    (mounted_workspace / "notes.txt").write_text("hello, 世界\n", encoding="utf-8")
+    (mounted_workspace / "notes.txt").write_bytes("hello, 世界\n".encode())
     (mounted_workspace / "artifact.bin").write_bytes(b"\x00\xffartifact")
     (mounted_workspace / ".secret").write_text("hidden", encoding="utf-8")
     (mounted_workspace / "src").mkdir()
