@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,11 +29,16 @@ from pydantic_ai import BinaryContent
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from ya_agent_environment.shell import BackgroundProcess
 from ya_agent_sdk.agents.main import AgentInterrupted
-from ya_agent_sdk.context import TaskManager
+from ya_agent_sdk.context import ResumableState, TaskManager
 
 # Import the components we're testing
 from yaacli.app import TUIApp, TUIMode, TUIState
-from yaacli.app.tui import PendingAttachment, _is_benign_contextvar_cleanup_error
+from yaacli.app.tui import (
+    PendingAttachment,
+    _BoundedOutputTail,
+    _format_direct_shell_preview,
+    _is_benign_contextvar_cleanup_error,
+)
 from yaacli.clipboard import ClipboardImage, ClipboardImageReadResult
 from yaacli.config import CommandDefinition, GeneralConfig, ModelProfileConfig, YaacliConfig
 from yaacli.model_profiles import ResolvedModelProfile, build_model_profiles
@@ -767,6 +775,55 @@ async def test_tui_app_shell_commands_are_added_to_prompt_history():
     assert app._prompt_history == ["!git status"]
 
 
+def test_direct_shell_tail_is_bounded_and_reports_truncation() -> None:
+    """Direct shell output keeps only its tail and makes discarded bytes visible."""
+    tail = _BoundedOutputTail(max_bytes=8)
+    tail.append(b"discard-me")
+    tail.append(b"-tail")
+
+    assert tail.retained_bytes == 8
+    assert tail.total_bytes == len(b"discard-me-tail")
+    assert tail.truncated is True
+    assert tail.text() == b"discard-me-tail"[-8:].decode()
+
+    preview = _format_direct_shell_preview(tail, stream_name="stdout", max_lines=100)
+    assert "stdout truncated" in preview
+    assert "last 8 of 15 bytes" in preview
+
+
+@pytest.mark.asyncio
+async def test_tui_app_direct_shell_drains_large_stdout_and_stderr_with_bounded_tails(monkeypatch) -> None:
+    """Large direct-command streams finish, preserve tails, and report truncation."""
+    monkeypatch.setattr("yaacli.app.tui._DIRECT_SHELL_OUTPUT_TAIL_BYTES", 256)
+    app = TUIApp(config=MockConfig(), config_manager=MockConfigManager())
+    script = (
+        "import sys; "
+        "sys.stdout.buffer.write(b'OUT-START' + b'x' * 131072 + b'OUT-END\\n'); "
+        "sys.stdout.flush(); "
+        "sys.stderr.buffer.write(b'ERR-START' + b'y' * 131072 + b'ERR-END\\n'); "
+        "sys.stderr.flush(); "
+        "sys.exit(7)"
+    )
+    command = (
+        subprocess.list2cmdline([sys.executable, "-c", script])
+        if sys.platform == "win32"
+        else shlex.join([sys.executable, "-c", script])
+    )
+
+    await asyncio.wait_for(app._execute_shell_command(command), timeout=10)
+
+    output = "\n".join(app._output_lines)
+    stdout_preview = next(block for block in app._output_lines if "stdout truncated" in block)
+    stderr_preview = next(block for block in app._output_lines if "stderr truncated" in block)
+    assert "stdout truncated; retained the last 256" in stdout_preview
+    assert "stderr truncated; retained the last 256" in stderr_preview
+    assert "OUT-END" in stdout_preview
+    assert "ERR-END" in stderr_preview
+    assert "OUT-START" not in stdout_preview
+    assert "ERR-START" not in stderr_preview
+    assert "Exit code: 7" in output
+
+
 def test_tui_app_input_keybindings_are_eager():
     """Ensure focused input keys win over TextArea defaults."""
     config = MockConfig()
@@ -1364,6 +1421,77 @@ def test_tui_app_saves_and_restores_display_messages(tmp_path: Path) -> None:
     assert restored._message_history == []
     assert restored._display_replay.snapshot() == [{"type": "TEXT_MESSAGE_CHUNK", "messageId": "m1", "delta": "hello"}]
     assert any("hello" in line for line in restored._output_lines)
+
+
+@pytest.mark.parametrize(
+    ("display_payload", "max_bytes"),
+    [
+        (json.dumps([{"type": "TEXT_MESSAGE_CHUNK", "messageId": "new", "delta": "new"}]), 1),
+        ("{invalid", 1024),
+    ],
+)
+def test_tui_app_skipped_display_replay_clears_prior_session_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    display_payload: str,
+    max_bytes: int,
+) -> None:
+    """Unsafe replay data must not leave the previous session visible or retained."""
+    app = TUIApp(config=MockConfig(), config_manager=MockConfigManager())
+    app._message_history = [ModelRequest(parts=[UserPromptPart(content="old history")])]
+    app._display_replay.append({"type": "TEXT_MESSAGE_CHUNK", "messageId": "old", "delta": "prior-session-output"})
+    app._restore_output_from_display_events(app._display_replay.snapshot())
+
+    load_dir = tmp_path / "session-b"
+    load_dir.mkdir()
+    (load_dir / "message_history.json").write_bytes(b"[]")
+    (load_dir / "display_messages.json").write_text(display_payload)
+    monkeypatch.setattr("yaacli.app.tui._MAX_DISPLAY_REPLAY_LOAD_BYTES", max_bytes)
+
+    app._load_history(str(load_dir))
+
+    assert app._message_history == []
+    assert app._display_replay.snapshot() == []
+    assert all("prior-session-output" not in line for line in app._output_lines)
+
+
+def test_tui_app_state_restore_failure_keeps_prior_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = TUIApp(config=MockConfig(), config_manager=MockConfigManager())
+    app._message_history = [ModelRequest(parts=[UserPromptPart(content="old history")])]
+    app._display_replay.append({"type": "TEXT_MESSAGE_CHUNK", "messageId": "old", "delta": "prior-session-output"})
+    app._restore_output_from_display_events(app._display_replay.snapshot())
+    prior_history = app._message_history
+    prior_replay = app._display_replay.snapshot()
+    prior_output = list(app._output_lines)
+    app._runtime = MagicMock()
+    app.runtime.ctx.shell_env = {"EXISTING": "value"}
+    app.runtime.ctx.steering_messages = ["old steering"]
+    failing_state = MagicMock()
+
+    def fail_after_partial_restore(ctx: MagicMock) -> None:
+        ctx.shell_env = {**ctx.shell_env, "INCOMING": "leak"}
+        ctx.steering_messages = ["new steering"]
+        raise RuntimeError("incompatible state")
+
+    failing_state.restore.side_effect = fail_after_partial_restore
+    monkeypatch.setattr(ResumableState, "model_validate_json", MagicMock(return_value=failing_state))
+
+    load_dir = tmp_path / "session-b"
+    load_dir.mkdir()
+    (load_dir / "message_history.json").write_bytes(b"[]")
+    (load_dir / "context_state.json").write_text("{}")
+
+    app._load_history(str(load_dir))
+
+    assert app._message_history is prior_history
+    assert app._display_replay.snapshot() == prior_replay
+    assert app._output_lines[:-1] == prior_output
+    assert "Error loading session: incompatible state" in app._output_lines[-1]
+    assert app.runtime.ctx.shell_env == {"EXISTING": "value"}
+    assert app.runtime.ctx.steering_messages == ["old steering"]
 
 
 def test_tui_app_persist_stream_recoverable_state_updates_memory_only_on_interrupt():
