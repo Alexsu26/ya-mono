@@ -61,6 +61,8 @@ This section is the maintainer index for implementation details that affect code
 - SQLite is the default durable store at `~/.ya-claw/ya_claw.sqlite3`.
 - `YA_CLAW_DATA_DIR` defaults to `~/.ya-claw/data`.
 - `YA_CLAW_WORKSPACE_DIR` defaults to `~/.ya-claw/data/workspace`.
+- Browser workspace downloads are capped at 100 MiB by default; configure `YA_CLAW_WORKSPACE_DOWNLOAD_MAX_BYTES` to change the enforced per-file limit.
+- `GET /api/v1/sessions/{session_id}/workspace/files` uses stable case-insensitive name ordering. Send `limit`, then continue with the opaque `next_cursor` while `has_more` is true; the name-key cursor prevents inserts or deletes before the cursor from shifting later pages. `offset`, `next_offset`, and the `truncated` alias remain available for backwards compatibility, but new clients should use `cursor`/`next_cursor`.
 - The default Docker workspace image is `ghcr.io/wh1isper/ya-claw-workspace:latest`.
 - Session metadata lives in the database; committed continuity blobs live in the local run store.
 
@@ -338,8 +340,9 @@ Every HTTP route except `/healthz` expects `Authorization: Bearer <YA_CLAW_API_T
 - `GET /healthz` — service health probe with storage and runtime component status
 - `POST /api/v1/sessions` — create a session with optional first queued run and return JSON
 - `POST /api/v1/sessions:stream` — create a session with a first run and stream foreground SSE events
-- `GET /api/v1/sessions` — list sessions
-- `GET /api/v1/sessions/{session_id}` — inspect a session plus paginated runs, top-level committed state, and optional compacted message replay lists
+- `GET /api/v1/sessions` — list sessions using the backwards-compatible unpaginated response; optional keyset parameters are available for transitional clients
+- `GET /api/v1/sessions/page` — list lightweight session pages ordered by `(updated_at, id)`, with `total`, `has_more`, and continuation anchors; this endpoint skips live Docker reconciliation and latest-run output text by default
+- `GET /api/v1/sessions/{session_id}` — inspect a session plus paginated runs, top-level committed state, and optional compacted message replay lists; set `include_head_payload=false` when only the run page is needed
 - `POST /api/v1/sessions/{session_id}/memory:extract` — enqueue a background memory extract run for the source session
 - `POST /api/v1/sessions/{session_id}/memory:summarize` — enqueue a background memory summary run for the source session
 - `POST /api/v1/sessions/{session_id}/runs` — create a run under a session and return JSON

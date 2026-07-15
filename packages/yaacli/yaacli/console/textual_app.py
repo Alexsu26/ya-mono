@@ -38,7 +38,7 @@ import asyncio
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -1235,6 +1235,8 @@ class YaacliTextualApp(App[None]):
         Binding("ctrl+r", "tool_rerun", "Rerun last tool", show=False),
     ]
 
+    _output_log: StreamingRichLog
+
     def __init__(
         self,
         *,
@@ -1277,7 +1279,7 @@ class YaacliTextualApp(App[None]):
 
         # Widgets — composed in compose()
         self._header = HeaderBar()
-        self._log = StreamingRichLog(
+        self._output_log = StreamingRichLog(
             id="log",
             min_width=1,
             wrap=True,
@@ -1303,12 +1305,12 @@ class YaacliTextualApp(App[None]):
         self._status = StatusBar()
         self._scroll_indicator = ScrollIndicator()
         self._sink = TextualSink(
-            self._log,
+            self._output_log,
             self._live,
             max_log_lines=getattr(getattr(config, "display", None), "max_output_lines", 0),
             theme_name=self._theme_name,
         )
-        self._log.on_width_changed = self._sink.reflow_streaming_text
+        self._output_log.on_width_changed = self._sink.reflow_streaming_text
         # Wire the auto-scroll watchdog: each time history grows, decide
         # whether to follow it or to bump the "↓ N new lines" indicator.
         self._sink._on_history_grew = self._on_history_grew
@@ -1355,7 +1357,7 @@ class YaacliTextualApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield self._header
-        yield self._log
+        yield self._output_log
         yield self._tool_details
         yield self._scroll_indicator
         yield self._mention_menu
@@ -1374,10 +1376,10 @@ class YaacliTextualApp(App[None]):
         # RichLog surface (whose CSS defaults to the default-theme base).
         self._apply_theme()
         # Allow text selection in the log so users can drag-select.
-        self._log.can_focus = True
+        self._output_log.can_focus = True
         self._tool_details.can_focus = True
         # Watch the log's scroll position so we can detect manual scroll.
-        self.watch(self._log, "scroll_y", self._on_log_scroll_y_changed, init=False)
+        self.watch(self._output_log, "scroll_y", self._on_log_scroll_y_changed, init=False)
         # Wire slash menu: feed it the registered commands. The menu is then
         # updated on every TextArea.Changed event (see ``on_text_area_changed``).
         from yaacli.console.palette import DEFAULT_COMMANDS
@@ -1779,13 +1781,13 @@ class YaacliTextualApp(App[None]):
             return False
         if self._input.text.strip():
             return False
-        if self._log.max_scroll_y <= 0:
+        if self._output_log.max_scroll_y <= 0:
             return False
         if key == "up":
-            self._log.action_scroll_up()
+            self._output_log.action_scroll_up()
             self._pause_history_auto_scroll()
         else:
-            self._log.action_scroll_down()
+            self._output_log.action_scroll_down()
             self._handle_log_scroll()
         return True
 
@@ -1833,7 +1835,7 @@ class YaacliTextualApp(App[None]):
 
     def _is_at_bottom(self) -> bool:
         """True iff the RichLog is scrolled to the very bottom."""
-        return self._log.scroll_y >= max(0.0, self._log.max_scroll_y - 0.5)
+        return self._output_log.scroll_y >= max(0.0, self._output_log.max_scroll_y - 0.5)
 
     def _on_history_grew(self) -> None:
         """Called by TextualSink whenever a block was committed to RichLog.
@@ -1927,7 +1929,7 @@ class YaacliTextualApp(App[None]):
     def _render_transcript_entries(self, entries: list[dict[str, Any]]) -> None:
         self._restoring_transcript = True
         try:
-            self._log.clear()
+            self._output_log.clear()
             self._sink.clear_history_metadata()
             for entry in entries:
                 kind = str(entry.get("kind") or "system")
@@ -2037,12 +2039,12 @@ class YaacliTextualApp(App[None]):
             self._render_tool_details_view()
         if self._is_at_bottom() and not self._user_scrolled_up:
             # Sticky to bottom — clear any indicator + ensure auto_scroll on.
-            self._log.auto_scroll = True
+            self._output_log.auto_scroll = True
             self._pending_lines_while_scrolled = 0
             self._scroll_indicator.pending = 0
             return
         # User is scrolled up — keep auto_scroll off and bump pending counter.
-        self._log.auto_scroll = False
+        self._output_log.auto_scroll = False
         self._pending_lines_while_scrolled += 1
         self._scroll_indicator.pending = self._pending_lines_while_scrolled
 
@@ -2050,29 +2052,29 @@ class YaacliTextualApp(App[None]):
         """Manual-scroll callback. Wired via the RichLog's scroll_y watcher."""
         if self._is_at_bottom():
             # User scrolled back to the bottom — re-arm.
-            self._log.auto_scroll = True
+            self._output_log.auto_scroll = True
             self._user_scrolled_up = False
             self._pending_lines_while_scrolled = 0
             self._scroll_indicator.pending = 0
         else:
             # User scrolled away from bottom — pause auto-scroll.
             self._user_scrolled_up = True
-            self._log.auto_scroll = False
+            self._output_log.auto_scroll = False
 
     def action_scroll_to_bottom(self) -> None:
         if self._tool_details_active:
             self._hide_tool_details_view()
-        self._log.scroll_end(animate=False)
-        self._log.auto_scroll = True
+        self._output_log.scroll_end(animate=False)
+        self._output_log.auto_scroll = True
         self._user_scrolled_up = False
         self._pending_lines_while_scrolled = 0
         self._scroll_indicator.pending = 0
 
     def action_page_up(self) -> None:
-        self._log.action_page_up()
+        self._output_log.action_page_up()
 
     def action_page_down(self) -> None:
-        self._log.action_page_down()
+        self._output_log.action_page_down()
 
     def action_search_prompt(self) -> None:
         self._set_prompt_text("/search ")
@@ -2186,7 +2188,7 @@ class YaacliTextualApp(App[None]):
         target = self._sink.marker_entry_index(
             marker,
             direction,
-            self._log.scroll_y,
+            self._output_log.scroll_y,
             skip_entry_index=skip_entry_index,
         )
         if target is None:
@@ -2201,14 +2203,14 @@ class YaacliTextualApp(App[None]):
         return True
 
     def _pause_history_auto_scroll(self) -> None:
-        self._log.auto_scroll = False
+        self._output_log.auto_scroll = False
         self._user_scrolled_up = True
 
     def _show_tool_details_view(self) -> bool:
         if not self._render_tool_details_view():
             return False
         self._tool_details_active = True
-        self._log.display = False
+        self._output_log.display = False
         self._tool_details.display = True
         self._live.display = False
         self._tool_details.scroll_home(animate=False)
@@ -2218,7 +2220,7 @@ class YaacliTextualApp(App[None]):
     def _hide_tool_details_view(self) -> None:
         self._tool_details_active = False
         self._tool_details.display = False
-        self._log.display = True
+        self._output_log.display = True
         self._live.display = True
         self._input.focus()
 
@@ -2228,13 +2230,13 @@ class YaacliTextualApp(App[None]):
         if not blocks:
             return False
 
-        width = max(40, self._tool_details.size.width or self._log.size.width or 100)
+        width = max(40, self._tool_details.size.width or self._output_log.size.width or 100)
         console = RichConsole(
             theme=build_theme(self._theme_name),
             force_terminal=True,
             color_system="truecolor",
             width=width,
-            height=max(1, self._tool_details.size.height or self._log.size.height or 25),
+            height=max(1, self._tool_details.size.height or self._output_log.size.height or 25),
         )
         title = Text()
         title.append("Tool Details", style="console.tool.name")
@@ -2352,9 +2354,8 @@ class YaacliTextualApp(App[None]):
             ) as stream:
                 await session.stream(stream)
                 try:
-                    if hasattr(stream, "all_messages") and callable(stream.all_messages):
-                        self._message_history = list(stream.all_messages())
-                        self._save_message_history_snapshot()
+                    self._message_history = stream.recoverable_messages()
+                    self._save_message_history_snapshot()
                 except Exception:
                     logger.debug("Could not persist message history", exc_info=True)
                 run = getattr(stream, "run", None)
@@ -2430,7 +2431,7 @@ class YaacliTextualApp(App[None]):
             self._message_history = []
             self._current_context_tokens = 0
             self._refresh_context_status()
-            self._log.clear()
+            self._output_log.clear()
             self._sink.clear_history_metadata()
             if self._transcript is not None:
                 self._transcript.clear_transcript()
@@ -2915,9 +2916,9 @@ class YaacliTextualApp(App[None]):
         getter = getattr(self._config, "get_startup_model_profile", None)
         if callable(getter):
             try:
-                name, _profile = getter()
-                if name:
-                    return str(name)
+                resolved = getter()
+                if isinstance(resolved, tuple) and len(resolved) == 2 and resolved[0]:
+                    return str(resolved[0])
             except Exception:
                 logger.debug("Could not resolve startup model profile", exc_info=True)
         active_model = getattr(getattr(self._config, "general", None), "active_model", "")
@@ -2928,8 +2929,13 @@ class YaacliTextualApp(App[None]):
     def _get_model_profiles(self) -> dict[str, Any]:
         getter = getattr(self._config, "get_model_profiles", None)
         if callable(getter):
-            return dict(getter())
-        return dict(getattr(self._config, "models", None) or {})
+            profiles = getter()
+            if isinstance(profiles, Mapping):
+                return {str(key): value for key, value in profiles.items()}
+        profiles = getattr(self._config, "models", None)
+        if isinstance(profiles, Mapping):
+            return {str(key): value for key, value in profiles.items()}
+        return {}
 
     def _get_model_profile(self, name: str) -> Any:
         getter = getattr(self._config, "get_model_profile", None)
@@ -3072,8 +3078,8 @@ class YaacliTextualApp(App[None]):
                 self.theme = textual_theme
             except Exception:
                 logger.debug("Could not set Textual theme %s", textual_theme, exc_info=True)
-        self._log.styles.background = theme.base
-        self._log.styles.color = theme.text
+        self._output_log.styles.background = theme.base
+        self._output_log.styles.color = theme.text
         self._tool_details.styles.background = theme.base
         self._tool_details.styles.color = theme.text
 
@@ -3136,10 +3142,17 @@ async def run_textual_tui(
     *,
     verbose: bool = False,
     working_dir: Path | None = None,
+    model_profile_id: str | None = None,
 ) -> str | None:
     """Construct the runtime then run YaacliTextualApp."""
     cwd = working_dir or Path.cwd()
     async with AsyncExitStack() as stack:
+        from yaacli.model_profiles import get_model_profile
+
+        model_profile = get_model_profile(config, model_profile_id) if model_profile_id else None
+        if model_profile_id and model_profile is None:
+            raise ValueError(f"Unknown model profile: {model_profile_id}")
+
         browser = BrowserManager(config.browser)
         await stack.enter_async_context(browser)
 
@@ -3150,6 +3163,7 @@ async def run_textual_tui(
             browser_manager=browser,
             working_dir=cwd,
             config_dir=config_manager.config_dir,
+            model_profile=model_profile,
         )
         await stack.enter_async_context(runtime)
 
@@ -3157,12 +3171,14 @@ async def run_textual_tui(
         model_name: str | None = None
         active_model_name: str | None = None
         try:
-            from yaacli.runtime import resolve_startup_model_profile
+            if model_profile is not None:
+                profile = model_profile
+                active_model_name = model_profile.id
+            else:
+                from yaacli.runtime import resolve_startup_model_profile
 
-            active_name, _ = resolve_startup_model_profile(config)
-            active_model_name = active_name
-            profile = config.get_model_profile(active_name)
-            label = getattr(profile, "label", None) or active_name
+                active_model_name, profile = resolve_startup_model_profile(config)
+            label = getattr(profile, "label", None) or active_model_name
             model_name = f"{label} ({getattr(profile, 'model', '?')})"
         except Exception:
             logger.debug("Could not resolve startup model profile", exc_info=True)

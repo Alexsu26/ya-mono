@@ -2,7 +2,7 @@
 
 Resource management, lifecycle hooks, and environment implementations.
 
-> **Note**: Base abstractions (`Environment`, `FileOperator`, `Shell`, `ResourceRegistry`, etc.) are defined in the [y-agent-environment](https://github.com/wh1isper/y-agent-environment) protocol package. This SDK provides concrete implementations (`LocalEnvironment`, `SandboxEnvironment`).
+> **Note**: Base abstractions (`Environment`, `FileOperator`, `Shell`, `ResourceRegistry`, etc.) are defined in the [ya-agent-environment](https://github.com/wh1isper/ya-mono/tree/main/packages/ya-agent-environment) protocol package. This SDK provides concrete implementations (`LocalEnvironment`, `SandboxEnvironment`).
 
 ## Overview
 
@@ -54,10 +54,10 @@ async with LocalEnvironment(allowed_paths=[path]) as env:
 
 ```python
 # Register resources
-registry.set("browser", browser)  # Must implement Resource protocol (close())
+registry.set("database", database)  # Must implement Resource protocol (close())
 
 # Access resources
-browser = registry.get_typed("browser", Browser)
+database = registry.get_typed("database", DatabasePool)
 
 # Collect toolsets from all resources
 toolsets = await registry.get_toolsets()
@@ -66,7 +66,7 @@ toolsets = await registry.get_toolsets()
 await registry.close_all()
 ```
 
-> Full API: [y-agent-environment](https://github.com/wh1isper/y-agent-environment)
+> Full API: [ya-agent-environment](https://github.com/wh1isper/ya-mono/tree/main/packages/ya-agent-environment)
 
 ## Creating Custom Environments
 
@@ -157,7 +157,7 @@ class ContainerEnvironment(Environment):
 Resources can provide their own toolsets via `get_toolsets()`. This enables better encapsulation where a resource owns both its state and the tools that operate on it:
 
 ```python
-from y_agent_environment import BaseResource
+from ya_agent_environment import BaseResource
 
 class ProcessManager(BaseResource):
     async def setup(self) -> None:
@@ -196,28 +196,28 @@ Resources can be exported and restored across process restarts using factories.
 `BaseResource` is a convenience abstract class with async `close()` and default export/restore:
 
 ```python
-from y_agent_environment import BaseResource
+from ya_agent_environment import BaseResource
 
-class BrowserSession(BaseResource):
-    def __init__(self, browser: Browser):
-        self._browser = browser
+class ApiClientSession(BaseResource):
+    def __init__(self, client: ApiClient):
+        self._client = client
 
     async def setup(self) -> None:
         """Async initialization (called after factory, before restore_state)."""
-        await self._browser.connect()
+        await self._client.connect()
 
     async def close(self) -> None:
-        await self._browser.close()
+        await self._client.close()
 
     async def export_state(self) -> dict[str, Any]:
-        return {"cookies": await self._browser.get_cookies()}
+        return {"cursor": self._client.cursor}
 
     async def restore_state(self, state: dict[str, Any]) -> None:
-        await self._browser.set_cookies(state.get("cookies", []))
+        self._client.cursor = state.get("cursor")
 
     def get_toolsets(self) -> list[Any]:
-        """Provide browser tools."""
-        return [BrowserToolset(self._browser)]
+        """Provide tools backed by this API client."""
+        return [ApiClientToolset(self._client)]
 ```
 
 ### Using Factories
@@ -225,19 +225,18 @@ class BrowserSession(BaseResource):
 Factory functions receive the `Environment` instance, allowing access to `file_operator`, `shell`, `resources`, and `tmp_dir`:
 
 ```python
-from y_agent_environment import Environment
+from ya_agent_environment import Environment
 
-async def create_browser(env: Environment) -> BrowserSession:
-    return BrowserSession(
-        file_operator=env.file_operator,
-        tmp_dir=env.tmp_dir,
+async def create_api_client(env: Environment) -> ApiClientSession:
+    return ApiClientSession(
+        client=ApiClient(cache_dir=env.tmp_dir),
     )
 
 # First run: create and export
 async with LocalEnvironment() as env:
-    env.resources.register_factory("browser", create_browser)
-    browser = await env.resources.get_or_create("browser")
-    # ... use browser ...
+    env.resources.register_factory("api_client", create_api_client)
+    api_client = await env.resources.get_or_create("api_client")
+    # ... use api_client ...
     state = await env.export_resource_state()
     Path("state.json").write_text(state.model_dump_json())
 
@@ -245,16 +244,16 @@ async with LocalEnvironment() as env:
 state = ResourceRegistryState.model_validate_json(Path("state.json").read_text())
 async with LocalEnvironment(
     resource_state=state,
-    resource_factories={"browser": create_browser},
+    resource_factories={"api_client": create_api_client},
 ) as env:
-    browser = env.resources.get("browser")  # Already restored
+    api_client = env.resources.get("api_client")  # Already restored
 ```
 
 ### Chaining API
 
 ```python
 env = (LocalEnvironment()
-    .with_resource_factory("browser", create_browser)
+    .with_resource_factory("api_client", create_api_client)
     .with_resource_state(state))
 ```
 

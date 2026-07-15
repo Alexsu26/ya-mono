@@ -7,8 +7,19 @@ import httpx
 import pytest
 from pydantic_ai.exceptions import UserError
 from ya_oauth.types import OAuthAccount, TokenSnapshot
-from ya_oauth_provider.codex import CodexResponsesModel, build_codex_model, build_session_headers
-from ya_oauth_provider.http import OAuthBearerAuth, build_codex_headers
+from ya_oauth_provider.codex import (
+    CodexResponsesModel,
+    CodexWebsocketResponsesModel,
+    build_codex_model,
+    build_session_headers,
+    normalize_codex_responses_payload,
+)
+from ya_oauth_provider.http import (
+    CODEX_WEBSOCKET_BETA,
+    OAuthBearerAuth,
+    build_codex_headers,
+    build_codex_websocket_headers,
+)
 
 ACCESS_TOKEN_OLD = "fixture-access-token-old"  # noqa: S105
 ACCESS_TOKEN_NEW = "fixture-access-token-new"  # noqa: S105
@@ -72,12 +83,65 @@ def test_build_session_headers_uses_both_variants() -> None:
     }
 
 
+def test_build_codex_model_defaults_to_websocket_auto() -> None:
+    model = build_codex_model("gpt-5.5", token_source=FakeTokenSource())
+
+    assert isinstance(model, CodexWebsocketResponsesModel)
+    assert model.websocket_fallback_state.mode == "auto"
+
+
+def test_build_codex_model_can_force_http() -> None:
+    model = build_codex_model("gpt-5.5", token_source=FakeTokenSource(), websocket_mode="http")
+
+    assert isinstance(model, CodexResponsesModel)
+    assert not isinstance(model, CodexWebsocketResponsesModel)
+
+
 def test_build_codex_model_requires_streaming_for_non_stream_request() -> None:
     model = build_codex_model("gpt-5.5", token_source=FakeTokenSource())
 
-    assert isinstance(model, CodexResponsesModel)
+    assert isinstance(model, CodexWebsocketResponsesModel)
     with pytest.raises(UserError, match="requires streaming"):
         anyio.run(model.request, [], None, None)  # type: ignore[arg-type]
+
+
+def test_normalize_codex_responses_payload() -> None:
+    assert normalize_codex_responses_payload({
+        "model": "gpt-5.5",
+        "instructions": None,
+        "max_tokens": 1,
+        "max_completion_tokens": 2,
+        "max_output_tokens": 3,
+    }) == {"model": "gpt-5.5", "instructions": "", "store": False}
+
+
+@pytest.mark.asyncio
+async def test_build_codex_websocket_headers() -> None:
+    headers = await build_codex_websocket_headers(
+        FakeTokenSource(),
+        extra_headers={"session-id": "s1", "thread-id": "t1", "x-client-request-id": "t1"},
+    )
+
+    assert headers["Authorization"] == f"Bearer {ACCESS_TOKEN_OLD}"
+    assert headers["ChatGPT-Account-ID"] == "acct_123"
+    assert headers["X-OpenAI-Fedramp"] == "true"
+    assert headers["originator"] == "ya_agent_sdk"
+    assert "OpenAI-Beta" not in headers
+    assert "openai-beta" not in headers
+    assert headers["session-id"] == "s1"
+    assert headers["thread-id"] == "t1"
+    assert headers["x-client-request-id"] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_codex_websocket_model_adds_core_beta_header_once() -> None:
+    model = build_codex_model("gpt-5.5", token_source=FakeTokenSource())
+    assert isinstance(model, CodexWebsocketResponsesModel)
+
+    headers = await model._build_websocket_headers({"openai-beta": CODEX_WEBSOCKET_BETA})
+
+    assert headers["openai-beta"] == CODEX_WEBSOCKET_BETA
+    assert "OpenAI-Beta" not in headers
 
 
 @pytest.mark.asyncio
@@ -178,3 +242,101 @@ async def test_oauth_bearer_auth_refreshes_once_on_401() -> None:
     assert response.status_code == 200
     assert seen == [f"Bearer {ACCESS_TOKEN_OLD}", f"Bearer {ACCESS_TOKEN_NEW}"]
     assert source.refresh_count == 1
+
+
+@pytest.mark.asyncio
+async def test_websocket_model_falls_back_to_http_before_first_event(monkeypatch) -> None:
+    from contextlib import asynccontextmanager
+
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+    from pydantic_ai.models import ModelRequestParameters, StreamedResponse
+    from ya_agent_sdk.agents.models.websocket import WebsocketResponsesModel
+
+    class DummyStreamedResponse(StreamedResponse):
+        @property
+        def model_name(self) -> str:
+            return "dummy"
+
+        @property
+        def provider_name(self) -> str:
+            return "dummy"
+
+        @property
+        def provider_url(self) -> str:
+            return "https://example.test"
+
+        @property
+        def timestamp(self):  # type: ignore[no-untyped-def]
+            from datetime import UTC, datetime
+
+            return datetime.now(UTC)
+
+        async def _get_event_iterator(self):  # type: ignore[no-untyped-def]
+            if False:
+                yield None
+
+    model = build_codex_model("gpt-5.5", token_source=FakeTokenSource())
+    assert isinstance(model, WebsocketResponsesModel)
+
+    async def fail_create_stream(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise OSError("ws connect failed")
+
+    fallback_called = False
+
+    @asynccontextmanager
+    async def fake_http_stream(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal fallback_called
+        fallback_called = True
+        yield DummyStreamedResponse(ModelRequestParameters())
+
+    monkeypatch.setattr(model, "_create_websocket_stream", fail_create_stream)
+    monkeypatch.setattr(model, "_request_stream_http", fake_http_stream)
+
+    async with model.request_stream(
+        [ModelRequest(parts=[UserPromptPart(content="hello")])],
+        None,
+        ModelRequestParameters(),
+    ) as response:
+        assert isinstance(response, DummyStreamedResponse)
+
+    assert fallback_called is True
+    assert model.websocket_fallback_state.failure_count == 1
+    assert model.websocket_fallback_state.last_error is not None
+
+
+def test_websocket_payload_maps_responses_model_settings() -> None:
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+    from pydantic_ai.models import ModelRequestParameters
+
+    model = build_codex_model("gpt-5.5", token_source=FakeTokenSource())
+    assert isinstance(model, CodexWebsocketResponsesModel)
+
+    payload = anyio.run(
+        model._build_websocket_payload,
+        [ModelRequest(parts=[UserPromptPart(content="hello")])],
+        {
+            "max_tokens": 123,
+            "openai_service_tier": "flex",
+            "openai_store": True,
+            "openai_reasoning_effort": "high",
+            "openai_user": "user-1",
+            "openai_top_logprobs": 2,
+            "openai_logprobs": True,
+            "extra_body": {"metadata": {"source": "test"}},
+            "temperature": 0.7,
+        },
+        ModelRequestParameters(),
+    )
+
+    assert payload["type"] == "response.create"
+    assert payload["stream"] is True
+    assert payload["service_tier"] == "flex"
+    assert payload["store"] is False
+    assert payload["user"] == "user-1"
+    assert "top_logprobs" not in payload
+    assert payload["include"] == ["reasoning.encrypted_content"]
+    assert payload["metadata"] == {"source": "test"}
+    assert payload["instructions"] == ""
+    assert "max_output_tokens" not in payload
+    assert "temperature" not in payload
+    assert "message.output_text.logprobs" not in payload["include"]

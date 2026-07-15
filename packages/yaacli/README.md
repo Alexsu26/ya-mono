@@ -1,32 +1,40 @@
-# YAACLI
+# YAACLI CLI
 
 TUI reference implementation for [ya-agent-sdk](https://github.com/wh1isper/ya-mono/tree/main/packages/ya-agent-sdk).
 
 ## Usage
 
-Run from the workspace with uvx:
+Run with uvx:
 
 ```bash
-uvx --from ./packages/yaacli yaacli
+uvx --from 'yaacli[rs]' yaacli
 ```
 
-Install globally from the workspace with uv:
+Install with uv:
 
 ```bash
-uv tool install ./packages/yaacli
+uv tool install 'yaacli[rs]'
 yaacli
 ```
 
-Update the global install from the workspace with uv:
+`[rs]` installs the native Rust filesystem search binding. The equivalent extra-dependency form is:
 
 ```bash
-uv tool install --force ./packages/yaacli
+uv tool install yaacli --with ya-ripgrep-core
+```
+
+`ya-ripgrep-core` is a library dependency, so `--with` is the matching uv form; `--with-executables-from` applies to companion packages that also expose CLI executables.
+
+Update with uv:
+
+```bash
+uv tool upgrade yaacli
 ```
 
 Install with pip:
 
 ```bash
-pip install ./packages/yaacli
+pip install 'yaacli[rs]'
 yaacli
 ```
 
@@ -35,10 +43,6 @@ Run as a module:
 ```bash
 python -m yaacli
 ```
-
-## Configuration
-
-YAACLI stores global configuration under `~/.yaacli/` and project-level configuration under `.yaacli/`.
 
 ## Built-in Skills
 
@@ -61,7 +65,7 @@ cp packages/yaacli/.env.example packages/yaacli/.env
 
 YAACLI loads `.env` from `packages/yaacli/.env` and the current working directory.
 Provider API keys can live in that `.env` file or in `~/.yaacli/config.toml` under `[env]`.
-SDK and tool variables such as `YA_AGENT_*`, `YA_AGENT_BROWSER_USE_*`, and search API keys can also live in that same `.env` file because YAACLI loads it into the process environment at startup.
+SDK and tool variables such as `YA_AGENT_*` and search API keys can also live in that same `.env` file because YAACLI loads it into the process environment at startup.
 Use [`packages/ya-agent-sdk/.env.example`](../ya-agent-sdk/.env.example) as the reference list for SDK and tool variables.
 
 Codex OAuth credentials can be created once and reused from YAACLI:
@@ -82,15 +86,27 @@ model_cfg = "claude_200k"
 
 [model_profiles.fast]
 label = "Fast"
-model = "openai-responses:gpt-5-mini"
-model_settings = "openai_responses_low"
+model = "openai-responses:gpt-5.6-luna"
+model_settings = "openai_responses_luna"
+model_cfg = "gpt5_270k"
+
+[model_profiles.pro]
+label = "GPT-5.6 Pro"
+model = "openai-responses:gpt-5.6"
+model_settings = "openai_responses_pro"
+model_cfg = "gpt5_270k"
+
+[model_profiles.sol]
+label = "GPT-5.6 Sol"
+model = "openai-responses:gpt-5.6-sol"
+model_settings = "openai_responses_max"
 model_cfg = "gpt5_270k"
 
 [model_profiles.codex_oauth]
 label = "Codex OAuth"
 model = "oauth@codex:gpt-5.5"
 model_settings = "openai_responses_high"
-model_cfg = "gpt5_270k"
+model_cfg = "gpt5_350k"
 ```
 
 `[general]` is the startup fallback profile. The last selected profile is remembered in `~/.yaacli/state.json` and restored on the next launch when that profile still exists.

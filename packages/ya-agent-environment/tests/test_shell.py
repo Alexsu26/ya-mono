@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+import ya_agent_environment.shell as shell_module
 from ya_agent_environment import (
     BackgroundProcess,
     CompletedProcess,
@@ -98,6 +99,46 @@ class ConcreteShell(Shell):
             wait=_wait,
             kill=_kill,
         )
+
+
+async def _wait_for_completed_buffer(
+    shell: Shell,
+    process_id: str,
+    *,
+    timeout: float = 2.0,
+) -> OutputBuffer:
+    """Wait until a background process buffer is marked completed."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    while True:
+        shell._refresh_completed_tasks()
+        buffer = shell._output_buffers.get(process_id)
+        if buffer is not None and buffer.completed:
+            return buffer
+        if loop.time() >= deadline:
+            pytest.fail(f"Timed out waiting for process {process_id} to complete")
+        await asyncio.sleep(0.01)
+
+
+async def _wait_for_completed_results(
+    shell: Shell,
+    expected_count: int,
+    *,
+    timeout: float = 2.0,
+) -> list[CompletedProcess]:
+    """Poll consume_completed_results until expected results are available."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    results: list[CompletedProcess] = []
+
+    while True:
+        results.extend(shell.consume_completed_results())
+        if len(results) >= expected_count:
+            return results
+        if loop.time() >= deadline:
+            pytest.fail(f"Timed out waiting for {expected_count} completed results; got {len(results)}")
+        await asyncio.sleep(0.01)
 
 
 class DeferredShellFixture(DeferredShell):
@@ -426,7 +467,7 @@ async def test_drain_output_completed_process() -> None:
     """drain_output on a completed process returns content and cleans up."""
     shell = ConcreteShell(default_cwd=None)
     pid = await shell.start("echo hello")
-    await asyncio.sleep(0.05)
+    await _wait_for_completed_buffer(shell, pid)
     stdout, _stderr, is_running, exit_code = shell.drain_output(pid)
     assert not is_running
     assert exit_code == 0
@@ -461,7 +502,6 @@ async def test_output_buffer_line_truncation() -> None:
     """Lines exceeding _MAX_LINE_LENGTH should be truncated."""
     shell = ConcreteShell(default_cwd=None)
     pid = await shell.start("longline")
-    await asyncio.sleep(0.05)
     stdout, _stderr, is_running, _exit_code = await shell.wait_process(pid, timeout=5.0)
     assert not is_running
     # Each line should be capped at _MAX_LINE_LENGTH
@@ -475,7 +515,6 @@ async def test_output_buffer_line_count_bounded() -> None:
     # Generate more lines than buffer allows
     count = _MAX_BUFFER_LINES + 50
     pid = await shell.start(f"multiline {count}")
-    await asyncio.sleep(0.05)
     stdout, _stderr, is_running, _exit_code = await shell.wait_process(pid, timeout=5.0)
     assert not is_running
     lines = stdout.splitlines()
@@ -491,10 +530,8 @@ async def test_completed_results_from_buffer() -> None:
     """Completed background process should be consumable via consume_completed_results."""
     shell = ConcreteShell(default_cwd=None)
     pid = await shell.start("echo hello")
-    # Wait for task to complete and done callback to fire
-    await asyncio.sleep(0.05)
 
-    results = shell.consume_completed_results()
+    results = await _wait_for_completed_results(shell, 1)
     assert len(results) == 1
     r = results[0]
     assert isinstance(r, CompletedProcess)
@@ -506,19 +543,32 @@ async def test_completed_results_from_buffer() -> None:
     await shell.close()
 
 
-async def test_consume_completed_results_returns_and_clears() -> None:
-    """consume_completed_results() should return results and clear buffer."""
+async def test_consume_completed_results_retains_result_for_explicit_wait() -> None:
+    """Filter delivery should not prevent a later explicit wait from reading the result."""
     shell = ConcreteShell(default_cwd=None)
     pid = await shell.start("echo hello")
-    await asyncio.sleep(0.05)
 
-    results = shell.consume_completed_results()
+    results = await _wait_for_completed_results(shell, 1)
     assert len(results) == 1
     assert results[0].process_id == pid
     assert results[0].exit_code == 0
+    assert pid not in shell._output_buffers
+    assert pid in shell._retained_completed_results
 
-    # Second call returns empty
+    # Filter-facing and retained results are independent mutable objects.
+    results[0].stdout = "mutated filter result"
+
+    # Filter delivery remains one-time, while shell_wait can still consume the original result.
     assert shell.consume_completed_results() == []
+    stdout, stderr, is_running, exit_code = await shell.wait_process(pid, timeout=5.0)
+    assert "echo hello" in stdout
+    assert stderr == ""
+    assert is_running is False
+    assert exit_code == 0
+    assert pid not in shell._retained_completed_results
+
+    with pytest.raises(KeyError):
+        await shell.wait_process(pid, timeout=0)
     await shell.close()
 
 
@@ -534,9 +584,8 @@ async def test_completed_results_multiple_processes() -> None:
     pid1 = await shell.start("echo one")
     pid2 = await shell.start("echo two")
     pid3 = await shell.start("fail something")
-    await asyncio.sleep(0.05)
 
-    results = shell.consume_completed_results()
+    results = await _wait_for_completed_results(shell, 3)
     assert len(results) == 3
     pids = {r.process_id for r in results}
     assert pids == {pid1, pid2, pid3}
@@ -547,19 +596,24 @@ async def test_completed_results_multiple_processes() -> None:
     assert "error from" in failed.stderr
 
 
-async def test_completed_results_output_capped() -> None:
-    """Output exceeding _MAX_COMPLETED_OUTPUT_BYTES should be truncated."""
+async def test_completed_results_output_capped_without_truncating_later_wait() -> None:
+    """Filter output is capped without changing explicit wait output."""
     shell = ConcreteShell(default_cwd=None)
-    await shell.start("large")
-    await asyncio.sleep(0.1)
+    pid = await shell.start("large")
 
-    results = shell.consume_completed_results()
+    results = await _wait_for_completed_results(shell, 1, timeout=5.0)
     assert len(results) == 1
     r = results[0]
     # CJK output: 200 lines * 4096 chars * 3 bytes/char ~ 2.4 MB > 1 MB cap
     assert r.truncated
     assert len(r.stdout.encode("utf-8")) <= _MAX_COMPLETED_OUTPUT_BYTES
     assert len(r.stderr.encode("utf-8")) <= _MAX_COMPLETED_OUTPUT_BYTES
+
+    stdout, stderr, is_running, exit_code = await shell.wait_process(pid, timeout=0)
+    assert len(stdout.encode("utf-8")) > _MAX_COMPLETED_OUTPUT_BYTES
+    assert len(stderr.encode("utf-8")) > _MAX_COMPLETED_OUTPUT_BYTES
+    assert is_running is False
+    assert exit_code == 0
 
 
 async def test_cancelled_task_not_in_completed_results() -> None:
@@ -575,7 +629,6 @@ async def test_wait_consumes_so_filter_skips() -> None:
     """wait_process on completed process should consume it, so filter won't see it."""
     shell = ConcreteShell(default_cwd=None)
     pid = await shell.start("echo done")
-    await asyncio.sleep(0.05)
 
     # wait_process drains and cleans up the completed buffer
     stdout, _stderr, is_running, exit_code = await shell.wait_process(pid, timeout=1.0)
@@ -595,7 +648,6 @@ async def test_wait_direct_blocks_until_completion() -> None:
     _stdout, _stderr, is_running, exit_code = await shell.wait_process(pid, timeout=5.0)
     assert exit_code == 0
     assert not is_running
-    await asyncio.sleep(0.05)
     # Should not be in completed results (wait consumed it)
     assert shell.consume_completed_results() == []
 
@@ -603,8 +655,8 @@ async def test_wait_direct_blocks_until_completion() -> None:
 async def test_close_clears_buffers() -> None:
     """close() should clear output buffers."""
     shell = ConcreteShell(default_cwd=None)
-    await shell.start("echo hello")
-    await asyncio.sleep(0.05)
+    pid = await shell.start("echo hello")
+    await _wait_for_completed_buffer(shell, pid)
     assert len(shell._output_buffers) > 0 or len(shell.consume_completed_results()) > 0
     # Start a new one for close to kill
     await shell.start("sleep 10")
@@ -640,7 +692,7 @@ async def test_background_status_summary_completed() -> None:
     """Completed-but-unconsumed process should appear in summary."""
     shell = ConcreteShell(default_cwd=None)
     pid = await shell.start("echo hello")
-    await asyncio.sleep(0.05)
+    await _wait_for_completed_buffer(shell, pid)
     summary = shell.background_status_summary()
     assert summary is not None
     assert "<background-processes>" in summary
@@ -652,9 +704,9 @@ async def test_background_status_summary_completed() -> None:
 async def test_background_status_summary_mixed() -> None:
     """Both active and completed should appear in summary."""
     shell = ConcreteShell(default_cwd=None)
-    await shell.start("echo fast")
+    pid1 = await shell.start("echo fast")
     pid2 = await shell.start("sleep 10")
-    await asyncio.sleep(0.05)
+    await _wait_for_completed_buffer(shell, pid1)
     summary = shell.background_status_summary()
     assert summary is not None
     assert 'status="running"' in summary
@@ -663,13 +715,21 @@ async def test_background_status_summary_mixed() -> None:
     await shell.close()
 
 
-async def test_background_status_summary_after_consume() -> None:
-    """After consuming results, completed section should disappear."""
+async def test_background_status_summary_after_filter_delivery() -> None:
+    """Automatic summaries omit delivered results while explicit status still lists them."""
     shell = ConcreteShell(default_cwd=None)
-    await shell.start("echo hello")
-    await asyncio.sleep(0.05)
-    shell.consume_completed_results()
+    pid = await shell.start("echo hello")
+    await _wait_for_completed_results(shell, 1)
+
     assert shell.background_status_summary() is None
+    status = shell.background_status_summary_with_retained_results()
+    assert status is not None
+    assert f'id="{pid}"' in status
+    assert 'status="completed"' in status
+    assert 'result="available"' in status
+
+    await shell.wait_process(pid, timeout=0)
+    assert shell.background_status_summary_with_retained_results() is None
 
 
 async def test_has_background_activity() -> None:
@@ -677,14 +737,37 @@ async def test_has_background_activity() -> None:
     shell = ConcreteShell(default_cwd=None)
     assert not shell.has_background_activity
 
-    await shell.start("echo hello")
+    pid = await shell.start("echo hello")
     assert shell.has_background_activity  # active
 
-    await asyncio.sleep(0.05)
+    await _wait_for_completed_buffer(shell, pid)
     assert shell.has_background_activity  # completed in buffer
 
     shell.consume_completed_results()
-    assert not shell.has_background_activity  # all consumed
+    assert not shell.has_background_activity  # no new result awaits filter delivery
+    assert shell.has_retained_completed_results
+
+    await shell.wait_process(pid, timeout=0)
+    assert not shell.has_retained_completed_results
+
+
+async def test_extended_status_preserves_legacy_virtual_status_override() -> None:
+    """Extended status should retain custom Shell implementations of the old virtual method."""
+
+    class LegacyStatusShell(ConcreteShell):
+        def background_status_summary(self) -> str | None:
+            return "<custom-shell-status />"
+
+    shell = LegacyStatusShell(default_cwd=None)
+    pid = await shell.start("echo hello")
+    await _wait_for_completed_results(shell, 1)
+
+    status = shell.background_status_summary_with_retained_results()
+    assert status is not None
+    assert "<custom-shell-status />" in status
+    assert f'id="{pid}"' in status
+    assert 'result="available"' in status
+    await shell.close()
 
 
 async def test_background_status_summary_xml_escaping() -> None:
@@ -1037,7 +1120,7 @@ async def test_active_background_processes_excludes_completed_but_unconsumed() -
     shell = ConcreteShell(default_cwd=None)
     pid = await shell.start("echo done")
     # Wait for process to finish (don't drain)
-    await asyncio.sleep(0.1)
+    await _wait_for_completed_buffer(shell, pid)
     # Process completed but buffer not yet drained
     buf = shell._output_buffers.get(pid)
     if buf and buf.completed:
@@ -1169,11 +1252,61 @@ async def test_consume_completed_results_respects_cap() -> None:
     remaining_completed = [pid for pid, buf in shell._output_buffers.items() if buf.completed]
     assert len(remaining_completed) == 10
 
-    # Second call should consume the rest
+    # Second call should consume the rest. Retained explicit-wait results stay bounded.
     results2 = shell.consume_completed_results()
     assert len(results2) == 10
+    assert len(shell._retained_completed_results) == _MAX_COMPLETED_RESULTS
+    assert "proc-0" not in shell._retained_completed_results
+    assert "proc-10" in shell._retained_completed_results
+    assert f"proc-{count - 1}" in shell._retained_completed_results
+
+    assert shell._retained_completed_output_bytes == 0
+    await shell.close()
+
+
+async def test_retained_results_respect_total_byte_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retained results should evict oldest entries when the aggregate byte budget is exceeded."""
+    monkeypatch.setattr(shell_module, "_MAX_RETAINED_COMPLETED_OUTPUT_BYTES", 10)
+    shell = ConcreteShell(default_cwd=None)
+
+    for index in range(2):
+        pid = f"byte-proc-{index}"
+        shell._background_processes[pid] = BackgroundProcess(process_id=pid, command=f"cmd-{index}", cwd=None)
+        buf = OutputBuffer()
+        buf.stdout.append("123456")
+        buf.completed = True
+        buf.exit_code = 0
+        shell._output_buffers[pid] = buf
+
+    assert len(shell.consume_completed_results()) == 2
+    assert shell.has_retained_completed_results
+    assert shell._retained_completed_output_bytes == 6
+
+    status = shell.background_status_summary_with_retained_results()
+    assert status is not None
+    assert "byte-proc-0" not in status
+    assert "byte-proc-1" in status
+    with pytest.raises(KeyError):
+        await shell.wait_process("byte-proc-0", timeout=0)
+
+    stdout, _stderr, is_running, exit_code = await shell.wait_process("byte-proc-1", timeout=0)
+    assert stdout == "123456"
+    assert is_running is False
+    assert exit_code == 0
+    assert shell._retained_completed_output_bytes == 0
+    assert not shell.has_retained_completed_results
+
+
+async def test_close_clears_retained_results() -> None:
+    """Shell.close should clear retained results and byte accounting."""
+    shell = ConcreteShell(default_cwd=None)
+    await shell.start("echo hello")
+    await _wait_for_completed_results(shell, 1)
+    assert shell.has_retained_completed_results
 
     await shell.close()
+    assert not shell.has_retained_completed_results
+    assert shell._retained_completed_output_bytes == 0
 
 
 async def test_drain_output_cleans_stdin_streams() -> None:
@@ -1302,7 +1435,7 @@ async def test_send_signal_no_handler() -> None:
     """send_signal should raise KeyError for processes without signal support."""
     shell = ConcreteShell(default_cwd=None)
     pid = await shell.start("echo hello")
-    await asyncio.sleep(0.05)
+    await _wait_for_completed_buffer(shell, pid)
 
     # ConcreteShell doesn't provide send_signal in ExecutionHandle
     with pytest.raises(KeyError, match="does not support signals"):
@@ -1315,7 +1448,7 @@ async def test_signal_handler_cleanup_on_drain() -> None:
     """drain_output should clean up signal handlers for completed processes."""
     shell = SignalShell(default_cwd=None)
     pid = await shell.start("echo hello")
-    await asyncio.sleep(0.05)
+    await _wait_for_completed_buffer(shell, pid)
 
     assert pid in shell._signal_handlers
     shell.drain_output(pid)
@@ -1351,7 +1484,7 @@ async def test_send_signal_rejected_for_completed_process() -> None:
     shell = SignalShell(default_cwd=None)
     pid = await shell.start("echo hello")
     # Wait for the process to complete
-    await asyncio.sleep(0.1)
+    await _wait_for_completed_buffer(shell, pid)
 
     # Process completed but output not consumed -- handler still exists
     assert pid in shell._signal_handlers
@@ -1436,6 +1569,33 @@ async def test_deferred_shell_start_delegates_to_resolved_shell() -> None:
     assert running is False
     assert exit_code == 0
     assert shell.resolve_count == 1
+
+
+async def test_deferred_shell_routes_retained_status_and_wait() -> None:
+    """DeferredShell should expose and consume results retained by its resolved shell."""
+    shell = DeferredShellFixture()
+    pid = await shell.start("echo hello")
+    resolved = shell.resolved_shell
+    assert resolved is not None
+
+    process_task = resolved._background_tasks[pid]
+    await process_task
+    resolved._refresh_completed_tasks()
+    results = shell.consume_completed_results()
+    assert len(results) == 1
+    assert shell.has_retained_completed_results
+
+    status = shell.background_status_summary_with_retained_results()
+    assert status is not None
+    assert f'id="{pid}"' in status
+    assert 'result="available"' in status
+
+    stdout, stderr, running, exit_code = await shell.wait_process(pid, timeout=0)
+    assert stdout == "output of echo hello"
+    assert stderr == ""
+    assert running is False
+    assert exit_code == 0
+    assert not shell.has_retained_completed_results
 
 
 async def test_deferred_shell_failed_resolution_sets_state() -> None:

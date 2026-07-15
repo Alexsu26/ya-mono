@@ -6,7 +6,7 @@ This module provides the main TUI application with:
 - Steering message injection during execution
 - Mode switching (ACT/PLAN) via /act and /plan slash commands
 - Scrollable output with keyboard and mouse support
-- Slash command completion in the input composer
+- Input mode switching (send/edit) with Tab key
 - Double Ctrl+C exit confirmation
 
 Example:
@@ -23,14 +23,12 @@ import asyncio
 import contextlib
 import json
 import os
-import shutil
 import signal
 import sys
-import textwrap
 import time
 import traceback
 import uuid
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -40,22 +38,31 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, cast
 
 from prompt_toolkit import Application
-from prompt_toolkit.completion import CompleteEvent, Completer, Completion
-from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
+from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
-from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Frame, TextArea
-from pydantic_ai import BinaryContent, DeferredToolRequests, DeferredToolResults, ToolDenied, UsageLimits, UserContent
+from prompt_toolkit.widgets import TextArea
+from pydantic_ai import (
+    AgentRunResult,
+    BinaryContent,
+    DeferredToolRequests,
+    DeferredToolResults,
+    ModelSettings,
+    ToolDenied,
+    UsageLimits,
+    UserContent,
+)
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     ModelMessagesTypeAdapter,
+    OutputToolCallEvent,
+    OutputToolResultEvent,
     PartDeltaEvent,
     PartEndEvent,
     PartStartEvent,
@@ -66,10 +73,20 @@ from pydantic_ai.messages import (
     ToolCallPart,
 )
 from pydantic_ai.models import Model
+from pydantic_ai.run import AgentRun
 from rich.table import Table
 from rich.text import Text
-from ya_agent_sdk.agents.main import AgentRuntime, stream_agent
-from ya_agent_sdk.context import PROJECT_GUIDANCE_TAG, USER_RULES_TAG, BusMessage, ResumableState, StreamEvent
+from ya_agent_sdk.agents.main import AgentInterrupted, AgentRuntime, AgentStreamer, stream_agent
+from ya_agent_sdk.agents.models import infer_model
+from ya_agent_sdk.context import (
+    PROJECT_GUIDANCE_TAG,
+    USER_RULES_TAG,
+    AgentContext,
+    BusMessage,
+    ResumableState,
+    StreamEvent,
+    TaskManager,
+)
 from ya_agent_sdk.events import (
     CompactCompleteEvent,
     CompactFailedEvent,
@@ -85,64 +102,230 @@ from ya_agent_sdk.events import (
     SubagentStartEvent,
     TaskEvent,
     ToolCallsStartEvent,
+    UsageSnapshotEvent,
 )
-from ya_agent_sdk.usage import coerce_run_usage
+from ya_agent_sdk.presets import resolve_model_settings
 from ya_agent_sdk.utils import get_latest_request_usage
 
 # Import state management from app.state (re-export TUIMode, TUIState for backward compatibility)
+from ya_agent_stream_protocol.agui import AguiReplayConfig, is_subagent_event
+from ya_agent_stream_protocol.sdk import AguiAdapterConfig, AguiEventAdapter
+from ya_oauth_provider import OAuthRefreshSupervisor, create_oauth_refresh_supervisor_for_models
+
 from yaacli.app.state import TUIMode
 from yaacli.background import BACKGROUND_MONITOR_KEY, BackgroundMonitor, BackgroundTaskInfo
-from yaacli.browser import BrowserManager
 from yaacli.clipboard import ClipboardImageReadResult, read_clipboard_image
 from yaacli.config import ConfigManager, YaacliConfig
 from yaacli.display import EventRenderer, RichRenderer, ToolMessage
+from yaacli.display_replay import MAX_DISPLAY_REPLAY_LOAD_BYTES, BoundedDisplayReplay, load_display_replay
 from yaacli.environment import TUIEnvironment
-from yaacli.events import ContextUpdateEvent, LoopCompleteEvent, LoopCompleteReason, LoopIterationEvent
+from yaacli.events import ContextUpdateEvent, GoalCompleteEvent, GoalCompleteReason, GoalIterationEvent
 from yaacli.hooks import emit_context_update
 from yaacli.logging import configure_tui_logging, get_logger
+from yaacli.model_profiles import (
+    ResolvedModelProfile,
+    build_model_profiles,
+    format_model_profile_choice,
+    format_model_profile_label,
+    get_startup_model_profile,
+    resolve_profile_model_cfg,
+    save_selected_model_profile_id,
+)
 from yaacli.perf import perf_log_report, perf_report, perf_timer
-from yaacli.runtime import apply_model_profile, create_tui_runtime, resolve_startup_model_profile
+from yaacli.rendering.transcript import BlockId, BoundedTextAccumulator, TranscriptLimits, TranscriptStore
+from yaacli.runtime import create_tui_runtime
 from yaacli.session import TUIContext
-from yaacli.usage import SessionUsage
+from yaacli.sessions import get_head_artifact_paths, save_session_turn, trim_sessions
+from yaacli.usage import SessionUsage, TokenUsageBreakdown
+
+YAACLI_AGUI_ADAPTER_CONFIG = AguiAdapterConfig(run_event_prefix="yaacli", stream_metadata_prefix="yaacli")
+YAACLI_AGUI_REPLAY_CONFIG = AguiReplayConfig(
+    agent_id_field="yaacliAgentId",
+    main_agent_id="main",
+    drop_subagent_detail_events=True,
+)
 
 if TYPE_CHECKING:
     from prompt_toolkit.key_binding import KeyPressEvent
-    from y_agent_environment import BackgroundProcess
+    from ya_agent_environment import BackgroundProcess
 
 logger = get_logger(__name__)
 
 _SHUTDOWN_AGENT_TASK_TIMEOUT = 8.0
 _SHUTDOWN_MANAGED_TASKS_TIMEOUT = 5.0
 _DIRECT_SHELL_TERMINATE_TIMEOUT = 2.0
-_MODIFY_OTHER_KEYS_ENABLE = "\x1b[>4;2m"
-_MODIFY_OTHER_KEYS_DISABLE = "\x1b[>4;0m"
-_SHIFT_ENTER_EVENT_DATA = frozenset({
-    "\x1b[13;2u",
-    "\x1b[13;2~",
-    "\x1b[27;2;13~",
-})
+_DIRECT_SHELL_TIMEOUT = 300.0
+_DIRECT_SHELL_READ_CHUNK_BYTES = 16 * 1024
+_DIRECT_SHELL_OUTPUT_TAIL_BYTES = 64 * 1024
+_DIRECT_SHELL_STDOUT_PREVIEW_LINES = 100
+_DIRECT_SHELL_STDERR_PREVIEW_LINES = 50
+_DEFAULT_MAX_TURNS_PER_SESSION = 20
+_DEFAULT_MAX_SESSIONS = 100
+_DEFAULT_MAX_PENDING_ATTACHMENTS = 8
+_DEFAULT_MAX_PENDING_ATTACHMENT_BYTES = 20 * 1024 * 1024
+_MAX_RETAINED_TOOL_RESULT_CHARS = 64 * 1024
+_MAX_RETAINED_TOOL_ARG_CHARS = 64 * 1024
+_MAX_DISPLAY_REPLAY_LOAD_BYTES = MAX_DISPLAY_REPLAY_LOAD_BYTES
+_TOOL_RESULT_TRUNCATION_SUFFIX = "\n... [tool result truncated for display]"
+_TOOL_ARG_TRUNCATION_SUFFIX = "\n... [tool arguments truncated for display]"
 
-_BUILTIN_SLASH_COMMAND_DESCRIPTIONS = {
-    "help": "Show available commands",
-    "clear": "Clear the screen and conversation history",
-    "cost": "Show token usage and estimated cost",
-    "perf": "Show performance metrics",
-    "dump": "Dump current session history",
-    "session": "List or restore saved sessions",
-    "load": "Load conversation history from a folder",
-    "exit": "Exit yaacli",
-    "act": "Switch to ACT mode",
-    "plan": "Switch to PLAN mode",
-    "tasks": "Show active tasks, subagents, and processes",
-    "model": "List, show, or switch model profiles",
-    "paste-image": "Attach an image from the clipboard",
-    "loop": "Run iterative task loop",
-}
+
+@dataclass
+class _BoundedOutputTail:
+    """Keep only a fixed-size tail while accounting for all drained bytes."""
+
+    max_bytes: int
+    _buffer: bytearray = field(default_factory=bytearray)
+    total_bytes: int = 0
+
+    @property
+    def truncated(self) -> bool:
+        """Whether bytes were discarded before the retained tail."""
+        return self.total_bytes > len(self._buffer)
+
+    @property
+    def retained_bytes(self) -> int:
+        """Return the number of bytes currently retained."""
+        return len(self._buffer)
+
+    def append(self, chunk: bytes) -> None:
+        """Append a chunk, discarding the oldest bytes past ``max_bytes``."""
+        self.total_bytes += len(chunk)
+        if self.max_bytes <= 0:
+            self._buffer.clear()
+            return
+
+        if len(chunk) >= self.max_bytes:
+            self._buffer[:] = chunk[-self.max_bytes :]
+            return
+
+        excess = len(self._buffer) + len(chunk) - self.max_bytes
+        if excess > 0:
+            del self._buffer[:excess]
+        self._buffer.extend(chunk)
+
+    def text(self) -> str:
+        """Decode the bounded tail without retaining the original stream."""
+        return self._buffer.decode("utf-8", errors="replace")
+
+
+async def _drain_direct_shell_stream(
+    stream: asyncio.StreamReader | None,
+    tail: _BoundedOutputTail,
+) -> None:
+    """Continuously drain one subprocess pipe into a bounded tail buffer."""
+    if stream is None:
+        return
+
+    while chunk := await stream.read(_DIRECT_SHELL_READ_CHUNK_BYTES):
+        tail.append(chunk)
+
+
+def _format_direct_shell_preview(
+    tail: _BoundedOutputTail,
+    *,
+    stream_name: str,
+    max_lines: int,
+) -> str:
+    """Return a bounded, tail-oriented preview with explicit truncation notes."""
+    text = tail.text().strip()
+    if not text:
+        if tail.truncated:
+            return (
+                f"... ({stream_name} truncated; retained the last "
+                f"{tail.retained_bytes:,} of {tail.total_bytes:,} bytes)"
+            )
+        return ""
+
+    lines = text.splitlines()
+    notes: list[str] = []
+    if tail.truncated:
+        notes.append(
+            f"... ({stream_name} truncated; retained the last {tail.retained_bytes:,} of {tail.total_bytes:,} bytes)"
+        )
+    if len(lines) > max_lines:
+        notes.append(f"... ({stream_name} preview limited to the last {max_lines} lines)")
+        lines = lines[-max_lines:]
+
+    return "\n".join([*notes, *lines])
 
 
 # =============================================================================
 # Utilities
 # =============================================================================
+
+
+def _agui_event_timestamp_seconds(event: dict[str, Any]) -> float | None:
+    """Return an AGUI event timestamp as Unix seconds when available."""
+    timestamp = event.get("timestamp")
+    if timestamp is None or isinstance(timestamp, bool):
+        return None
+    if isinstance(timestamp, int | float):
+        return float(timestamp) / 1000.0
+    if not isinstance(timestamp, str):
+        return None
+
+    value = timestamp.strip()
+    if not value:
+        return None
+    try:
+        return float(value) / 1000.0
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _bounded_tool_result(value: str) -> str:
+    """Bound display-only tool state; full results remain in model history."""
+    if len(value) <= _MAX_RETAINED_TOOL_RESULT_CHARS:
+        return value
+    keep = _MAX_RETAINED_TOOL_RESULT_CHARS - len(_TOOL_RESULT_TRUNCATION_SUFFIX)
+    return value[: max(0, keep)] + _TOOL_RESULT_TRUNCATION_SUFFIX
+
+
+def _bounded_tool_args(value: str | dict[str, Any] | None) -> str | dict[str, Any] | None:
+    """Bound display-only tool arguments without mutating the source event."""
+    if value is None:
+        return None
+    serialized = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    if len(serialized) <= _MAX_RETAINED_TOOL_ARG_CHARS:
+        return value
+    keep = _MAX_RETAINED_TOOL_ARG_CHARS - len(_TOOL_ARG_TRUNCATION_SUFFIX)
+    return serialized[: max(0, keep)] + _TOOL_ARG_TRUNCATION_SUFFIX
+
+
+_RESUMABLE_CONTEXT_FIELDS = (
+    "subagent_history",
+    "usage_snapshot_entries",
+    "user_prompts",
+    "previous_assistant_response_reference",
+    "steering_messages",
+    "handoff_message",
+    "shell_env",
+    "deferred_tool_metadata",
+    "agent_registry",
+    "need_user_approve_tools",
+    "need_user_approve_mcps",
+    "auto_load_files",
+    "task_manager",
+    "note_manager",
+    "tool_search_loaded_tools",
+    "tool_search_loaded_namespaces",
+)
+
+
+def _restore_resumable_state_transactionally(state: ResumableState, ctx: AgentContext) -> None:
+    """Restore resumable fields exactly or put every touched field back."""
+    previous_values = {field_name: getattr(ctx, field_name) for field_name in _RESUMABLE_CONTEXT_FIELDS}
+    try:
+        state.restore(ctx)
+    except Exception:
+        for field_name, value in previous_values.items():
+            setattr(ctx, field_name, value)
+        raise
 
 
 def _safe_exception_str(e: BaseException) -> str:
@@ -171,6 +354,14 @@ def _safe_exception_str(e: BaseException) -> str:
     return result
 
 
+def _positive_int_config(value: object, default: int) -> int:
+    return value if isinstance(value, int) and value > 0 else default
+
+
+def _optional_positive_int_config(value: object) -> int | None:
+    return value if isinstance(value, int) and value > 0 else None
+
+
 def _is_benign_contextvar_cleanup_error(e: BaseException | None) -> bool:
     """Check if an exception matches pydantic-ai's known ContextVar cleanup race."""
     if not isinstance(e, ValueError):
@@ -186,45 +377,6 @@ def _get_elapsed_seconds(started_at: datetime) -> float:
         return (datetime.now() - started_at).total_seconds()
 
     return (datetime.now(UTC) - started_at.astimezone(UTC)).total_seconds()
-
-
-class SlashCommandCompleter(Completer):
-    """Complete slash commands at the beginning of the input buffer."""
-
-    def __init__(self, get_entries: Callable[[], dict[str, str]]) -> None:
-        self._get_entries = get_entries
-
-    @staticmethod
-    def _command_prefix(text_before_cursor: str) -> str | None:
-        if not text_before_cursor.startswith("/"):
-            return None
-        if "\n" in text_before_cursor:
-            return None
-        if any(ch.isspace() for ch in text_before_cursor):
-            return None
-        return text_before_cursor[1:].lower()
-
-    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Iterable[Completion]:
-        prefix = self._command_prefix(document.text_before_cursor)
-        if prefix is None:
-            return
-
-        replace_len = len(prefix) + 1
-        for name, description in sorted(self._get_entries().items()):
-            if not name.startswith(prefix):
-                continue
-            command = f"/{name}"
-            yield Completion(
-                command,
-                start_position=-replace_len,
-                display=command,
-                display_meta=description,
-            )
-
-
-def _is_shift_enter_event_data(data: str) -> bool:
-    """Return whether key event data is a known Shift+Enter encoding."""
-    return data in _SHIFT_ENTER_EVENT_DATA
 
 
 # =============================================================================
@@ -257,6 +409,7 @@ class PendingAttachment:
     data: bytes
     media_type: str
     size_bytes: int
+    placeholder: str = ""
 
 
 # =============================================================================
@@ -269,7 +422,6 @@ class TUIApp:
     """Main TUI application class.
 
     Manages the lifecycle of:
-    - BrowserManager (optional)
     - AgentRuntime (env + ctx + agent)
     - prompt_toolkit Application
 
@@ -287,24 +439,26 @@ class TUIApp:
     _mode: TUIMode = field(default=TUIMode.ACT, init=False)
     _state: TUIState = field(default=TUIState.IDLE, init=False)
     _agent_phase: str = field(default="idle", init=False)  # "idle", "thinking", "tools"
-    _active_model_name: str = field(default="", init=False)
 
     # Resources (initialized in __aenter__)
     _exit_stack: AsyncExitStack | None = field(default=None, init=False, repr=False)
-    _browser: BrowserManager | None = field(default=None, init=False)
     _runtime: AgentRuntime[TUIContext, str | DeferredToolRequests, TUIEnvironment] | None = field(
         default=None, init=False
     )
+    _oauth_refresh_supervisor: OAuthRefreshSupervisor | None = field(default=None, init=False, repr=False)
 
     # UI components
     _app: Application[None] | None = field(default=None, init=False, repr=False)
+    _transcript: TranscriptStore = field(default_factory=TranscriptStore, init=False, repr=False)
+    # Compatibility views backed by _transcript. Do not mutate directly.
     _output_lines: list[str] = field(default_factory=list, init=False)
-    _max_output_lines: int = field(default=500, init=False)  # Overridden from config.display
+    _max_output_lines: int = field(default=500, init=False)
+    _max_output_blocks: int = field(default=1000, init=False)
+    _max_output_bytes: int = field(default=4 * 1024 * 1024, init=False)
+    _max_stream_render_bytes: int = field(default=512 * 1024, init=False)
 
     # Virtual viewport rendering (only parse ANSI for visible lines)
     _scroll_offset: int = field(default=0, init=False)  # Display line offset from top
-    _auto_scroll: bool = field(default=True, init=False)
-    _unread_output_lines: int = field(default=0, init=False)
     _block_line_counts: list[int] = field(default_factory=list, init=False)  # Line count per output block
     _total_line_count: int = field(default=0, init=False)  # Sum of all block line counts
     _output_generation: int = field(default=0, init=False)  # Bumped on any content change
@@ -312,6 +466,10 @@ class TUIApp:
     _output_ansi_cache: ANSI | None = field(default=None, init=False)  # Cached visible ANSI
     _renderer: RichRenderer = field(default_factory=RichRenderer, init=False)
     _event_renderer: EventRenderer = field(default_factory=EventRenderer, init=False)
+    _display_replay: BoundedDisplayReplay = field(
+        default_factory=lambda: BoundedDisplayReplay(config=YAACLI_AGUI_REPLAY_CONFIG), init=False
+    )
+    _display_adapter: AguiEventAdapter | None = field(default=None, init=False)
 
     # Session
     _session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12], init=False)
@@ -319,13 +477,13 @@ class TUIApp:
     # Agent execution
     _agent_task: asyncio.Task[None] | None = field(default=None, init=False)
     _managed_tasks: set[asyncio.Task[Any]] = field(default_factory=set, init=False, repr=False)
-    _last_run: Any | None = field(default=None, init=False)  # AgentRun from last execution
+    _last_run: AgentRun[TUIContext, str | DeferredToolRequests] | None = field(default=None, init=False)
     _message_history: list[Any] | None = field(default=None, init=False)  # Conversation history
+    _session_save_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
     # Tool tracking
     _tool_messages: dict[str, ToolMessage] = field(default_factory=dict, init=False)
     _printed_tool_calls: set[str] = field(default_factory=set, init=False)
-    _tool_call_line_indices: dict[str, int] = field(default_factory=dict, init=False)
 
     # Subagent state tracking: agent_id -> {"line_index": int, "tool_names": list[str]}
     _subagent_states: dict[str, dict[str, Any]] = field(default_factory=dict, init=False)
@@ -333,6 +491,9 @@ class TUIApp:
     # Steering pane
     _steering_items: list[tuple[str, str, str]] = field(default_factory=list, init=False)
     _max_steering_lines: int = field(default=5, init=False)
+
+    # Input mode: "send" (Enter sends) or "edit" (Enter inserts newline)
+    _input_mode: str = field(default="send", init=False)
 
     # Mouse support mode
     _mouse_enabled: bool = field(default=True, init=False)
@@ -343,6 +504,7 @@ class TUIApp:
 
     # Prompt history for up/down navigation
     _prompt_history: list[str] = field(default_factory=list, init=False)
+    _max_prompt_history: int = field(default=500, init=False)
     _history_index: int = field(default=-1, init=False)
     _current_input_backup: str = field(default="", init=False)
     _pending_attachments: list[PendingAttachment] = field(default_factory=list, init=False)
@@ -353,11 +515,15 @@ class TUIApp:
 
     # Streaming text tracking for markdown rendering
     _streaming_text: str = field(default="", init=False)
+    _streaming_text_buffer: BoundedTextAccumulator | None = field(default=None, init=False, repr=False)
     _streaming_line_index: int | None = field(default=None, init=False)
+    _streaming_block_id: BlockId | None = field(default=None, init=False)
 
     # Streaming thinking tracking for extended thinking display
     _streaming_thinking: str = field(default="", init=False)
+    _streaming_thinking_buffer: BoundedTextAccumulator | None = field(default=None, init=False, repr=False)
     _streaming_thinking_line_index: int | None = field(default=None, init=False)
+    _streaming_thinking_block_id: BlockId | None = field(default=None, init=False)
 
     # Real-time context usage tracking
     _current_context_tokens: int = field(default=0, init=False)
@@ -366,13 +532,24 @@ class TUIApp:
     # Session-level usage tracking
     _session_usage: SessionUsage = field(default_factory=SessionUsage, init=False)
 
+    # Goal usage tracking
+    _goal_usage_start_breakdown: TokenUsageBreakdown | None = field(default=None, init=False)
+    _goal_usage_report_pending: bool = field(default=False, init=False)
+
+    # Model profile state
+    _active_model_profile: ResolvedModelProfile | None = field(default=None, init=False)
+    _model_selector_open: bool = field(default=False, init=False)
+    _model_selector_profiles: list[ResolvedModelProfile] = field(default_factory=list, init=False)
+    _model_selector_index: int = field(default=0, init=False)
+
     # UI refresh throttling
     _last_invalidate_time: float = field(default=0.0, init=False)
-    _invalidate_interval: float = field(default=0.016, init=False)  # ~60fps max
+    _invalidate_interval: float = field(default=0.05, init=False)  # 20fps max
+    _pending_invalidate_handle: asyncio.TimerHandle | None = field(default=None, init=False, repr=False)
 
     # Streaming render throttle (separate from UI invalidation)
     _last_stream_render_time: float = field(default=0.0, init=False)
-    _stream_render_interval: float = field(default=0.025, init=False)  # ~40fps for lightweight live text
+    _stream_render_interval: float = field(default=0.08, init=False)  # ~12fps for markdown re-render
 
     # HITL (Human-in-the-Loop) approval state
     _hitl_pending: bool = field(default=False, init=False)
@@ -387,6 +564,28 @@ class TUIApp:
 
     # Deferred screen recovery scheduling
     _screen_recovery_scheduled: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        """Initialize bounded stores from config while tolerating test doubles."""
+        display = getattr(self.config, "display", None)
+        self._max_output_lines = _positive_int_config(
+            getattr(display, "max_output_lines", None), self._max_output_lines
+        )
+        self._max_output_blocks = _positive_int_config(
+            getattr(display, "max_output_blocks", None), self._max_output_blocks
+        )
+        self._max_output_bytes = _positive_int_config(
+            getattr(display, "max_output_bytes", None), self._max_output_bytes
+        )
+        self._max_stream_render_bytes = _positive_int_config(
+            getattr(display, "max_stream_render_bytes", None), self._max_stream_render_bytes
+        )
+        self._max_prompt_history = _positive_int_config(
+            getattr(display, "max_prompt_history", None), self._max_prompt_history
+        )
+        self._transcript.configure(self._transcript_limits())
+        self._output_lines = self._transcript.blocks
+        self._block_line_counts = self._transcript.line_counts
 
     @property
     def mode(self) -> TUIMode:
@@ -561,26 +760,22 @@ class TUIApp:
         self._exit_stack = AsyncExitStack()
         await self._exit_stack.__aenter__()
 
-        # Configure TUI logging (queue for internal use, file for verbose mode)
-        log_queue: asyncio.Queue[object] = asyncio.Queue()
-
-        # Start browser manager (optional)
-        self._browser = BrowserManager(self.config.browser)
-        await self._exit_stack.enter_async_context(self._browser)
+        # Configure stderr-safe logging; verbose mode uses a bounded rotating file.
 
         # Load MCP config
         mcp_config = self.config_manager.load_mcp_config()
+
+        self._active_model_profile = get_startup_model_profile(self.config, self.config_manager.config_dir)
 
         # Create runtime
         self._runtime = create_tui_runtime(
             config=self.config,
             mcp_config=mcp_config,
-            browser_manager=self._browser,
             working_dir=self.working_dir,
             config_dir=self.config_manager.config_dir,
+            model_profile=self._active_model_profile,
         )
         await self._exit_stack.enter_async_context(self._runtime)
-        self._active_model_name, _ = resolve_startup_model_profile(self.config)
 
         # Register application-level injected context tags for compact stripping
         self._runtime.ctx.injected_context_tags = (
@@ -589,15 +784,28 @@ class TUIApp:
             USER_RULES_TAG,
         )
 
+        self._oauth_refresh_supervisor = self._create_oauth_refresh_supervisor()
+        if self._oauth_refresh_supervisor is not None:
+            await self._oauth_refresh_supervisor.start()
+            logger.info(
+                "OAuth refresh supervisor started providers=%s", sorted(self._oauth_refresh_supervisor.provider_names)
+            )
+
         # Initialize context window size from model config
         if self._runtime.ctx.model_cfg.context_window:
             self._context_window_size = self._runtime.ctx.model_cfg.context_window
 
-        # Apply display config
+        # Apply display retention config.
         self._max_output_lines = self.config.display.max_output_lines
+        self._max_output_blocks = self.config.display.max_output_blocks
+        self._max_output_bytes = self.config.display.max_output_bytes
+        self._max_stream_render_bytes = self.config.display.max_stream_render_bytes
+        self._max_prompt_history = self.config.display.max_prompt_history
+        self._transcript.configure(self._transcript_limits())
+        self._sync_transcript_state()
 
         logger.info("TUIApp initialized")
-        configure_tui_logging(log_queue, verbose=self.verbose)
+        configure_tui_logging(verbose=self.verbose)
 
         # Set core_toolset on BackgroundMonitor so it can find the delegate tool
         bg_monitor = self._get_background_monitor()
@@ -627,10 +835,16 @@ class TUIApp:
         bg_monitor = self._get_background_monitor()
         if bg_monitor:
             bg_monitor.set_completion_callback(None)
+        if self._pending_invalidate_handle is not None:
+            self._pending_invalidate_handle.cancel()
+            self._pending_invalidate_handle = None
 
         # Cancel any running agent task and tracked fire-and-forget tasks
         await self._cancel_agent_task()
         await self._cancel_managed_tasks()
+        if self._oauth_refresh_supervisor is not None:
+            await self._oauth_refresh_supervisor.shutdown()
+            self._oauth_refresh_supervisor = None
 
         # Give event loop a chance to process pending cleanups
         await asyncio.sleep(0)
@@ -673,154 +887,318 @@ class TUIApp:
     # =========================================================================
 
     def _throttled_invalidate(self) -> None:
-        """Invalidate UI with throttling to prevent excessive redraws."""
+        """Coalesce redraws while preserving the final trailing update."""
         if not self._app:
             return
-        now = time.time()
-        if now - self._last_invalidate_time >= self._invalidate_interval:
+        now = time.monotonic()
+        elapsed = now - self._last_invalidate_time
+        if elapsed >= self._invalidate_interval:
+            if self._pending_invalidate_handle is not None:
+                self._pending_invalidate_handle.cancel()
+                self._pending_invalidate_handle = None
             self._last_invalidate_time = now
             self._app.invalidate()
+            return
+        if self._pending_invalidate_handle is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._app.invalidate()
+            return
+        self._pending_invalidate_handle = loop.call_later(
+            self._invalidate_interval - elapsed,
+            self._run_trailing_invalidate,
+        )
+
+    def _run_trailing_invalidate(self) -> None:
+        self._pending_invalidate_handle = None
+        if self._app is not None:
+            self._last_invalidate_time = time.monotonic()
+            self._app.invalidate()
+
+    def _transcript_limits(self) -> TranscriptLimits:
+        return TranscriptLimits(
+            max_lines=self._max_output_lines,
+            max_blocks=self._max_output_blocks,
+            max_bytes=self._max_output_bytes,
+        )
+
+    def _sync_transcript_state(self) -> None:
+        """Synchronize compatibility counters and live block indices."""
+        self._total_line_count = self._transcript.total_lines
+        self._streaming_line_index = self._transcript.index_of(self._streaming_block_id)
+        self._streaming_thinking_line_index = self._transcript.index_of(self._streaming_thinking_block_id)
 
     def _invalidate_output_cache(self) -> None:
-        """Mark output cache as invalid (must be called after modifying _output_lines).
-
-        O(1) operation - just bumps the generation counter.
-        Line counts are maintained incrementally by _append_block and _update_block.
-        """
+        """Mark the viewport cache as invalid."""
         self._output_generation += 1
 
-    def _append_block(self, content: str) -> None:
-        """Append an output block with incremental bookkeeping.
-
-        Handles line count tracking and generation bump.
-        All code that appends to _output_lines should use this method.
-        """
-        line_count = content.count("\n") + 1
-        self._output_lines.append(content)
-        self._block_line_counts.append(line_count)
-        self._total_line_count += line_count
+    def _append_block(self, content: str) -> BlockId:
+        """Append through the single bounded transcript entry point."""
+        self._transcript.configure(self._transcript_limits())
+        block_id = self._transcript.append(content)
+        self._sync_transcript_state()
         self._output_generation += 1
+        return block_id
 
     def _update_block(self, idx: int, new_content: str) -> None:
-        """Update an output block in-place with incremental line count tracking.
+        """Compatibility update by retained block index."""
+        self._transcript.configure(self._transcript_limits())
+        if self._transcript.replace_at(idx, new_content):
+            self._sync_transcript_state()
+            self._output_generation += 1
 
-        This is O(1) for line count update (just delta between old and new).
-        Used by streaming text/thinking updates.
-        """
-        if idx >= len(self._output_lines):
-            return
-        old_count = self._block_line_counts[idx]
-        new_count = new_content.count("\n") + 1
-        self._output_lines[idx] = new_content
-        self._block_line_counts[idx] = new_count
-        self._total_line_count += new_count - old_count
-        self._output_generation += 1
-
-    def _update_pinned_unread_count(self) -> None:
-        """Refresh unread line count while the viewport is pinned away from tail."""
-        if self._auto_scroll:
-            self._unread_output_lines = 0
-            return
-        visible_bottom = self._scroll_offset + self._get_viewport_height()
-        self._unread_output_lines = max(0, self._total_line_count - visible_bottom)
-
-    def _maybe_scroll_to_bottom(self) -> None:
-        """Follow output tail only when the user has not pinned the viewport."""
-        if self._auto_scroll:
-            self._scroll_to_bottom()
-        else:
-            self._update_pinned_unread_count()
-
-    def _follow_latest_output(self) -> None:
-        """Restore tail-following behavior and move the viewport to latest output."""
-        self._auto_scroll = True
-        self._unread_output_lines = 0
-        self._scroll_to_bottom()
-
-    def _scroll_output_up(self, lines: int) -> None:
-        """Scroll output up and pin the viewport against streaming auto-follow."""
-        self._scroll_offset = max(0, self._scroll_offset - lines)
-        self._auto_scroll = False
-        self._update_pinned_unread_count()
-        if self._app:
-            self._app.invalidate()
-
-    def _scroll_output_down(self, lines: int) -> None:
-        """Scroll output down; re-enable auto-follow when reaching the tail."""
-        tail_offset = self._get_tail_scroll_offset()
-        self._scroll_offset = min(self._scroll_offset + lines, tail_offset)
-        if self._scroll_offset >= self._get_max_scroll():
-            self._auto_scroll = True
-            self._unread_output_lines = 0
-            self._scroll_to_bottom()
-        else:
-            self._auto_scroll = False
-            self._update_pinned_unread_count()
-        if self._app:
-            self._app.invalidate()
+    def _update_block_by_id(self, block_id: BlockId | None, new_content: str) -> bool:
+        """Replace a live block by stable ID, surviving older-block eviction."""
+        if block_id is None:
+            return False
+        self._transcript.configure(self._transcript_limits())
+        updated = self._transcript.replace(block_id, new_content)
+        self._sync_transcript_state()
+        if updated:
+            self._output_generation += 1
+        return updated
 
     def _append_output(self, text: str) -> None:
-        """Append text to output buffer with auto-scroll when running."""
+        """Append text to the bounded transcript and auto-scroll when running."""
         self._append_block(text)
 
-        # Trim old lines to prevent memory issues
-        if len(self._output_lines) > self._max_output_lines:
-            trim_count = len(self._output_lines) - self._max_output_lines
-            removed_line_count = 0
-            # Subtract line counts of removed blocks
-            for i in range(trim_count):
-                removed_line_count += self._block_line_counts[i]
-            self._total_line_count -= removed_line_count
-            self._output_lines = self._output_lines[trim_count:]
-            self._block_line_counts = self._block_line_counts[trim_count:]
-            if not self._auto_scroll:
-                self._scroll_offset = max(0, self._scroll_offset - removed_line_count)
-            # Adjust streaming indices to account for removed blocks
-            if self._streaming_line_index is not None:
-                self._streaming_line_index -= trim_count
-                if self._streaming_line_index < 0:
-                    # Streaming block was trimmed away - reset
-                    self._streaming_text = ""
-                    self._streaming_line_index = None
-            if self._streaming_thinking_line_index is not None:
-                self._streaming_thinking_line_index -= trim_count
-                if self._streaming_thinking_line_index < 0:
-                    # Thinking block was trimmed away - reset
-                    self._streaming_thinking = ""
-                    self._streaming_thinking_line_index = None
-            for tool_call_id, line_index in list(self._tool_call_line_indices.items()):
-                new_index = line_index - trim_count
-                if new_index < 0:
-                    del self._tool_call_line_indices[tool_call_id]
-                else:
-                    self._tool_call_line_indices[tool_call_id] = new_index
-
-        self._maybe_scroll_to_bottom()
+        # Auto-scroll to bottom when agent is running
+        if self._state == TUIState.RUNNING:
+            self._scroll_to_bottom()
         # Invalidate app to refresh display (throttled during streaming)
         self._throttled_invalidate()
+
+    def _record_display_event(self, event: dict[str, Any]) -> None:
+        """Persist a display-layer event for replay/session restore."""
+        self._display_replay.append(event)
+
+    def _record_display_events(self, events: Sequence[dict[str, Any]]) -> None:
+        """Persist display-layer events for replay/session restore."""
+        for event in events:
+            self._record_display_event(event)
+
+    def _record_display_system_event(self, event_name: str, payload: Any) -> None:
+        """Persist a YAACLI custom display event."""
+        adapter = self._display_adapter or AguiEventAdapter(
+            session_id=self._session_id, run_id=self._session_id, config=YAACLI_AGUI_ADAPTER_CONFIG
+        )
+        self._handle_and_record_display_events([adapter.build_run_custom_event(event_name, cast(Any, payload))])
+
+    def _handle_and_record_display_events(self, events: Sequence[dict[str, Any]]) -> None:
+        self._record_display_events(events)
+        self._handle_display_events(events)
+
+    def _reset_output_blocks(self) -> None:
+        """Clear rendered output blocks and viewport bookkeeping."""
+        self._transcript.clear()
+        self._output_ansi_cache = None
+        self._viewport_cache_key = None
+        self._output_generation = 0
+        self._total_line_count = 0
+        self._streaming_block_id = None
+        self._streaming_thinking_block_id = None
+        self._scroll_offset = 0
+
+    def _handle_display_events(self, events: Sequence[dict[str, Any]]) -> None:
+        """Render display-layer events into the TUI output buffer."""
+        width = self._get_terminal_width()
+        for event in events:
+            event_type = str(event.get("type", ""))
+            if is_subagent_event(event, agent_id_field="yaacliAgentId"):
+                if event_type == "TOOL_CALL_CHUNK":
+                    tool_name = str(event.get("toolCallName") or event.get("tool_call_name") or "")
+                    tool_call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+                    agent_id = str(event.get("yaacliAgentId") or event.get("yaacli_agent_id") or "")
+                    if agent_id in self._subagent_states and tool_call_id and tool_call_id not in self._tool_messages:
+                        self._tool_messages[tool_call_id] = ToolMessage(
+                            tool_call_id=tool_call_id,
+                            name=tool_name,
+                            args=_bounded_tool_args(str(event.get("delta") or "")),
+                        )
+                        if tool_name:
+                            state = self._subagent_states[agent_id]
+                            state["tool_names"] = [*state["tool_names"][-2:], tool_name]
+                            state["tool_count"] = int(state.get("tool_count", 0)) + 1
+                            self._update_subagent_progress_line(agent_id)
+                continue
+            if event_type == "TEXT_MESSAGE_START":
+                self._finalize_streaming_text()
+                self._finalize_streaming_thinking()
+                self._start_streaming_text("")
+                continue
+            if event_type == "TEXT_MESSAGE_CHUNK":
+                delta = event.get("delta")
+                if isinstance(delta, str) and delta:
+                    if self._streaming_line_index is not None:
+                        self._update_streaming_text(delta)
+                    else:
+                        self._append_block(
+                            self._renderer.render_markdown(
+                                delta,
+                                code_theme=self._get_code_theme(),
+                                width=width,
+                            ).rstrip("\n")
+                        )
+                continue
+            if event_type == "TEXT_MESSAGE_END":
+                self._finalize_streaming_text()
+                continue
+            if event_type == "REASONING_MESSAGE_START":
+                self._finalize_streaming_text()
+                self._finalize_streaming_thinking()
+                self._start_streaming_thinking("")
+                continue
+            if event_type == "REASONING_MESSAGE_CHUNK":
+                delta = event.get("delta")
+                if isinstance(delta, str) and delta:
+                    if self._streaming_thinking_line_index is not None:
+                        self._update_streaming_thinking(delta)
+                    else:
+                        self._append_block(self._event_renderer.render_thinking(delta, width=width).rstrip("\n"))
+                continue
+            if event_type == "REASONING_MESSAGE_END":
+                self._finalize_streaming_thinking()
+                continue
+            if event_type == "TOOL_CALL_START":
+                agent_id = str(event.get("yaacliAgentId") or "main")
+                if agent_id != "main":
+                    continue
+                self._finalize_streaming_text()
+                self._finalize_streaming_thinking()
+                tool_name = event.get("toolCallName") or event.get("tool_call_name") or "tool"
+                tool_call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+                if tool_call_id and tool_call_id not in self._tool_messages:
+                    self._tool_messages[tool_call_id] = ToolMessage(
+                        tool_call_id=tool_call_id,
+                        name=str(tool_name),
+                    )
+                    self._event_renderer.tracker.start_call(
+                        tool_call_id,
+                        str(tool_name),
+                        start_time=_agui_event_timestamp_seconds(event),
+                    )
+                    self._append_block(
+                        self._event_renderer.render_tool_call_start(str(tool_name), tool_call_id).rstrip()
+                    )
+                continue
+            if event_type == "TOOL_CALL_CHUNK":
+                agent_id = str(event.get("yaacliAgentId") or "main")
+                if agent_id != "main":
+                    continue
+                self._finalize_streaming_text()
+                self._finalize_streaming_thinking()
+                tool_name = event.get("toolCallName") or event.get("tool_call_name") or "tool"
+                tool_call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+                if tool_call_id and tool_call_id not in self._tool_messages:
+                    display_args = _bounded_tool_args(str(event.get("delta") or ""))
+                    self._tool_messages[tool_call_id] = ToolMessage(
+                        tool_call_id=tool_call_id,
+                        name=str(tool_name),
+                        args=display_args,
+                    )
+                    self._event_renderer.tracker.start_call(
+                        tool_call_id,
+                        str(tool_name),
+                        display_args,
+                        start_time=_agui_event_timestamp_seconds(event),
+                    )
+                    self._append_block(
+                        self._event_renderer.render_tool_call_start(str(tool_name), tool_call_id).rstrip()
+                    )
+                elif tool_call_id and tool_call_id in self._tool_messages:
+                    existing_tool_msg = self._tool_messages[tool_call_id]
+                    if not existing_tool_msg.args:
+                        existing_tool_msg.args = _bounded_tool_args(str(event.get("delta") or ""))
+                    if tool_call_id in self._event_renderer.tracker.tool_calls:
+                        self._event_renderer.tracker.tool_calls[tool_call_id].args = existing_tool_msg.args
+                continue
+            if event_type == "TOOL_CALL_RESULT":
+                agent_id = str(event.get("yaacliAgentId") or "main")
+                if agent_id != "main":
+                    continue
+                tool_call_id = str(event.get("toolCallId") or event.get("tool_call_id") or "")
+                existing_tool_msg = self._tool_messages.get(tool_call_id)
+                tool_msg = existing_tool_msg or ToolMessage(
+                    tool_call_id=tool_call_id,
+                    name=str(event.get("toolCallName") or event.get("tool_call_name") or "tool"),
+                )
+                tool_msg.content = _bounded_tool_result(str(event.get("content") or ""))
+                self._event_renderer.tracker.complete_call(
+                    tool_call_id,
+                    tool_msg.content,
+                    end_time=_agui_event_timestamp_seconds(event),
+                )
+                if tool_call_id not in self._printed_tool_calls:
+                    duration = 0.0
+                    if tool_call_id in self._event_renderer.tracker.tool_calls:
+                        duration = self._event_renderer.tracker.tool_calls[tool_call_id].duration()
+                    self._append_block(
+                        self._event_renderer.render_tool_call_complete(
+                            tool_msg,
+                            duration=duration,
+                            width=width,
+                        ).rstrip()
+                    )
+                    self._printed_tool_calls.add(tool_call_id)
+                continue
+            if event_type == "CUSTOM" and event.get("name") == "yaacli.user_input":
+                value = event.get("value")
+                if isinstance(value, dict):
+                    text = str(value.get("text") or "")
+                    attachments = value.get("attachments")
+                    attachment_count = len(attachments) if isinstance(attachments, list) else 0
+                    display_text = text
+                    if not display_text and attachment_count:
+                        noun = "image" if attachment_count == 1 else "images"
+                        display_text = f"[Attached {attachment_count} {noun}]"
+                    from rich.text import Text as RichText
+
+                    user_text = RichText()
+                    user_text.append("> ", style="bold green")
+                    user_text.append(display_text)
+                    self._append_block(self._renderer.render(user_text, width=width).rstrip("\n"))
+
+        if self._state == TUIState.RUNNING:
+            self._scroll_to_bottom()
+        self._throttled_invalidate()
+
+    def _restore_output_from_display_events(self, events: Sequence[dict[str, Any]]) -> None:
+        """Rebuild visible output from compacted display-layer events."""
+        self._reset_output_blocks()
+        self._streaming_text = ""
+        self._streaming_text_buffer = None
+        self._streaming_line_index = None
+        self._streaming_thinking = ""
+        self._streaming_thinking_buffer = None
+        self._streaming_thinking_line_index = None
+        self._handle_display_events(events)
+        self._finalize_streaming_text()
+        self._finalize_streaming_thinking()
+        self._scroll_to_bottom()
+        if self._app:
+            self._app.invalidate()
 
     def _get_viewport_height(self) -> int:
         """Get visible output height in lines."""
         if self._app and self._app.output:
             terminal_size = self._app.output.get_size()
-            # Reserve: status bar + steering + framed composer + margins
+            # Reserve: status bar (2) + steering (dynamic) + input area (5) + margins
             return max(5, terminal_size.rows - 9)
         return 40
-
-    def _get_tail_scroll_offset(self) -> int:
-        """Return the tail-follow offset, including a small bottom breathing room."""
-        visible_height = self._get_viewport_height()
-        bottom_padding = 4
-        if self._total_line_count > visible_height:
-            return self._total_line_count - visible_height + bottom_padding
-        return 0
 
     def _scroll_to_bottom(self) -> None:
         """Scroll output to bottom.
 
         Uses cached line count for performance - O(1) operation.
         """
-        self._scroll_offset = self._get_tail_scroll_offset()
+        visible_height = self._get_viewport_height()
+        bottom_padding = 4
+        if self._total_line_count > visible_height:
+            self._scroll_offset = self._total_line_count - visible_height + bottom_padding
+        else:
+            self._scroll_offset = 0
 
     def _get_output_text(self) -> ANSI:
         """Get formatted output for display using virtual viewport.
@@ -844,41 +1222,8 @@ class TUIApp:
             return self._output_ansi_cache
 
     def _get_visible_text(self, start_line: int, end_line: int) -> str:
-        """Extract only the text visible in the given line range.
-
-        Scans output blocks using pre-computed line counts to find
-        the overlapping blocks, then slices them to the exact visible range.
-        O(total_blocks) scan + O(visible_blocks) string operations.
-        The scan is cheap (integer additions on at most _max_output_lines blocks).
-        """
-        if not self._output_lines:
-            return ""
-
-        cum = 0
-        parts: list[str] = []
-
-        for i in range(len(self._output_lines)):
-            block_count = self._block_line_counts[i]
-            block_end = cum + block_count
-
-            if block_end <= start_line:
-                cum = block_end
-                continue
-            if cum >= end_line:
-                break
-
-            # This block overlaps with visible range
-            block_lines = self._output_lines[i].split("\n")
-            local_start = max(0, start_line - cum)
-            local_end = min(block_count, end_line - cum)
-
-            if local_start > 0 or local_end < block_count:
-                block_lines = block_lines[local_start:local_end]
-
-            parts.append("\n".join(block_lines))
-            cum = block_end
-
-        return "\n".join(parts)
+        """Extract a visible line range from the indexed transcript."""
+        return self._transcript.visible_text(start_line, end_line)
 
     def _get_max_scroll(self) -> int:
         """Calculate maximum scroll position. O(1) using cached line count."""
@@ -895,143 +1240,116 @@ class TUIApp:
         # TODO: Make configurable via config
         return "monokai"
 
-    def _wrap_live_text(self, text: str, *, width: int | None = None) -> str:
-        """Cheap terminal-width wrapping for live streaming text.
-
-        Finalized assistant output is still rendered as Markdown. During streaming,
-        avoid full Rich Markdown re-renders so token updates feel continuous.
-        """
-        wrap_width = max(20, (width or self._get_terminal_width()) - 1)
-        wrapped_lines: list[str] = []
-        for line in text.split("\n"):
-            if not line:
-                wrapped_lines.append("")
-                continue
-            wrapped_lines.extend(
-                textwrap.wrap(
-                    line,
-                    width=wrap_width,
-                    break_long_words=True,
-                    break_on_hyphens=False,
-                    drop_whitespace=False,
-                    replace_whitespace=False,
-                )
-                or [""]
-            )
-        return "\n".join(wrapped_lines)
-
-    def _render_live_streaming_text(self, text: str) -> str:
-        """Render assistant text cheaply while it is still streaming."""
-        return self._wrap_live_text(text).rstrip("\n")
-
-    def _render_live_streaming_thinking(self, text: str) -> str:
-        """Render thinking cheaply while it is still streaming."""
-        wrapped = self._wrap_live_text(text, width=self._get_terminal_width() - 2)
-        lines = wrapped.split("\n")
-        prefix = "\x1b[2;35m> \x1b[0m"
-        content_start = "\x1b[2;3m"
-        reset = "\x1b[0m"
-        return "\n".join(f"{prefix}{content_start}{line}{reset}" for line in lines).rstrip("\n")
+    def _new_stream_accumulator(self) -> BoundedTextAccumulator:
+        return BoundedTextAccumulator(
+            max_bytes=min(self._max_stream_render_bytes, self._max_output_bytes),
+            max_lines=self._max_output_lines,
+        )
 
     def _start_streaming_text(self, initial_content: str = "") -> None:
-        """Start tracking a new streaming text block."""
-        self._streaming_text = initial_content
+        """Start a bounded streaming text block."""
+        self._streaming_text_buffer = self._new_stream_accumulator()
+        self._streaming_text_buffer.append(initial_content)
+        self._streaming_text = self._streaming_text_buffer.text()
+        self._streaming_block_id = None
         self._streaming_line_index = len(self._output_lines)
-        self._last_stream_render_time = 0.0  # Reset throttle for new block
+        self._last_stream_render_time = 0.0
         if initial_content:
-            # Add placeholder that will be updated.
-            # Empty text blocks should not create a visible blank line.
-            self._append_block(self._render_live_streaming_text(initial_content))
-            self._maybe_scroll_to_bottom()
-            self._throttled_invalidate()
+            self._streaming_block_id = self._append_block(initial_content)
+            self._sync_transcript_state()
 
     def _update_streaming_text(self, delta: str) -> None:
-        """Update the current streaming text block with delta.
-
-        Throttles markdown re-rendering to ~12fps to avoid expensive Rich
-        markdown parsing on every single token delta.
-        """
-        self._streaming_text += delta
-
-        # Throttle: skip expensive markdown re-render if too soon
-        now = time.time()
+        """Append a fragment and periodically re-render the Markdown preview."""
+        if self._streaming_text_buffer is None:
+            self._streaming_text_buffer = self._new_stream_accumulator()
+        self._streaming_text_buffer.append(delta)
+        now = time.monotonic()
         if now - self._last_stream_render_time < self._stream_render_interval:
-            return  # Delta buffered in _streaming_text, will render on next interval or finalize
-        self._last_stream_render_time = now
-
-        # Live updates are intentionally plain, width-wrapped text. A full
-        # Markdown render happens once in _finalize_streaming_text().
-        if self._streaming_line_index is not None:
-            with perf_timer("stream_render_text"):
-                rendered = self._render_live_streaming_text(self._streaming_text)
-            if self._streaming_line_index < len(self._output_lines):
-                self._update_block(self._streaming_line_index, rendered)
-            elif rendered:
-                self._append_block(rendered)
-            self._maybe_scroll_to_bottom()
-            self._throttled_invalidate()
-
-    def _finalize_streaming_text(self) -> None:
-        """Finalize the current streaming text block."""
-        if self._streaming_text and self._streaming_line_index is not None:
-            # Final render with complete text and dynamic width
+            return
+        self._streaming_text = self._streaming_text_buffer.text()
+        with perf_timer("stream_render_markdown"):
             rendered = self._renderer.render_markdown(
                 self._streaming_text,
                 code_theme=self._get_code_theme(),
                 width=self._get_terminal_width(),
             ).rstrip("\n")
-            if self._streaming_line_index < len(self._output_lines):
-                self._update_block(self._streaming_line_index, rendered)
-            elif rendered:
+        self._last_stream_render_time = time.monotonic()
+        if not self._update_block_by_id(self._streaming_block_id, rendered) and rendered:
+            self._streaming_block_id = self._append_block(rendered)
+            self._sync_transcript_state()
+        if self._state == TUIState.RUNNING:
+            self._scroll_to_bottom()
+        self._throttled_invalidate()
+
+    def _finalize_streaming_text(self) -> None:
+        """Render the complete Markdown when the streamed part ends."""
+        complete_text = self._streaming_text_buffer.text() if self._streaming_text_buffer is not None else ""
+        if complete_text:
+            rendered = self._renderer.render_markdown(
+                complete_text,
+                code_theme=self._get_code_theme(),
+                width=self._get_terminal_width(),
+            ).rstrip("\n")
+            if not self._update_block_by_id(self._streaming_block_id, rendered) and rendered:
                 self._append_block(rendered)
-            self._maybe_scroll_to_bottom()
         self._streaming_text = ""
+        self._streaming_text_buffer = None
+        self._streaming_block_id = None
         self._streaming_line_index = None
 
     def _start_streaming_thinking(self, initial_content: str = "") -> None:
-        """Start tracking a new streaming thinking block."""
-        self._streaming_thinking = initial_content
+        """Start a bounded reasoning block."""
+        self._streaming_thinking_buffer = self._new_stream_accumulator()
+        self._streaming_thinking_buffer.append(initial_content)
+        self._streaming_thinking = self._streaming_thinking_buffer.text()
+        self._streaming_thinking_block_id = None
         self._streaming_thinking_line_index = len(self._output_lines)
-        self._last_stream_render_time = 0.0  # Reset throttle for new block
-        rendered = self._render_live_streaming_thinking(initial_content)
-        self._append_block(rendered)
-        self._maybe_scroll_to_bottom()
-        self._throttled_invalidate()
-
-    def _update_streaming_thinking(self, delta: str) -> None:
-        """Update current streaming thinking with delta.
-
-        Throttled similarly to streaming text to avoid excessive re-rendering.
-        """
-        self._streaming_thinking += delta
-
-        # Throttle: skip expensive re-render if too soon
-        now = time.time()
-        if now - self._last_stream_render_time < self._stream_render_interval:
-            return  # Delta buffered, will render on next interval or finalize
-        self._last_stream_render_time = now
-
-        # Re-render thinking for the complete text so far
-        if self._streaming_thinking_line_index is not None and self._streaming_thinking_line_index < len(
-            self._output_lines
-        ):
-            rendered = self._render_live_streaming_thinking(self._streaming_thinking)
-            self._update_block(self._streaming_thinking_line_index, rendered)
-            self._maybe_scroll_to_bottom()
-            self._throttled_invalidate()
-
-    def _finalize_streaming_thinking(self) -> None:
-        """Finalize the current streaming thinking block."""
-        if self._streaming_thinking and self._streaming_thinking_line_index is not None:
-            # Final render
+        self._last_stream_render_time = 0.0
+        if initial_content:
             rendered = self._event_renderer.render_thinking(
-                self._streaming_thinking,
+                initial_content,
                 width=self._get_terminal_width(),
             ).rstrip("\n")
-            if self._streaming_thinking_line_index < len(self._output_lines):
-                self._update_block(self._streaming_thinking_line_index, rendered)
-            self._maybe_scroll_to_bottom()
+            self._streaming_thinking_block_id = self._append_block(rendered)
+            self._sync_transcript_state()
+            self._throttled_invalidate()
+
+    def _update_streaming_thinking(self, delta: str) -> None:
+        """Append reasoning and periodically refresh its lightweight view."""
+        if self._streaming_thinking_buffer is None:
+            self._streaming_thinking_buffer = self._new_stream_accumulator()
+        self._streaming_thinking_buffer.append(delta)
+        now = time.monotonic()
+        if now - self._last_stream_render_time < self._stream_render_interval:
+            return
+        self._last_stream_render_time = now
+        self._streaming_thinking = self._streaming_thinking_buffer.text()
+        rendered = self._event_renderer.render_thinking(
+            self._streaming_thinking,
+            width=self._get_terminal_width(),
+        ).rstrip("\n")
+        if not self._update_block_by_id(self._streaming_thinking_block_id, rendered) and rendered:
+            self._streaming_thinking_block_id = self._append_block(rendered)
+            self._sync_transcript_state()
+        if self._state == TUIState.RUNNING:
+            self._scroll_to_bottom()
+        self._throttled_invalidate()
+
+    def _finalize_streaming_thinking(self) -> None:
+        """Finalize the complete reasoning block."""
+        complete_thinking = (
+            self._streaming_thinking_buffer.text() if self._streaming_thinking_buffer is not None else ""
+        )
+        if complete_thinking:
+            rendered = self._event_renderer.render_thinking(
+                complete_thinking,
+                width=self._get_terminal_width(),
+            ).rstrip("\n")
+            if not self._update_block_by_id(self._streaming_thinking_block_id, rendered) and rendered:
+                self._append_block(rendered)
         self._streaming_thinking = ""
+        self._streaming_thinking_buffer = None
+        self._streaming_thinking_block_id = None
         self._streaming_thinking_line_index = None
 
     def _format_size_bytes(self, size_bytes: int) -> str:
@@ -1045,6 +1363,29 @@ class TUIApp:
     def _format_attachment_description(self, attachment: PendingAttachment) -> str:
         """Format a single attachment description."""
         return f"{attachment.media_type} {self._format_size_bytes(attachment.size_bytes)}"
+
+    def _format_attachment_placeholder(self, index: int, media_type: str, size_bytes: int) -> str:
+        """Format the visible compose-buffer placeholder for a queued image."""
+        return f"[Attached image {index}: {media_type} {self._format_size_bytes(size_bytes)}]"
+
+    def _insert_attachment_placeholder(self, input_area: TextArea, placeholder: str) -> None:
+        """Insert an attachment placeholder into the current compose buffer."""
+        buffer = input_area.buffer
+        prefix = "" if not buffer.text or buffer.text.endswith((" ", "\n")) else " "
+        suffix = "" if placeholder.endswith(" ") else " "
+        buffer.insert_text(f"{prefix}{placeholder}{suffix}")
+
+    def _strip_attachment_placeholders(
+        self,
+        text: str,
+        attachments: Sequence[PendingAttachment],
+    ) -> str:
+        """Remove generated attachment placeholders from submitted prompt text."""
+        cleaned_text = text
+        for attachment in attachments:
+            if attachment.placeholder:
+                cleaned_text = cleaned_text.replace(attachment.placeholder, "")
+        return cleaned_text.strip()
 
     def _format_pending_attachments_label(self) -> str:
         """Format pending attachment status label."""
@@ -1069,35 +1410,47 @@ class TUIApp:
         self._current_input_backup = ""
 
     def _append_user_input(self, text: str, attachments: Sequence[PendingAttachment] | None = None) -> None:
-        """Render user input as a visually distinct turn boundary."""
+        """Render user input with styled prompt indicator and attachment markers."""
+        attachment_list = list(attachments or [])
+        adapter = self._display_adapter or AguiEventAdapter(
+            session_id=self._session_id, run_id=self._session_id, config=YAACLI_AGUI_ADAPTER_CONFIG
+        )
+        self._record_display_event(
+            adapter.build_run_custom_event(
+                "user_input",
+                {
+                    "text": text,
+                    "attachments": [
+                        {"media_type": item.media_type, "size_bytes": item.size_bytes} for item in attachment_list
+                    ],
+                },
+            )
+        )
         width = self._get_terminal_width()
         from rich.text import Text as RichText
 
-        attachment_list = list(attachments or [])
         display_text = text
         if not display_text and attachment_list:
             count = len(attachment_list)
             noun = "image" if count == 1 else "images"
             display_text = f"[Attached {count} {noun}]"
 
-        delimiter_width = max(width - 1, 24)
-        top_delimiter = " User ".center(delimiter_width, "-")
-        bottom_delimiter = "-" * delimiter_width
-
         user_text = RichText()
+        user_text.append("> ", style="bold green")
         user_text.append(display_text)
         for attachment in attachment_list:
             user_text.append("\n")
             user_text.append("  [Attached] ", style="dim cyan")
             user_text.append(self._format_attachment_description(attachment), style="dim cyan")
-        body = self._renderer.render(user_text, width=width).rstrip("\n")
-        green = "\x1b[1;32m"
-        reset = "\x1b[0m"
-        rendered = f"{green}{top_delimiter}{reset}\n{body}\n{green}{bottom_delimiter}{reset}"
+        rendered = self._renderer.render(user_text, width=width).rstrip("\n")
         self._append_output(rendered)
 
     def _append_error_output(self, e: BaseException) -> None:
         """Render error message with traceback to fit terminal width."""
+        self._record_display_system_event(
+            "error",
+            {"type": type(e).__name__, "message": _safe_exception_str(e)},
+        )
         width = self._get_terminal_width()
         from rich.text import Text as RichText
 
@@ -1206,38 +1559,28 @@ class TUIApp:
         if self._app:
             self._app.invalidate()
 
+    def _create_oauth_refresh_supervisor(self) -> OAuthRefreshSupervisor | None:
+        if not self.config.oauth_refresh.enabled:
+            return None
+        models = [profile.model for profile in build_model_profiles(self.config)]
+        return create_oauth_refresh_supervisor_for_models(
+            models,
+            interval_seconds=self.config.oauth_refresh.interval_seconds,
+            failure_retry_seconds=self.config.oauth_refresh.failure_retry_seconds,
+            refresh_on_startup=self.config.oauth_refresh.refresh_on_startup,
+        )
+
+    def _format_active_model_label(self) -> str:
+        """Format the active model label for status and welcome output."""
+        if self._active_model_profile is not None:
+            return format_model_profile_label(self._active_model_profile)
+        if self.config.general.model:
+            return self.config.general.model
+        return "unconfigured"
+
     # =========================================================================
     # Status Bar
     # =========================================================================
-
-    def _get_status_model_label(self) -> str:
-        """Return compact active model label for the status bar."""
-        current = self._get_current_model_profile()
-        if current is None:
-            return "--"
-        name, _ = current
-        return name
-
-    def _get_context_percent_label(self) -> str:
-        """Return compact context usage percentage for the status bar."""
-        if self._current_context_tokens > 0 and self._context_window_size > 0:
-            return f"{self._current_context_tokens / self._context_window_size * 100:.0f}%"
-        return "--"
-
-    def _append_pinned_status(self, parts: list[tuple[str, str]]) -> None:
-        """Append pinned-scroll status when the user is reading historical output."""
-        if self._auto_scroll:
-            return
-        self._update_pinned_unread_count()
-        label = "Pinned"
-        if self._unread_output_lines:
-            label = f"Pinned: +{self._unread_output_lines} lines"
-        parts.extend([
-            ("class:status-bar", " | "),
-            ("class:status-bar.warning", label),
-            ("class:status-bar", " | "),
-            ("class:status-bar", "Ctrl+L: Bottom"),
-        ])
 
     def _get_status_text(self) -> list[tuple[str, str]]:
         """Get formatted status bar text."""
@@ -1251,29 +1594,27 @@ class TUIApp:
         mode_style = f"class:status-bar.mode-{self._mode.value}"
         state_text = "RUNNING" if self._state == TUIState.RUNNING else "IDLE"
         attachment_label = self._format_pending_attachments_label()
-        context_pct = self._get_context_percent_label()
-        model_label = self._get_status_model_label()
+
+        # Calculate context usage percentage
+        if self._current_context_tokens > 0 and self._context_window_size > 0:
+            context_pct = f"{self._current_context_tokens / self._context_window_size * 100:.0f}"
+        else:
+            context_pct = "--"
 
         # Build status based on state
         if self._state == TUIState.RUNNING:
             # Check if waiting for HITL approval
             if self._hitl_pending:
                 approval_progress = f"{self._current_approval_index + 1}/{len(self._pending_approvals)}"
-                parts = [
+                return [
                     (mode_style, f" {self._mode.value.upper()} "),
-                    ("class:status-bar", " | "),
-                    ("class:status-bar", "State: RUNNING"),
-                    ("class:status-bar", " | "),
-                    ("class:status-bar", f"Model: {model_label}"),
                     ("class:status-bar", " | "),
                     ("class:status-bar.warning", f"Approval: {approval_progress}"),
                     ("class:status-bar", " | "),
-                    ("class:status-bar", f"Context: {context_pct}"),
+                    ("class:status-bar", f"Context: {context_pct}%"),
                     ("class:status-bar", " | "),
                     ("class:status-bar", "Enter/Y: Approve | Text: Reject | Ctrl+C: Cancel"),
                 ]
-                self._append_pinned_status(parts)
-                return parts
             else:
                 # Show phase-specific status
                 phase_display = {"thinking": "Thinking...", "tools": "Running tools..."}.get(
@@ -1282,19 +1623,17 @@ class TUIApp:
                 parts = [
                     (mode_style, f" {self._mode.value.upper()} "),
                     ("class:status-bar", " | "),
-                    ("class:status-bar", "State: RUNNING"),
-                    ("class:status-bar", " | "),
-                    ("class:status-bar", f"Model: {model_label}"),
-                    ("class:status-bar", " | "),
                     ("class:status-bar", phase_display),
                     ("class:status-bar", " | "),
-                    ("class:status-bar", f"Context: {context_pct}"),
+                    ("class:status-bar", f"Model: {self._format_active_model_label()}"),
+                    ("class:status-bar", " | "),
+                    ("class:status-bar", f"Context: {context_pct}%"),
                 ]
                 ctx = self.runtime.ctx
-                if ctx.loop_active:
+                if ctx.goal_active:
                     parts.extend([
                         ("class:status-bar", " | "),
-                        ("class:status-bar.warning", f"Loop: {ctx.loop_iteration}/{ctx.loop_max_iterations}"),
+                        ("class:status-bar.warning", f"Goal: {ctx.goal_iteration}/{ctx.goal_max_iterations}"),
                     ])
                 bg_label = self._format_background_label()
                 if bg_label:
@@ -1311,10 +1650,14 @@ class TUIApp:
                     ("class:status-bar", " | "),
                     ("class:status-bar", "Ctrl+C: Interrupt "),
                 ])
-                self._append_pinned_status(parts)
                 return parts
         else:
-            input_mode_text = "Enter:Send | Shift+Enter:Newline"
+            # IDLE: show input mode and scroll hint
+            if self._input_mode == "send":
+                input_mode_text = "Enter:Send | Tab:Multiline"
+            else:
+                input_mode_text = "Enter:Newline | Tab:Send"
+
             scroll_hint = "Fn+Up/Down: Scroll" if sys.platform == "darwin" else "Ctrl+Up/Down: Scroll"
 
             parts = [
@@ -1322,9 +1665,9 @@ class TUIApp:
                 ("class:status-bar", " | "),
                 ("class:status-bar", f"State: {state_text}"),
                 ("class:status-bar", " | "),
-                ("class:status-bar", f"Model: {model_label}"),
+                ("class:status-bar", f"Model: {self._format_active_model_label()}"),
                 ("class:status-bar", " | "),
-                ("class:status-bar", f"Context: {context_pct}"),
+                ("class:status-bar", f"Context: {context_pct}%"),
             ]
             bg_label = self._format_background_label()
             if bg_label:
@@ -1343,16 +1686,127 @@ class TUIApp:
                 ("class:status-bar", " | "),
                 ("class:status-bar", scroll_hint),
                 ("class:status-bar", " | "),
-                ("class:status-bar", "Mouse: Scroll" if self._mouse_enabled else "Mouse: Select"),
-                ("class:status-bar", " | "),
                 ("class:status-bar", "Ctrl+C: Exit "),
             ])
-            self._append_pinned_status(parts)
             return parts
 
     def _get_prompt(self) -> str:
         """Get the input prompt based on current state."""
-        return "> "
+        state_indicator = "*" if self._state == TUIState.RUNNING else ">"
+        mouse_mode = "scroll" if self._mouse_enabled else "select"
+        return f"[{mouse_mode}] {state_indicator} "
+
+    async def _show_model_selector(self) -> None:
+        """Open the in-TUI model profile selector."""
+        if self._state == TUIState.RUNNING:
+            self._append_system_output("Model selection is available after the current run finishes.")
+            return
+
+        profiles = build_model_profiles(self.config)
+        if not profiles:
+            self._append_system_output("No model profiles are configured.")
+            return
+
+        current_id = self._active_model_profile.id if self._active_model_profile else profiles[0].id
+        current_index = next((idx for idx, profile in enumerate(profiles) if profile.id == current_id), 0)
+        self._model_selector_profiles = profiles
+        self._model_selector_index = current_index
+        self._model_selector_open = True
+        if self._app:
+            self._app.invalidate()
+
+    def _close_model_selector(self) -> None:
+        """Close the in-TUI model selector."""
+        self._model_selector_open = False
+        self._model_selector_profiles = []
+        self._model_selector_index = 0
+        if self._app:
+            self._app.invalidate()
+
+    def _move_model_selector(self, delta: int) -> None:
+        """Move the active selection in the model selector."""
+        if not self._model_selector_open or not self._model_selector_profiles:
+            return
+        count = len(self._model_selector_profiles)
+        self._model_selector_index = (self._model_selector_index + delta) % count
+        if self._app:
+            self._app.invalidate()
+
+    async def _apply_model_selector_selection(self) -> None:
+        """Apply the currently highlighted model profile."""
+        if not self._model_selector_open or not self._model_selector_profiles:
+            return
+
+        index = max(0, min(self._model_selector_index, len(self._model_selector_profiles) - 1))
+        selected_profile = self._model_selector_profiles[index]
+        self._close_model_selector()
+        await self._switch_model_profile(selected_profile)
+
+    def _get_model_selector_text(self) -> ANSI:
+        """Render the in-TUI model selector."""
+        if not self._model_selector_open or not self._model_selector_profiles:
+            return ANSI("")
+
+        max_visible = 8
+        total = len(self._model_selector_profiles)
+        start = max(0, min(self._model_selector_index - max_visible // 2, total - max_visible))
+        end = min(total, start + max_visible)
+
+        lines = [
+            " Select model profile",
+            " Up/Down: move | Enter: use | Esc: cancel",
+            "",
+        ]
+        for idx in range(start, end):
+            profile = self._model_selector_profiles[idx]
+            cursor = ">" if idx == self._model_selector_index else " "
+            active = "*" if self._active_model_profile and profile.id == self._active_model_profile.id else " "
+            lines.append(f" {cursor} {active} {format_model_profile_choice(profile)}")
+
+        if start > 0:
+            lines.insert(3, "     ...")
+        if end < total:
+            lines.append("     ...")
+
+        return ANSI("\n".join(lines))
+
+    def _get_model_selector_height(self) -> int:
+        """Return the model selector window height."""
+        if not self._model_selector_open or not self._model_selector_profiles:
+            return 1
+        max_visible = 8
+        total = len(self._model_selector_profiles)
+        visible_items = min(total, max_visible)
+        overflow_lines = int(total > max_visible and self._model_selector_index >= max_visible // 2)
+        overflow_lines += int(total > max_visible and self._model_selector_index < total - max_visible // 2 - 1)
+        return visible_items + 3 + overflow_lines
+
+    async def _switch_model_profile(self, profile: ResolvedModelProfile) -> None:
+        """Switch the current runtime to a model profile."""
+        if self._state == TUIState.RUNNING:
+            self._append_system_output("Model selection is available after the current run finishes.")
+            return
+
+        model_settings = resolve_model_settings(profile.model_settings)
+        model_cfg = resolve_profile_model_cfg(profile.model_cfg)
+
+        model_extra_headers = (
+            self.runtime.ctx.get_model_extra_headers() if profile.model.startswith("oauth@codex:") else None
+        )
+        self.runtime.agent.model = infer_model(profile.model, extra_headers=model_extra_headers)
+        self.runtime.agent.model_settings = cast(ModelSettings, model_settings)
+        self.runtime.ctx.model_cfg = model_cfg
+        self._active_model_profile = profile
+        if model_cfg.context_window:
+            self._context_window_size = model_cfg.context_window
+        else:
+            self._context_window_size = 200000
+
+        save_selected_model_profile_id(self.config_manager.config_dir, profile.id)
+        self._append_system_output(f"Switched model to {format_model_profile_label(profile)}")
+
+        if self._app:
+            self._app.invalidate()
 
     # =========================================================================
     # Agent Execution
@@ -1496,29 +1950,28 @@ class TUIApp:
         """Callback invoked when a background task completes.
 
         This is called synchronously from the asyncio event loop when
-        SpawnDelegateTool finishes. If the agent is idle and there
-        are pending bus messages, we schedule a new agent turn.
+        SpawnDelegateTool finishes. If the agent is idle, queued background
+        results are redelivered and a new agent turn is scheduled.
 
         Args:
             agent_id: The ID of the completed background agent.
         """
-        # Only trigger if agent is idle - if running, we set a flag to check
+        # Show UI notification immediately, even while the main agent is still
+        # running, so users can see that the background subagent returned.
+        self._append_system_output(f"Background task completed: {agent_id}")
+
+        # Only trigger if agent is idle - if running, we set a flag to redeliver
         # after the current turn completes (see _check_pending_bus_messages)
         if self._state != TUIState.IDLE:
             logger.debug("Background task %s completed while agent running, will check after turn", agent_id)
             self._pending_bus_check_needed = True
             return
 
-        # Check if there are actually pending bus messages
-        ctx = self.runtime.ctx
-        if not ctx.message_bus.has_pending(ctx.agent_id):
+        if not self._deliver_background_messages():
             logger.debug("Background task %s completed but no pending messages", agent_id)
             return
 
         logger.info("Background task %s completed, triggering agent turn", agent_id)
-
-        # Show UI notification that background task completed
-        self._append_system_output(f"Background task completed: {agent_id}")
 
         # Set state atomically BEFORE create_task to prevent race
         self._state = TUIState.RUNNING
@@ -1545,12 +1998,29 @@ class TUIApp:
                 self._app.invalidate()
             return
 
+    def _deliver_background_messages(self) -> bool:
+        """Redeliver queued background notifications into the current main-agent bus."""
+        monitor = self._get_background_monitor()
+        ctx = self.runtime.ctx
+        delivered = 0
+        if monitor is not None:
+            drained_snapshots = monitor.drain_usage_snapshots()
+            for snapshot in drained_snapshots:
+                self._session_usage.set_run_snapshot(snapshot)
+                self._session_usage.commit_run_snapshot(snapshot.run_id)
+            for run_id in monitor.drain_retired_usage_run_ids():
+                self._session_usage.finalize_run_snapshots(run_id)
+            for snapshot in drained_snapshots:
+                if not monitor.can_publish_late_usage_snapshot(snapshot.run_id):
+                    self._session_usage.finalize_run_snapshots(snapshot.run_id)
+            delivered = monitor.deliver_pending_messages(ctx.message_bus, ctx.agent_id)
+        return delivered > 0 or ctx.message_bus.has_pending(ctx.agent_id)
+
     def _check_pending_bus_messages(self) -> None:
         """Check for pending bus messages and trigger agent turn if needed.
 
-        Called after agent execution completes to handle messages that
-        arrived after the last LLM request (e.g., from background tasks
-        that completed while we were still running).
+        Called after agent execution completes to redeliver messages that
+        arrived while the main agent was still running.
         """
         # Only proceed if flag was set (background task completed during run)
         if not self._pending_bus_check_needed:
@@ -1561,9 +2031,7 @@ class TUIApp:
         if self._state != TUIState.IDLE:
             return
 
-        # Check if there are actually pending bus messages
-        ctx = self.runtime.ctx
-        if not ctx.message_bus.has_pending(ctx.agent_id):
+        if not self._deliver_background_messages():
             return
 
         logger.info("Pending bus messages detected after agent turn, triggering new turn")
@@ -1577,6 +2045,57 @@ class TUIApp:
         # Schedule agent turn - empty prompt, the bus message IS the input
         self._agent_task = asyncio.create_task(self._run_agent(""))
         self._agent_task.add_done_callback(self._on_agent_task_done)
+
+    def _mark_goal_usage_report_pending(self) -> None:
+        """Mark the active goal usage report to be printed after final usage persistence."""
+        if self._goal_usage_start_breakdown is not None:
+            self._goal_usage_report_pending = True
+
+    def _append_goal_usage_report_if_pending(self) -> None:
+        """Append the token delta for the just-finished goal, if pending."""
+        if not self._goal_usage_report_pending:
+            return
+
+        start_breakdown = self._goal_usage_start_breakdown
+        self._goal_usage_start_breakdown = None
+        self._goal_usage_report_pending = False
+
+        if start_breakdown is None:
+            return
+
+        delta = self._session_usage.token_breakdown.delta_since(start_breakdown)
+        self._append_system_output(
+            "[Goal] Total tokens used this goal: "
+            f"{delta.total_tokens:,} tokens "
+            "("
+            f"input: {delta.input_tokens:,}, "
+            f"cache read: {delta.cache_read_tokens:,}, "
+            f"cache write: {delta.cache_write_tokens:,}, "
+            f"output: {delta.output_tokens:,}"
+            ")"
+        )
+
+    def _finish_active_goal(self, reason: GoalCompleteReason) -> None:
+        """Finish active goal mode from the TUI layer with an explicit reason."""
+        ctx = self.runtime.ctx
+        if not isinstance(ctx, TUIContext) or not ctx.goal_active:
+            return
+
+        event = GoalCompleteEvent(
+            event_id=f"goal-{uuid.uuid4().hex[:8]}",
+            iteration=ctx.goal_iteration,
+            reason=reason,
+            task=ctx.goal_task or "",
+        )
+        stream_event = StreamEvent(agent_id="main", agent_name="main", event=event)
+
+        if self._display_adapter is not None:
+            self._handle_and_record_display_events(self._display_adapter.adapt_stream_event(stream_event))
+            self._handle_stream_event(stream_event, render_display=False)
+        else:
+            self._handle_stream_event(stream_event)
+
+        ctx.reset_goal()
 
     async def _run_agent(
         self,
@@ -1592,6 +2111,12 @@ class TUIApp:
         self._subagent_states.clear()
         self._event_renderer.clear()
         cancelled = False
+        reported_error = False
+        run_id = uuid.uuid4().hex[:12]
+        self._display_adapter = AguiEventAdapter(
+            session_id=self._session_id, run_id=run_id, config=YAACLI_AGUI_ADAPTER_CONFIG
+        )
+        self._handle_and_record_display_events([self._display_adapter.build_run_started_event()])
 
         try:
             # Initial agent execution
@@ -1610,7 +2135,10 @@ class TUIApp:
                 # Resume agent with approval results
                 result = await self._execute_stream(user_response)
 
-            # Agent completed successfully
+            output = result.output if result and isinstance(result.output, str) else None
+            self._handle_and_record_display_events([
+                self._display_adapter.build_run_finished_event(result={"output_text": output})
+            ])
 
         except asyncio.CancelledError:
             cancelled = True
@@ -1622,6 +2150,7 @@ class TUIApp:
             if _is_benign_contextvar_cleanup_error(e):
                 logger.debug("Suppressed benign ContextVar cleanup error in agent run: %s", _safe_exception_str(e))
             else:
+                reported_error = True
                 self._finalize_streaming_text()
                 self._finalize_streaming_thinking()
                 self._append_error_output(e)
@@ -1632,6 +2161,12 @@ class TUIApp:
                     self._append_system_output(
                         f"After restarting, run /session {self._session_id} to restore this session."
                     )
+                self._handle_and_record_display_events([
+                    self._display_adapter.build_run_error_event(
+                        message=_safe_exception_str(e),
+                        code=type(e).__name__,
+                    )
+                ])
                 logger.exception("Agent execution failed")
         finally:
             # Finalize any remaining streaming text/thinking
@@ -1648,11 +2183,19 @@ class TUIApp:
             # These are messages injected via bus from user during execution.
             # If not cleared, they would leak into unrelated future tasks.
             self.runtime.ctx.steering_messages.clear()
-            # Clean up loop state if still active (cancelled or error)
+            # Finish active goal state explicitly. Verified and max-iteration
+            # endings are handled by the goal guard; if the guard did not end
+            # goal mode, the run stopped without accepted completion.
             ctx = self.runtime.ctx
-            if ctx.loop_active:
-                self._append_system_output("[Loop] Cancelled")
-                ctx.reset_loop()
+            if isinstance(ctx, TUIContext) and ctx.goal_active:
+                if cancelled:
+                    goal_stop_reason = GoalCompleteReason.cancelled
+                elif reported_error:
+                    goal_stop_reason = GoalCompleteReason.error
+                else:
+                    goal_stop_reason = GoalCompleteReason.unverified_stop
+                self._finish_active_goal(goal_stop_reason)
+            self._append_goal_usage_report_if_pending()
             self._agent_phase = "idle"
             self._state = TUIState.IDLE
             if self._app:
@@ -1663,6 +2206,7 @@ class TUIApp:
             # intended to stop execution, not restart it immediately.
             if not cancelled:
                 self._check_pending_bus_messages()
+            self._display_adapter = None
 
     def _reset_hitl_state(self) -> None:
         """Reset all HITL-related state variables.
@@ -1688,7 +2232,7 @@ class TUIApp:
         self,
         prompt: str | DeferredToolResults,
         attachments: Sequence[PendingAttachment] | None = None,
-    ) -> Any:
+    ) -> AgentRunResult[str | DeferredToolRequests] | None:
         """Execute a single agent stream and return the result.
 
         Args:
@@ -1721,44 +2265,62 @@ class TUIApp:
             resume_max_attempts=self.config.general.agent_stream_resume_max_attempts,
             resume_prompt=self.config.general.agent_stream_resume_prompt,
         ) as stream:
-            async for event in stream:
-                self._handle_stream_event(event)
-
-            # Always try to save message history from the run, even on error.
-            # This preserves conversation context so user can continue
-            # with a new prompt after an error, instead of losing all context.
-            # Wrapped in try/except since run fields may be incomplete on error.
-            self._last_run = stream.run
             try:
-                if stream.run:
-                    self._message_history = list(stream.run.all_messages())
-                    # Update context usage from run
-                    usage = coerce_run_usage(stream.run.usage)
-                    latest_usage = get_latest_request_usage(self._message_history)
-                    self._current_context_tokens = latest_usage.total_tokens if latest_usage else usage.total_tokens
+                async for event in stream:
+                    if self._display_adapter is not None:
+                        display_events = self._display_adapter.adapt_stream_event(event)
+                        self._handle_and_record_display_events(display_events)
+                        self._handle_stream_event(event, render_display=False)
+                    else:
+                        self._handle_stream_event(event)
 
-                    # Accumulate session usage
-                    model_id = cast(Model, self.runtime.agent.model).model_name
-                    self._session_usage.add("main", model_id, usage)
-
-                    # Also accumulate extra_usages (subagents, image_understanding, etc.)
-                    ctx = self.runtime.ctx
-                    for record in ctx.extra_usages:
-                        self._session_usage.add(record.agent, record.model_id, record.usage)
-            except Exception:
-                logger.debug("Failed to save message history from errored run", exc_info=True)
-
-            # Persist the latest recoverable state before surfacing stream errors.
-            # Successful runs exclude extra_usages so future restores start clean.
-            # Error paths include extra_usages to preserve crash-recovery context.
-            try:
                 stream.raise_if_exception()
-            except Exception:
-                self._save_session_snapshot(include_extra_usages=True, save_reason="error")
+            except BaseException as exc:
+                self._persist_stream_recoverable_state(stream)
+                if isinstance(exc, AgentInterrupted | asyncio.CancelledError):
+                    raise
+                await self._save_session_snapshot_async(include_usage_ledger=True, save_reason="error")
                 raise
 
-            self._auto_save_history()
+            self._persist_stream_recoverable_state(stream)
+            monitor = self._get_background_monitor()
+            if monitor is not None:
+                monitor.acknowledge_enqueued_task_results(self.runtime.ctx.message_bus, self.runtime.ctx.agent_id)
+            await self._auto_save_history()
             return stream.run.result if stream.run else None
+
+    def _persist_stream_recoverable_state(
+        self, stream: AgentStreamer[AgentContext, str | DeferredToolRequests]
+    ) -> bool:
+        """Persist stream recoverable messages and usage to in-memory session state."""
+        self._last_run = stream.run
+        if stream.run is None:
+            return False
+        try:
+            message_history = stream.recoverable_messages()
+            self._message_history = message_history
+            usage = stream.run.usage
+            latest_usage = get_latest_request_usage(message_history)
+            self._current_context_tokens = latest_usage.total_tokens if latest_usage else usage.total_tokens
+
+            # Accumulate main-agent usage when no realtime snapshot was emitted.
+            if not self._session_usage.has_run_snapshot:
+                model_id = cast(Model, self.runtime.agent.model).model_name
+                self._session_usage.add("main", model_id, usage)
+            committed_run_ids = self._session_usage.commit_run_snapshot()
+            monitor = self._get_background_monitor()
+            for run_id in committed_run_ids:
+                if monitor is not None:
+                    monitor.observe_usage_run(run_id)
+                if monitor is None or not monitor.can_publish_late_usage_snapshot(run_id):
+                    self._session_usage.finalize_run_snapshots(run_id)
+            if monitor is not None:
+                for run_id in monitor.drain_retired_usage_run_ids():
+                    self._session_usage.finalize_run_snapshots(run_id)
+        except Exception:
+            logger.debug("Failed to persist recoverable stream state", exc_info=True)
+            return False
+        return True
 
     async def _request_user_action(
         self,
@@ -1787,7 +2349,12 @@ class TUIApp:
         for idx, tool_call in enumerate(deferred.approvals):
             self._current_approval_index = idx
             # Display approval panel
-            self._display_approval_panel(tool_call, idx + 1, len(deferred.approvals))
+            self._display_approval_panel(
+                tool_call,
+                idx + 1,
+                len(deferred.approvals),
+                deferred.metadata.get(tool_call.tool_call_id),
+            )
 
             # Wait for user decision (blocking with asyncio.Event)
             approved, reason = await self._wait_for_approval_input()
@@ -1827,7 +2394,7 @@ class TUIApp:
         self._approval_event = None
         return approved, reason
 
-    def _format_args_for_display(self, args: Any, max_str_len: int = 500, max_lines: int = 30) -> str:
+    def _format_args_for_display(self, args: object, max_str_len: int = 500, max_lines: int = 30) -> str:
         """Format tool arguments for display with smart truncation.
 
         Args:
@@ -1839,7 +2406,7 @@ class TUIApp:
             Formatted JSON string or fallback representation
         """
 
-        def truncate_strings(obj: Any, max_len: int) -> Any:
+        def truncate_strings(obj: object, max_len: int) -> object:
             """Recursively truncate long strings in nested structures."""
             if isinstance(obj, str):
                 if len(obj) > max_len:
@@ -1888,6 +2455,7 @@ class TUIApp:
         tool_call: ToolCallPart,
         index: int,
         total: int,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Display approval panel for a tool call."""
         from rich.console import Group
@@ -1899,6 +2467,17 @@ class TUIApp:
             Text(""),
             Text(f"Tool: {tool_call.tool_name}", style="bold yellow"),
         ]
+
+        if metadata and metadata.get("reviewer") == "shell_command_reviewer":
+            reason = metadata.get("reason")
+            risk_level = metadata.get("risk_level")
+            if reason or risk_level:
+                content_parts.append(Text(""))
+                content_parts.append(Text("Shell review:", style="bold cyan"))
+                if risk_level:
+                    content_parts.append(Text(f"Risk: {risk_level}", style="yellow"))
+                if reason:
+                    content_parts.append(Text(f"Reason: {reason}", style="yellow"))
 
         if tool_call.args:
             content_parts.append(Text(""))
@@ -1937,15 +2516,14 @@ class TUIApp:
         text.append("Running...", style="dim")
         rendered = self._renderer.render(text, width=self._get_terminal_width())
 
-        # Track state with line index for later update
-        line_index = len(self._output_lines)
+        block_id = self._append_block(rendered.rstrip())
         self._subagent_states[agent_id] = {
-            "line_index": line_index,
+            "block_id": block_id,
+            "line_index": self._transcript.index_of(block_id),
             "tool_names": [],
+            "tool_count": 0,
             "agent_name": agent_name,
         }
-        self._append_block(rendered.rstrip())
-        self._maybe_scroll_to_bottom()
         self._throttled_invalidate()
 
     def _handle_subagent_complete(self, event: SubagentCompleteEvent) -> None:
@@ -1998,10 +2576,13 @@ class TUIApp:
 
         rendered = self._renderer.render(text, width=self._get_terminal_width())
 
-        # Update the line in place
-        if line_index < len(self._output_lines):
+        # Update by stable ID, with index fallback for legacy/test state.
+        block_id = state.get("block_id")
+        stable_update_failed = not isinstance(block_id, int) or not self._update_block_by_id(
+            BlockId(block_id), rendered.rstrip()
+        )
+        if stable_update_failed and isinstance(line_index, int) and line_index < len(self._output_lines):
             self._update_block(line_index, rendered.rstrip())
-            self._maybe_scroll_to_bottom()
 
         # Clean up state
         del self._subagent_states[agent_id]
@@ -2015,6 +2596,7 @@ class TUIApp:
         state = self._subagent_states[agent_id]
         line_index = state["line_index"]
         tool_names = state["tool_names"]
+        tool_count = state.get("tool_count", len(tool_names))
 
         # Build progress line
         text = Text()
@@ -2025,17 +2607,20 @@ class TUIApp:
             # Show last few tools
             recent_tools = tool_names[-3:]  # Last 3 tools
             tools_str = ", ".join(recent_tools)
-            if len(tool_names) > 3:
+            if tool_count > 3:
                 tools_str = f"...{tools_str}"
             text.append(tools_str, style="dim yellow")
-            text.append(f" ({len(tool_names)} tools)", style="dim")
+            text.append(f" ({tool_count} tools)", style="dim")
 
         rendered = self._renderer.render(text, width=self._get_terminal_width())
 
-        # Update the line in place
-        if line_index < len(self._output_lines):
+        # Update by stable ID, with index fallback for legacy/test state.
+        block_id = state.get("block_id")
+        updated = isinstance(block_id, int) and self._update_block_by_id(BlockId(block_id), rendered.rstrip())
+        if not updated and isinstance(line_index, int) and line_index < len(self._output_lines):
             self._update_block(line_index, rendered.rstrip())
-            self._maybe_scroll_to_bottom()
+            updated = True
+        if updated:
             self._throttled_invalidate()
 
     @staticmethod
@@ -2043,8 +2628,8 @@ class TUIApp:
         """Check if an agent_id belongs to a background subagent."""
         return "-bg-" in agent_id
 
-    def _handle_stream_event(self, event: StreamEvent) -> None:
-        """Handle a stream event from agent execution."""
+    def _handle_stream_event(self, event: StreamEvent, *, render_display: bool = True) -> None:
+        """Handle non-display state updates from agent execution."""
         message_event = event.event
         agent_id = event.agent_id
 
@@ -2072,10 +2657,38 @@ class TUIApp:
         if agent_id != "main" and agent_id in self._subagent_states:
             if isinstance(message_event, FunctionToolCallEvent):
                 # Track tool name for progress display
-                tool_name = message_event.part.tool_name
-                self._subagent_states[agent_id]["tool_names"].append(tool_name)
-                self._update_subagent_progress_line(agent_id)
+                tool_call_id = message_event.part.tool_call_id
+                if tool_call_id not in self._tool_messages:
+                    tool_name = message_event.part.tool_name
+                    self._tool_messages[tool_call_id] = ToolMessage(
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                        args=message_event.part.args,
+                    )
+                    state = self._subagent_states[agent_id]
+                    state["tool_names"] = [*state["tool_names"][-2:], tool_name]
+                    state["tool_count"] = int(state.get("tool_count", 0)) + 1
+                    self._update_subagent_progress_line(agent_id)
             # Ignore all other subagent events (text streaming, tool results, etc.)
+            return
+
+        if isinstance(message_event, UsageSnapshotEvent):
+            if message_event.snapshot is not None:
+                self._session_usage.set_run_snapshot(message_event.snapshot)
+            return
+
+        if not render_display and isinstance(
+            message_event,
+            PartStartEvent
+            | PartDeltaEvent
+            | PartEndEvent
+            | FunctionToolCallEvent
+            | OutputToolCallEvent
+            | FunctionToolResultEvent
+            | OutputToolResultEvent,
+        ):
+            # AGUI is the sole owner of display and tool-render state. The raw
+            # SDK path continues below only when no display adapter is active.
             return
 
         # Main agent events - normal processing
@@ -2120,28 +2733,28 @@ class TUIApp:
             elif isinstance(message_event.part, ThinkingPart):
                 self._finalize_streaming_thinking()
 
-        elif isinstance(message_event, FunctionToolCallEvent):
+        elif isinstance(message_event, FunctionToolCallEvent | OutputToolCallEvent):
             # Finalize any streaming text before tool call
             self._finalize_streaming_text()
             self._finalize_streaming_thinking()
 
             tool_call_id = message_event.part.tool_call_id
             tool_name = message_event.part.tool_name
+            display_args = _bounded_tool_args(message_event.part.args)
             self._tool_messages[tool_call_id] = ToolMessage(
                 tool_call_id=tool_call_id,
                 name=tool_name,
-                args=message_event.part.args,
+                args=display_args,
             )
-            self._event_renderer.tracker.start_call(tool_call_id, tool_name, message_event.part.args)
+            self._event_renderer.tracker.start_call(tool_call_id, tool_name, display_args)
             rendered = self._event_renderer.render_tool_call_start(tool_name, tool_call_id)
-            self._tool_call_line_indices[tool_call_id] = len(self._output_lines)
             self._append_output(rendered.rstrip())
 
-        elif isinstance(message_event, FunctionToolResultEvent):
+        elif isinstance(message_event, FunctionToolResultEvent | OutputToolResultEvent):
             tool_call_id = message_event.tool_call_id
             if tool_call_id in self._tool_messages:
                 tool_msg = self._tool_messages[tool_call_id]
-                result_content = self._extract_tool_result(message_event)
+                result_content = _bounded_tool_result(self._extract_tool_result(message_event))
                 tool_msg.content = result_content
                 self._event_renderer.tracker.complete_call(tool_call_id, result_content)
 
@@ -2153,14 +2766,7 @@ class TUIApp:
                     rendered = self._event_renderer.render_tool_call_complete(
                         tool_msg, duration=duration, width=self._get_terminal_width()
                     )
-                    rendered = rendered.rstrip()
-                    line_index = self._tool_call_line_indices.pop(tool_call_id, None)
-                    if line_index is not None and line_index < len(self._output_lines):
-                        self._update_block(line_index, rendered)
-                        self._maybe_scroll_to_bottom()
-                        self._throttled_invalidate()
-                    else:
-                        self._append_output(rendered)
+                    self._append_output(rendered.rstrip())
                     self._printed_tool_calls.add(tool_call_id)
 
         # Handle SDK events (compact, handoff)
@@ -2211,17 +2817,31 @@ class TUIApp:
                 self._append_output(rendered.rstrip())
 
         # Handle TUI-specific events
-        elif isinstance(message_event, LoopIterationEvent):
-            self._append_system_output(f"[Loop] Iteration {message_event.iteration}/{message_event.max_iterations}")
+        elif isinstance(message_event, GoalIterationEvent):
+            self._append_system_output(f"[Goal] Iteration {message_event.iteration}/{message_event.max_iterations}")
 
-        elif isinstance(message_event, LoopCompleteEvent):
-            if message_event.reason == LoopCompleteReason.verified:
-                self._append_system_output(f"[Loop] Task completed in {message_event.iteration} iteration(s)")
-            elif message_event.reason == LoopCompleteReason.max_iterations:
+        elif isinstance(message_event, GoalCompleteEvent):
+            if message_event.reason == GoalCompleteReason.verified:
+                self._append_system_output(f"[Goal] Task completed in {message_event.iteration} iteration(s)")
+            elif message_event.reason == GoalCompleteReason.max_iterations:
                 self._append_system_output(
-                    f"[Loop] Reached max iterations ({message_event.iteration}). "
-                    "Task may be incomplete. You can run /loop again to continue."
+                    f"[Goal] Reached max iterations ({message_event.iteration}). "
+                    "Task may be incomplete. You can run /goal again to continue."
                 )
+            elif message_event.reason == GoalCompleteReason.cancelled:
+                self._append_system_output(
+                    f"[Goal] Cancelled at iteration {message_event.iteration}. Task may be incomplete."
+                )
+            elif message_event.reason == GoalCompleteReason.error:
+                self._append_system_output(
+                    f"[Goal] Stopped after an error at iteration {message_event.iteration}. Task may be incomplete."
+                )
+            elif message_event.reason == GoalCompleteReason.unverified_stop:
+                self._append_system_output(
+                    f"[Goal] Stopped without verified completion at iteration {message_event.iteration}. "
+                    "Task may be incomplete. You can run /goal again to continue."
+                )
+            self._mark_goal_usage_report_pending()
 
         elif isinstance(message_event, ContextUpdateEvent):
             self._current_context_tokens = message_event.total_tokens
@@ -2250,10 +2870,9 @@ class TUIApp:
                 rendered = self._event_renderer.render_steering_injected(previews)
                 self._append_output(rendered.rstrip())
 
-        if self._app:
-            self._app.invalidate()
+        self._throttled_invalidate()
 
-    async def _paste_clipboard_image(self) -> None:
+    async def _paste_clipboard_image(self, input_area: TextArea | None = None) -> None:
         """Attach an image from the system clipboard when available."""
         try:
             clipboard_result = await read_clipboard_image()
@@ -2263,12 +2882,37 @@ class TUIApp:
 
         image = clipboard_result.image
         if image is not None:
+            size_bytes = len(image.data)
+            media = getattr(self.config, "media", None)
+            max_attachments = _positive_int_config(
+                getattr(media, "max_pending_attachments", None), _DEFAULT_MAX_PENDING_ATTACHMENTS
+            )
+            max_attachment_bytes = _positive_int_config(
+                getattr(media, "max_pending_attachment_bytes", None), _DEFAULT_MAX_PENDING_ATTACHMENT_BYTES
+            )
+            queued_bytes = sum(item.size_bytes for item in self._pending_attachments)
+            if len(self._pending_attachments) >= max_attachments:
+                self._append_system_output(f"Attachment limit reached ({max_attachments} per prompt).")
+                return
+            if size_bytes > max_attachment_bytes or queued_bytes + size_bytes > max_attachment_bytes:
+                self._append_system_output(
+                    f"Attachment byte limit exceeded ({self._format_size_bytes(max_attachment_bytes)} per prompt)."
+                )
+                return
+            placeholder = self._format_attachment_placeholder(
+                len(self._pending_attachments) + 1,
+                image.media_type,
+                size_bytes,
+            )
             attachment = PendingAttachment(
                 data=image.data,
                 media_type=image.media_type,
-                size_bytes=len(image.data),
+                size_bytes=size_bytes,
+                placeholder=placeholder,
             )
             self._pending_attachments.append(attachment)
+            if input_area is not None:
+                self._insert_attachment_placeholder(input_area, placeholder)
             self._history_index = -1
             self._current_input_backup = ""
             self._append_system_output(f"Attached {self._format_attachment_description(attachment)} from clipboard")
@@ -2297,6 +2941,8 @@ class TUIApp:
         self._current_input_backup = ""
         if not self._prompt_history or self._prompt_history[-1] != text:
             self._prompt_history.append(text)
+            if len(self._prompt_history) > self._max_prompt_history:
+                del self._prompt_history[: len(self._prompt_history) - self._max_prompt_history]
 
     def _submit_input(self, text: str, input_area: TextArea) -> None:
         """Submit the current input buffer content."""
@@ -2318,43 +2964,41 @@ class TUIApp:
         if text.startswith("/"):
             self._add_prompt_history(text)
             input_area.buffer.reset()
-            self._follow_latest_output()
             self._track_managed_task(asyncio.create_task(self._handle_command(text)))
             return
 
         if text.startswith("!"):
             self._add_prompt_history(text)
             input_area.buffer.reset()
-            self._follow_latest_output()
             self._track_managed_task(asyncio.create_task(self._execute_shell_command(text[1:])))
             return
 
         attachments = self._consume_pending_attachments()
-        if not text and not attachments:
+        submitted_text = self._strip_attachment_placeholders(text, attachments)
+        if not submitted_text and not attachments:
             input_area.buffer.reset()
             return
 
-        self._add_prompt_history(text)
+        self._add_prompt_history(submitted_text)
 
         input_area.buffer.reset()
-        self._follow_latest_output()
-        self._append_user_input(text, attachments)
-        self._agent_task = asyncio.create_task(self._run_agent(text, attachments))
+        self._append_user_input(submitted_text, attachments)
+        self._agent_task = asyncio.create_task(self._run_agent(submitted_text, attachments))
         self._agent_task.add_done_callback(self._on_agent_task_done)
 
-    def _extract_tool_result(self, event: FunctionToolResultEvent) -> str:
+    def _extract_tool_result(self, event: FunctionToolResultEvent | OutputToolResultEvent) -> str:
         """Extract result content from tool result event."""
         try:
-            result = event.result
-            if hasattr(result, "content"):
-                content = result.content
+            part = event.part
+            if hasattr(part, "content"):
+                content = part.content
                 if isinstance(content, str):
                     return content
                 rv = getattr(content, "return_value", None)
                 if rv is not None:
                     return str(rv)
                 return str(content)
-            return str(result)
+            return str(part)
         except Exception:
             return "<result>"
 
@@ -2362,63 +3006,14 @@ class TUIApp:
     # UI Setup
     # =========================================================================
 
-    def _get_slash_command_entries(self) -> dict[str, str]:
-        """Return slash command names and descriptions for completion."""
-        entries = dict(_BUILTIN_SLASH_COMMAND_DESCRIPTIONS)
-        for name, cmd_def in self.config.get_commands().items():
-            entries[name] = cmd_def.description or "Custom command"
-        return entries
-
-    @staticmethod
-    def _apply_selected_completion(input_area: TextArea) -> bool:
-        """Apply the current completion when the completion menu is open."""
-        complete_state = input_area.buffer.complete_state
-        if complete_state is None:
-            return False
-
-        completion = complete_state.current_completion
-        if completion is None:
-            input_area.buffer.complete_next()
-            complete_state = input_area.buffer.complete_state
-            completion = complete_state.current_completion if complete_state else None
-        if completion is None:
-            return False
-
-        input_area.buffer.apply_completion(completion)
-        return True
-
-    @staticmethod
-    def _move_completion(input_area: TextArea, *, forward: bool) -> bool:
-        """Move within the active completion menu, if it is open."""
-        if input_area.buffer.complete_state is None:
-            return False
-        if forward:
-            input_area.buffer.complete_next(disable_wrap_around=True)
-        else:
-            input_area.buffer.complete_previous(disable_wrap_around=True)
-        return True
-
-    @staticmethod
-    def _start_slash_completion(input_area: TextArea) -> None:
-        """Open slash command completions when the cursor is at a slash prefix."""
-        if SlashCommandCompleter._command_prefix(input_area.buffer.document.text_before_cursor) is None:
-            return
-        input_area.buffer.start_completion(select_first=False)
-
-    @staticmethod
-    def _write_terminal_sequence(app: Application[Any], sequence: str) -> None:
-        """Best-effort raw terminal sequence write."""
-        try:
-            app.output.write_raw(sequence)
-            app.output.flush()
-        except Exception:
-            logger.debug("Failed to write terminal control sequence", exc_info=True)
-
     def _setup_input_keybindings(self, input_area: TextArea) -> KeyBindings:
         """Set up key bindings owned by the focused input control."""
         kb = KeyBindings()
 
         def previous_history() -> None:
+            if self._model_selector_open:
+                self._move_model_selector(-1)
+                return
             if not self._prompt_history:
                 return
             # First time pressing up: backup current input
@@ -2432,6 +3027,9 @@ class TUIApp:
                 input_area.buffer.cursor_position = len(input_area.buffer.text)
 
         def next_history() -> None:
+            if self._model_selector_open:
+                self._move_model_selector(1)
+                return
             if self._history_index == -1:
                 return
             # Move to next item
@@ -2447,78 +3045,58 @@ class TUIApp:
         @kb.add("up", eager=True)
         def handle_up(event: KeyPressEvent) -> None:
             """Navigate to previous prompt in history."""
-            if self._move_completion(input_area, forward=False):
-                return
             previous_history()
 
         @kb.add("c-p", eager=True)
         def handle_ctrl_p(event: KeyPressEvent) -> None:
             """Navigate to previous prompt in history using a TTY-stable key."""
-            if self._move_completion(input_area, forward=False):
-                return
             previous_history()
 
         @kb.add("down", eager=True)
         def handle_down(event: KeyPressEvent) -> None:
             """Navigate to next prompt in history."""
-            if self._move_completion(input_area, forward=True):
-                return
             next_history()
 
         @kb.add("c-n", eager=True)
         def handle_ctrl_n(event: KeyPressEvent) -> None:
             """Navigate to next prompt in history using a TTY-stable key."""
-            if self._move_completion(input_area, forward=True):
-                return
             next_history()
 
         def submit_or_newline() -> None:
-            text = input_area.buffer.text.strip()
-
-            if self._hitl_pending and self._approval_event and not self._approval_event.is_set():
-                input_area.buffer.reset()
-                if text.lower() in ("", "y", "yes"):
-                    self._approval_result = True
-                    self._approval_reason = None
+            if self._model_selector_open:
+                if self._app:
+                    self._app.create_background_task(self._apply_model_selector_selection())
                 else:
-                    self._approval_result = False
-                    self._approval_reason = text if text else None
-                self._approval_event.set()
+                    self._track_managed_task(asyncio.create_task(self._apply_model_selector_selection()))
                 return
 
-            self._submit_input(text, input_area)
+            if self._input_mode == "send":
+                text = input_area.buffer.text.strip()
 
-        def insert_newline() -> None:
-            input_area.buffer.insert_text("\n")
+                if self._hitl_pending and self._approval_event and not self._approval_event.is_set():
+                    input_area.buffer.reset()
+                    if text.lower() in ("", "y", "yes"):
+                        self._approval_result = True
+                        self._approval_reason = None
+                    else:
+                        self._approval_result = False
+                        self._approval_reason = text if text else None
+                    self._approval_event.set()
+                    return
 
-        @kb.add("c-m", eager=True)
-        def handle_enter(event: KeyPressEvent) -> None:
-            """Submit on Enter."""
-            if _is_shift_enter_event_data(event.data):
-                insert_newline()
+                self._submit_input(text, input_area)
             else:
-                submit_or_newline()
+                input_area.buffer.insert_text("\n")
+
+        @kb.add("enter", eager=True)
+        def handle_enter(event: KeyPressEvent) -> None:
+            """Handle Enter based on current input mode."""
+            submit_or_newline()
 
         @kb.add("c-j", eager=True)
         def handle_ctrl_j(event: KeyPressEvent) -> None:
             """Handle terminals that emit Ctrl+J for Enter."""
-            if _is_shift_enter_event_data(event.data):
-                insert_newline()
-            else:
-                submit_or_newline()
-
-        @kb.add("escape", "[", "1", "3", ";", "2", "u", eager=True)
-        @kb.add("escape", "[", "1", "3", ";", "2", "~", eager=True)
-        @kb.add("escape", "[", "2", "7", ";", "2", ";", "1", "3", "~", eager=True)
-        def handle_shift_enter(event: KeyPressEvent) -> None:
-            """Insert newline for terminals that emit Shift+Enter escape sequences."""
-            insert_newline()
-
-        @kb.add("/", eager=True)
-        def handle_slash(event: KeyPressEvent) -> None:
-            """Insert slash and open slash command completions immediately."""
-            input_area.buffer.insert_text("/")
-            self._start_slash_completion(input_area)
+            submit_or_newline()
 
         return kb
 
@@ -2530,6 +3108,10 @@ class TUIApp:
         def handle_ctrl_c(event: KeyPressEvent) -> None:
             """Handle Ctrl+C - cancel running task or double-press to exit."""
             current_time = time.time()
+
+            if self._model_selector_open:
+                self._close_model_selector()
+                return
 
             if self._state == TUIState.RUNNING:
                 # Running: request cancellation (state change handled by _run_agent finally)
@@ -2558,11 +3140,16 @@ class TUIApp:
         # Scroll functions
         def _scroll_up(event: KeyPressEvent) -> None:
             """Scroll output up."""
-            self._scroll_output_up(10)
+            self._scroll_offset = max(0, self._scroll_offset - 10)
+            if self._app:
+                self._app.invalidate()
 
         def _scroll_down(event: KeyPressEvent) -> None:
             """Scroll output down."""
-            self._scroll_output_down(10)
+            max_scroll = self._get_max_scroll()
+            self._scroll_offset = min(self._scroll_offset + 10, max_scroll)
+            if self._app:
+                self._app.invalidate()
 
         # Register scroll keybindings
         kb.add("pageup")(_scroll_up)
@@ -2577,7 +3164,7 @@ class TUIApp:
         @kb.add("c-l")
         def handle_ctrl_l(event: KeyPressEvent) -> None:
             """Scroll to bottom of output."""
-            self._follow_latest_output()
+            self._scroll_to_bottom()
             if self._app:
                 self._app.invalidate()
 
@@ -2589,7 +3176,11 @@ class TUIApp:
 
         @kb.add("escape")
         def handle_escape(event: KeyPressEvent) -> None:
-            """Toggle mouse support mode."""
+            """Close model selector or toggle mouse support mode."""
+            if self._model_selector_open:
+                self._close_model_selector()
+                return
+
             self._mouse_enabled = not self._mouse_enabled
             if self._app and self._app.output:
                 if self._mouse_enabled:
@@ -2612,17 +3203,21 @@ class TUIApp:
             # Use eager matching so this app-level binding wins over prompt_toolkit's
             # default buffer/control Ctrl+V handlers on macOS terminals.
             if self._app:
-                self._app.create_background_task(self._paste_clipboard_image())
+                self._app.create_background_task(self._paste_clipboard_image(input_area))
             else:
-                self._track_managed_task(asyncio.create_task(self._paste_clipboard_image()))
+                self._track_managed_task(asyncio.create_task(self._paste_clipboard_image(input_area)))
 
         @kb.add("tab")
         def handle_tab(event: KeyPressEvent) -> None:
-            """Accept completion when active."""
-            if self._apply_selected_completion(input_area):
-                if self._app:
-                    self._app.invalidate()
+            """Toggle input mode between send and edit."""
+            if self._model_selector_open:
                 return
+            if self._input_mode == "send":
+                self._input_mode = "edit"
+            else:
+                self._input_mode = "send"
+            if self._app:
+                self._app.invalidate()
 
         @kb.add("c-o")
         def handle_newline(event: KeyPressEvent) -> None:
@@ -2655,12 +3250,8 @@ class TUIApp:
             "status-bar.mode-act": "bg:ansigreen fg:black bold",
             "status-bar.mode-plan": "bg:ansiblue fg:white bold",
             "steering-pane": "bg:ansibrightblack fg:ansicyan",
+            "model-selector": "bg:ansibrightblack fg:ansiwhite",
             "input-area": "",
-            "input-frame": "fg:ansiblue",
-            "completion-menu": "bg:#25283a fg:#d7d9f0",
-            "completion-menu.completion.current": "bg:ansiblue fg:white",
-            "completion-menu.meta": "fg:ansibrightblack",
-            "completion-menu.meta.completion.current": "fg:white",
         })
 
     # =========================================================================
@@ -2675,7 +3266,7 @@ class TUIApp:
             logger.exception("Command failed: %s", command)
             self._append_error_output(e)
         finally:
-            self._follow_latest_output()
+            self._scroll_to_bottom()
             if self._app:
                 self._app.invalidate()
 
@@ -2728,29 +3319,32 @@ class TUIApp:
                 self._append_user_input(command)
                 self.switch_mode(TUIMode.PLAN)
                 self._append_system_output("Mode changed to PLAN")
+            case "/model":
+                self._append_user_input(command)
+                await self._show_model_selector()
             case "/tasks":
                 self._append_user_input(command)
                 self._show_tasks()
-            case "/model":
-                self._append_user_input(command)
-                self._handle_model_command(args)
             case "/paste-image":
                 self._append_user_input(command)
                 await self._paste_clipboard_image()
-            case "/loop":
+            case "/goal":
                 self._append_user_input(command)
                 ctx = self.runtime.ctx
-                if ctx.loop_active:
-                    self._append_system_output("Loop is already running. Use Ctrl+C to stop it first.")
+                if ctx.goal_active:
+                    self._append_system_output("Goal is already running. Use Ctrl+C to stop it first.")
                 elif not args.strip():
-                    self._append_system_output("Usage: /loop <task description>")
+                    self._append_system_output("Usage: /goal <task description>")
                 else:
                     task = args.strip()
-                    ctx.loop_task = task
-                    ctx.loop_iteration = 0
-                    ctx.loop_max_iterations = self.config.general.max_loop_iterations
+                    ctx.reset_goal()
+                    ctx.goal_task = task
+                    ctx.goal_iteration = 0
+                    ctx.goal_max_iterations = self.config.general.max_goal_iterations
+                    self._goal_usage_start_breakdown = self._session_usage.token_breakdown
+                    self._goal_usage_report_pending = False
                     self._append_system_output(
-                        f"[Loop] Starting loop mode ({ctx.loop_max_iterations} max iterations). Ctrl+C to stop."
+                        f"[Goal] Starting goal mode ({ctx.goal_max_iterations} max iterations). Ctrl+C to stop."
                     )
                     self._agent_task = asyncio.create_task(self._run_agent(task))
                     self._agent_task.add_done_callback(self._on_agent_task_done)
@@ -2780,30 +3374,41 @@ class TUIApp:
                     self._agent_task.add_done_callback(self._on_agent_task_done)
 
     async def _terminate_direct_shell_process(self, process: asyncio.subprocess.Process | None) -> None:
-        """Terminate a direct !command subprocess during timeout or shutdown."""
-        if process is None or process.returncode is not None:
+        """Terminate a direct !command subprocess group during timeout or shutdown."""
+        if process is None:
             return
 
         if os.name == "posix" and process.pid is not None:
+            # start_new_session=True makes the shell PID the process-group ID.
+            # Use that stable ID rather than getpgid(pid), because the shell can
+            # exit before a background child holding a pipe open does.
+            process_group_id = process.pid
             with contextlib.suppress(ProcessLookupError, OSError):
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        else:
-            with contextlib.suppress(ProcessLookupError):
-                process.terminate()
+                os.killpg(process_group_id, signal.SIGTERM)
 
+            if process.returncode is None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(process.wait(), timeout=_DIRECT_SHELL_TERMINATE_TIMEOUT)
+
+            # A timed-out command must not leave a child alive merely because
+            # its shell exited first. This is harmless when the group is gone.
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.killpg(process_group_id, signal.SIGKILL)
+            return
+
+        if process.returncode is not None:
+            return
+
+        with contextlib.suppress(ProcessLookupError):
+            process.terminate()
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(process.wait(), timeout=_DIRECT_SHELL_TERMINATE_TIMEOUT)
 
         if process.returncode is not None:
             return
 
-        if os.name == "posix" and process.pid is not None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        else:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(process.wait(), timeout=_DIRECT_SHELL_TERMINATE_TIMEOUT)
 
@@ -2821,6 +3426,7 @@ class TUIApp:
 
         start_time = time.time()
         process: asyncio.subprocess.Process | None = None
+        drain_tasks: list[asyncio.Task[None]] = []
 
         try:
             if os.name == "posix":
@@ -2841,29 +3447,36 @@ class TUIApp:
                     env=os.environ.copy(),
                 )
 
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+            # Drain both pipes concurrently. Unlike communicate(), this never retains
+            # the complete command output in memory and therefore stays bounded even
+            # when a command produces many gigabytes on stdout or stderr.
+            stdout_tail = _BoundedOutputTail(_DIRECT_SHELL_OUTPUT_TAIL_BYTES)
+            stderr_tail = _BoundedOutputTail(_DIRECT_SHELL_OUTPUT_TAIL_BYTES)
+            stdout_drain = asyncio.create_task(_drain_direct_shell_stream(process.stdout, stdout_tail))
+            stderr_drain = asyncio.create_task(_drain_direct_shell_stream(process.stderr, stderr_tail))
+            drain_tasks = [stdout_drain, stderr_drain]
+            await asyncio.wait_for(
+                asyncio.gather(process.wait(), *drain_tasks),
+                timeout=_DIRECT_SHELL_TIMEOUT,
+            )
             elapsed = time.time() - start_time
 
-            # Display stdout (limit to 100 lines)
-            if stdout:
-                stdout_text = stdout.decode("utf-8", errors="replace").strip()
-                if stdout_text:
-                    lines = stdout_text.split("\n")
-                    if len(lines) > 100:
-                        lines = lines[:100]
-                        lines.append(f"... ({len(stdout_text.split(chr(10))) - 100} more lines)")
-                    self._append_output("\n".join(lines))
+            stdout_preview = _format_direct_shell_preview(
+                stdout_tail,
+                stream_name="stdout",
+                max_lines=_DIRECT_SHELL_STDOUT_PREVIEW_LINES,
+            )
+            if stdout_preview:
+                self._append_output(stdout_preview)
 
-            # Display stderr in red (limit to 50 lines)
-            if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace").strip()
-                if stderr_text:
-                    lines = stderr_text.split("\n")
-                    if len(lines) > 50:
-                        lines = lines[:50]
-                        lines.append("... (truncated)")
-                    err_output = Text("\n".join(lines), style="red")
-                    self._append_output(self._renderer.render(err_output).rstrip())
+            stderr_preview = _format_direct_shell_preview(
+                stderr_tail,
+                stream_name="stderr",
+                max_lines=_DIRECT_SHELL_STDERR_PREVIEW_LINES,
+            )
+            if stderr_preview:
+                err_output = Text(stderr_preview, style="red")
+                self._append_output(self._renderer.render(err_output).rstrip())
 
             # Show exit code if non-zero
             if process.returncode != 0:
@@ -2874,13 +3487,19 @@ class TUIApp:
 
         except TimeoutError:
             await self._terminate_direct_shell_process(process)
-            self._append_system_output("Command timed out (300s)")
+            self._append_system_output(f"Command timed out ({_DIRECT_SHELL_TIMEOUT:.0f}s)")
         except asyncio.CancelledError:
             await self._terminate_direct_shell_process(process)
             raise
         except Exception as e:
+            await self._terminate_direct_shell_process(process)
             self._append_system_output(f"Error: {type(e).__name__}: {e}")
         finally:
+            for task in drain_tasks:
+                if not task.done():
+                    task.cancel()
+            if drain_tasks:
+                await asyncio.gather(*drain_tasks, return_exceptions=True)
             if self._app:
                 self._app.invalidate()
 
@@ -2901,8 +3520,8 @@ class TUIApp:
         sys_table.add_row("/help", "Show this help")
         sys_table.add_row("/clear", "Clear output and history")
         sys_table.add_row("/cost", "Show cost summary")
+        sys_table.add_row("/model", "Select model profile")
         sys_table.add_row("/tasks", "Show background tasks and processes")
-        sys_table.add_row("/model [name|current]", "List, show, or switch model profiles")
         sys_table.add_row("/perf", "Show performance stats (YAACLI_PERF=1)")
         sys_table.add_row("/session [id]", "List sessions or restore by ID")
         sys_table.add_row("/paste-image", "Attach image from system clipboard")
@@ -2910,7 +3529,7 @@ class TUIApp:
         sys_table.add_row("/load <folder>", "Load session from folder")
         sys_table.add_row("/act", "Switch to ACT mode")
         sys_table.add_row("/plan", "Switch to PLAN mode")
-        sys_table.add_row("/loop <task>", "Run task in autonomous loop until complete")
+        sys_table.add_row("/goal <task>", "Run task toward a verified goal until complete")
         sys_table.add_row("/exit", "Exit TUI")
         lines.append(self._renderer.render(sys_table).rstrip())
 
@@ -2943,12 +3562,10 @@ class TUIApp:
         kb_table.add_row("Ctrl+C", "Cancel / double-press exit")
         kb_table.add_row("Ctrl+D", "Exit")
         kb_table.add_row("Ctrl+V", "Attach image from clipboard")
-        kb_table.add_row("Shift+Enter", "Insert newline")
-        kb_table.add_row("Tab", "Accept slash completion")
+        kb_table.add_row("Tab", "Toggle input mode")
         kb_table.add_row("Escape", "Toggle mouse mode")
         kb_table.add_row("Up/Down, Ctrl+P/N", "Browse history")
         kb_table.add_row("PageUp/PageDown", "Scroll output")
-        kb_table.add_row("Ctrl+L", "Jump to latest output")
         lines.append(self._renderer.render(kb_table).rstrip())
 
         self._append_output("\n".join(lines))
@@ -2959,33 +3576,34 @@ class TUIApp:
         Resets:
         - Output lines and streaming state
         - Conversation history
+        - Agent task list
         - Status bar context percentage
         - Scroll position
 
         Preserves:
         - Session usage (token/cost tracking)
         """
-        self._output_lines.clear()
-        # Reset virtual viewport state
-        self._block_line_counts.clear()
-        self._output_ansi_cache = None
-        self._viewport_cache_key = None
-        self._output_generation = 0
-        self._total_line_count = 0
-        self._scroll_offset = 0
-        self._auto_scroll = True
-        self._unread_output_lines = 0
+        self._reset_output_blocks()
         # Reset streaming state
         self._streaming_text = ""
+        self._streaming_text_buffer = None
         self._streaming_line_index = None
+        self._streaming_block_id = None
         self._streaming_thinking = ""
+        self._streaming_thinking_buffer = None
         self._streaming_thinking_line_index = None
+        self._streaming_thinking_block_id = None
+        self._prompt_history.clear()
+        self._history_index = -1
+        self._current_input_backup = ""
         self._printed_tool_calls.clear()
         self._tool_messages.clear()
-        self._tool_call_line_indices.clear()
         self._subagent_states.clear()
         self._steering_items.clear()
+        self._display_replay.clear()
         self._reset_pending_attachments()
+        if self._runtime is not None:
+            self._runtime.ctx.task_manager = TaskManager()
         # Clear conversation history
         self._message_history = None
         self._last_run = None
@@ -3142,6 +3760,9 @@ class TUIApp:
             history_file = dump_dir / "message_history.json"
             history_file.write_bytes(ModelMessagesTypeAdapter.dump_json(self._message_history, indent=2))
 
+            display_file = dump_dir / "display_messages.json"
+            display_file.write_text(json.dumps(self._display_replay.snapshot(), ensure_ascii=False, indent=2))
+
             # Save context state
             state_file = dump_dir / "context_state.json"
             state = self.runtime.ctx.export_state()
@@ -3149,6 +3770,7 @@ class TUIApp:
 
             self._append_system_output(f"Session dumped to {dump_dir}")
             self._append_system_output(f"  - message_history.json ({len(self._message_history)} messages)")
+            self._append_system_output(f"  - display_messages.json ({len(self._display_replay.snapshot())} events)")
             self._append_system_output("  - context_state.json")
         except Exception as e:
             self._append_system_output(f"Error: {e}")
@@ -3170,37 +3792,86 @@ class TUIApp:
             return
 
         history_file = load_dir / "message_history.json"
+        display_file = load_dir / "display_messages.json"
         state_file = load_dir / "context_state.json"
+        if not history_file.exists():
+            try:
+                paths = get_head_artifact_paths(self.config_manager, load_dir.name)
+            except (FileNotFoundError, ValueError):
+                paths = None
+            if paths is not None:
+                history_file = paths.message_history_file or history_file
+                display_file = paths.display_messages_file or display_file
+                state_file = paths.context_state_file or state_file
 
         if not history_file.exists():
             self._append_system_output(f"message_history.json not found in {load_dir}")
             return
 
         try:
+            # Parse artifacts into temporary values before replacing the active session.
+            history = ModelMessagesTypeAdapter.validate_json(history_file.read_bytes())
+            state = ResumableState.model_validate_json(state_file.read_text()) if state_file.exists() else None
+            display_events: list[dict[str, Any]] = []
+            display_warning: str | None = None
+            if display_file.exists():
+                try:
+                    loaded_display_events = load_display_replay(
+                        display_file,
+                        max_bytes=_MAX_DISPLAY_REPLAY_LOAD_BYTES,
+                    )
+                    if loaded_display_events is None:
+                        display_warning = (
+                            "Display replay is too large to restore safely; conversation history was still loaded."
+                        )
+                    else:
+                        display_events = loaded_display_events
+                except Exception as e:
+                    logger.warning("Failed to restore display replay from %s: %s", display_file, e)
+                    display_warning = (
+                        "Display replay is invalid and was skipped; conversation history was still loaded."
+                    )
+
+            replacement_replay = BoundedDisplayReplay(config=YAACLI_AGUI_REPLAY_CONFIG)
+            replacement_replay.extend_snapshot(display_events)
+            if state is not None:
+                _restore_resumable_state_transactionally(state, self.runtime.ctx)
+
             self._reset_pending_attachments()
-            # Load message history
-            history_data = history_file.read_bytes()
-            history = ModelMessagesTypeAdapter.validate_json(history_data)
             self._message_history = history
+            self._display_replay = replacement_replay
+            self._tool_messages.clear()
+            self._printed_tool_calls.clear()
+            self._subagent_states.clear()
+            self._event_renderer.clear()
+            self._restore_output_from_display_events(self._display_replay.snapshot())
+            if display_warning is not None:
+                self._append_system_output(display_warning)
 
-            # Load context state if exists
-            if state_file.exists():
-                state_data = state_file.read_text()
-                state = ResumableState.model_validate_json(state_data)
-                state.restore(self.runtime.ctx)
-
-                # Re-populate session usage from restored extra_usages
-                for record in self.runtime.ctx.extra_usages:
-                    self._session_usage.add(record.agent, record.model_id, record.usage)
-                # Clear after populating to avoid double counting on next run
-                self.runtime.ctx.extra_usages.clear()
+            # Re-populate session usage from restored usage ledger entries.
+            if state is not None:
+                if self.runtime.ctx.usage_snapshot_entries:
+                    snapshot = self.runtime.ctx.build_usage_snapshot()
+                    self._session_usage.set_run_snapshot(snapshot)
+                    self._session_usage.commit_run_snapshot()
+                    self._session_usage.finalize_run_snapshots()
+                    # Clear after populating to avoid double counting on next run.
+                    self.runtime.ctx.usage_snapshot_entries.clear()
 
                 self._append_system_output(f"Session loaded from {load_dir}")
                 self._append_system_output(f"  - message_history.json ({len(history)} messages)")
+                if display_file.exists():
+                    self._append_system_output(
+                        f"  - display_messages.json ({len(self._display_replay.snapshot())} events)"
+                    )
                 self._append_system_output("  - context_state.json (restored)")
             else:
                 self._append_system_output(f"Session loaded from {load_dir}")
                 self._append_system_output(f"  - message_history.json ({len(history)} messages)")
+                if display_file.exists():
+                    self._append_system_output(
+                        f"  - display_messages.json ({len(self._display_replay.snapshot())} events)"
+                    )
                 self._append_system_output("  - context_state.json (not found, skipped)")
 
             self._append_system_output("Next message will continue from loaded history.")
@@ -3210,61 +3881,114 @@ class TUIApp:
     def _save_session_snapshot(
         self,
         *,
-        include_extra_usages: bool,
+        include_usage_ledger: bool | None = None,
         save_reason: str,
+        include_extra_usages: bool | None = None,
     ) -> bool:
         """Persist the current session to disk.
 
         Args:
-            include_extra_usages: Whether to include extra_usages in exported state.
+            include_usage_ledger: Whether to include the usage ledger in exported state.
                 Use True for error recovery snapshots.
             save_reason: Metadata tag describing why the snapshot was saved.
+            include_extra_usages: Backward-compatible alias for include_usage_ledger.
 
         Returns:
             True when a snapshot was written, False when there is no message history.
         """
-        if not self._message_history:
+        if include_usage_ledger is None:
+            include_usage_ledger = bool(include_extra_usages)
+
+        if not self._message_history and not self._display_replay.snapshot():
             return False
 
-        sessions_dir = self.config_manager.get_sessions_dir()
-        save_dir = sessions_dir / self._session_id
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        now = datetime.now(UTC).isoformat()
-
-        # Save message history
-        history_file = save_dir / "message_history.json"
-        history_file.write_bytes(ModelMessagesTypeAdapter.dump_json(self._message_history, indent=2))
-
-        # Save context state
-        state_file = save_dir / "context_state.json"
-        state = self.runtime.ctx.export_state(include_extra_usages=include_extra_usages)
-        state_file.write_text(state.model_dump_json(indent=2))
-
-        # Save/update metadata
-        metadata_file = save_dir / "metadata.json"
-        if metadata_file.exists():
-            metadata = json.loads(metadata_file.read_text())
-            metadata["updated_at"] = now
+        if include_extra_usages is None:
+            state = self.runtime.ctx.export_state(include_usage_ledger=include_usage_ledger)
         else:
-            metadata = {
-                "session_id": self._session_id,
-                "working_dir": str(self.working_dir),
-                "created_at": now,
-                "updated_at": now,
-            }
-        metadata["last_save_reason"] = save_reason
-        metadata_file.write_text(json.dumps(metadata, indent=2))
+            state = self.runtime.ctx.export_state(include_extra_usages=include_extra_usages)
 
-        logger.debug("Saved session snapshot to %s (reason=%s)", save_dir, save_reason)
+        turn_dir = save_session_turn(
+            config_manager=self.config_manager,
+            session_id=self._session_id,
+            working_dir=self.working_dir,
+            message_history_json=ModelMessagesTypeAdapter.dump_json(self._message_history or [], indent=2),
+            context_state_json=state.model_dump_json(indent=2),
+            display_messages=self._display_replay.snapshot(),
+            output_text=None,
+            save_reason=save_reason,
+            max_turns=_positive_int_config(
+                getattr(getattr(self.config, "session", None), "max_turns_per_session", None),
+                _DEFAULT_MAX_TURNS_PER_SESSION,
+            ),
+            max_sessions=_positive_int_config(
+                getattr(getattr(self.config, "session", None), "max_sessions", None), _DEFAULT_MAX_SESSIONS
+            ),
+            max_session_age_days=_optional_positive_int_config(
+                getattr(getattr(self.config, "session", None), "max_session_age_days", None)
+            ),
+        )
 
-        # Prune old sessions
-        self._prune_sessions(sessions_dir)
+        logger.debug("Saved session snapshot to %s (reason=%s)", turn_dir, save_reason)
         return True
 
-    def _auto_save_history(self) -> None:
-        """Auto-save session to session-specific directory after a successful run."""
-        self._save_session_snapshot(include_extra_usages=False, save_reason="success")
+    async def _save_session_snapshot_async(
+        self,
+        *,
+        include_usage_ledger: bool,
+        save_reason: str,
+    ) -> bool:
+        """Prepare a consistent snapshot, then serialize/write it off-loop."""
+        async with self._session_save_lock:
+            display_messages = self._display_replay.snapshot()
+            message_history = list(self._message_history or [])
+            if not message_history and not display_messages:
+                return False
+
+            # Read mutable runtime structures on the event-loop thread. The
+            # prepared Pydantic state and shallow message list are stable while
+            # this turn awaits the worker write.
+            state = self.runtime.ctx.export_state(include_usage_ledger=include_usage_ledger)
+            max_turns = _positive_int_config(
+                getattr(getattr(self.config, "session", None), "max_turns_per_session", None),
+                _DEFAULT_MAX_TURNS_PER_SESSION,
+            )
+            max_sessions = _positive_int_config(
+                getattr(getattr(self.config, "session", None), "max_sessions", None), _DEFAULT_MAX_SESSIONS
+            )
+            max_session_age_days = _optional_positive_int_config(
+                getattr(getattr(self.config, "session", None), "max_session_age_days", None)
+            )
+
+            def persist() -> Path:
+                return save_session_turn(
+                    config_manager=self.config_manager,
+                    session_id=self._session_id,
+                    working_dir=self.working_dir,
+                    message_history_json=ModelMessagesTypeAdapter.dump_json(message_history, indent=2),
+                    context_state_json=state.model_dump_json(indent=2),
+                    display_messages=display_messages,
+                    output_text=None,
+                    save_reason=save_reason,
+                    max_turns=max_turns,
+                    max_sessions=max_sessions,
+                    max_session_age_days=max_session_age_days,
+                )
+
+            worker = asyncio.create_task(asyncio.to_thread(persist))
+            try:
+                turn_dir = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # A worker thread cannot be cancelled. Keep the save lock until
+                # it finishes so a newer writer cannot race the same session.
+                with contextlib.suppress(Exception):
+                    await worker
+                raise
+            logger.debug("Saved session snapshot to %s (reason=%s)", turn_dir, save_reason)
+            return True
+
+    async def _auto_save_history(self) -> None:
+        """Auto-save a successful turn without blocking rendering/input."""
+        await self._save_session_snapshot_async(include_usage_ledger=False, save_reason="success")
 
     @property
     def session_id(self) -> str:
@@ -3275,7 +3999,8 @@ class TUIApp:
     def has_session_data(self) -> bool:
         """Check if this session has any saved data."""
         sessions_dir = self.config_manager.get_sessions_dir()
-        return (sessions_dir / self._session_id / "message_history.json").exists()
+        session_dir = sessions_dir / self._session_id
+        return (session_dir / "message_history.json").exists() or (session_dir / "display_messages.json").exists()
 
     def _prune_sessions(self, sessions_dir: Path, max_sessions: int = 100) -> None:
         """Remove old sessions beyond the retention limit.
@@ -3288,35 +4013,17 @@ class TUIApp:
             sessions_dir: Path to ~/.yaacli/sessions/
             max_sessions: Maximum number of sessions to retain.
         """
-        if not sessions_dir.exists():
-            return
-
-        session_dirs = [d for d in sessions_dir.iterdir() if d.is_dir()]
-        if len(session_dirs) <= max_sessions:
-            return
-
-        def _get_session_time(d: Path) -> str:
-            metadata_file = d / "metadata.json"
-            if metadata_file.exists():
-                try:
-                    metadata = json.loads(metadata_file.read_text())
-                    return metadata.get("updated_at", "")
-                except (json.JSONDecodeError, OSError):
-                    pass
-            # Fallback to directory mtime
-            return datetime.fromtimestamp(d.stat().st_mtime, tz=UTC).isoformat()
-
-        # Sort by time ascending (oldest first)
-        session_dirs.sort(key=_get_session_time)
-
-        # Remove oldest sessions
-        to_remove = session_dirs[: len(session_dirs) - max_sessions]
-        for d in to_remove:
-            try:
-                shutil.rmtree(d)
-                logger.debug(f"Pruned old session: {d.name}")
-            except OSError as e:
-                logger.warning(f"Failed to prune session {d.name}: {e}")
+        try:
+            trim_sessions(
+                sessions_dir,
+                max_sessions=max_sessions,
+                max_session_age_days=_optional_positive_int_config(
+                    getattr(getattr(self.config, "session", None), "max_session_age_days", None)
+                ),
+                protected_session_id=self._session_id,
+            )
+        except OSError as e:
+            logger.warning("Failed to prune sessions in %s: %s", sessions_dir, e)
 
     def _list_sessions(self, max_display: int = 20) -> None:
         """List recent sessions.
@@ -3411,82 +4118,11 @@ class TUIApp:
             self._append_system_output(f"Session not found: {session_id}")
 
     def _append_system_output(self, text: str) -> None:
-        """Append system message to output."""
+        """Append system message to output, wrapped to the current terminal width."""
         sys_text = Text()
         sys_text.append("[SYS] ", style="bold yellow")
         sys_text.append(text)
-        self._append_output(self._renderer.render(sys_text).rstrip())
-
-    def _get_current_model_profile(self) -> tuple[str, Any] | None:
-        """Get the active model profile for display."""
-        if not self._active_model_name:
-            try:
-                self._active_model_name, _ = resolve_startup_model_profile(self.config)
-            except Exception:
-                return None
-        try:
-            return self._active_model_name, self.config.get_model_profile(self._active_model_name)
-        except Exception:
-            return None
-
-    def _format_model_profile_line(self, name: str, profile: Any, *, current: bool = False) -> str:
-        marker = "*" if current else " "
-        description = f" - {profile.description}" if getattr(profile, "description", "") else ""
-        return f"{marker} {name}: {profile.model}{description}"
-
-    def _show_model_list(self) -> None:
-        """List configured model profiles."""
-        profiles = self.config.get_model_profiles()
-        if not profiles:
-            self._append_system_output("No model profiles configured.")
-            return
-
-        lines = ["Available models:"]
-        for name, profile in profiles.items():
-            lines.append(self._format_model_profile_line(name, profile, current=name == self._active_model_name))
-        self._append_output("\n".join(lines))
-
-    def _show_current_model(self) -> None:
-        """Display the current model profile."""
-        current = self._get_current_model_profile()
-        if current is None:
-            self._append_system_output("No active model configured.")
-            return
-
-        name, profile = current
-        lines = [
-            f"Current model: {name}",
-            f"model: {profile.model}",
-            f"model_settings: {profile.model_settings if profile.model_settings is not None else '(default)'}",
-            f"model_cfg: {profile.model_cfg if profile.model_cfg is not None else '(default)'}",
-        ]
-        if profile.description:
-            lines.append(f"description: {profile.description}")
-        self._append_output("\n".join(lines))
-
-    def _switch_model(self, model_name: str) -> None:
-        """Switch the active main-agent model profile."""
-        if self._state == TUIState.RUNNING:
-            self._append_system_output("Cannot switch model while agent is running.")
-            return
-
-        profile = self.config.get_model_profile(model_name)
-        model_cfg = apply_model_profile(self.runtime, profile)
-        self._active_model_name = model_name
-        if model_cfg.context_window:
-            self._context_window_size = model_cfg.context_window
-        self._append_system_output(f"Model switched to {model_name}: {profile.model}")
-
-    def _handle_model_command(self, args: str) -> None:
-        """Handle /model commands."""
-        arg = args.strip()
-        if not arg:
-            self._show_model_list()
-            return
-        if arg == "current":
-            self._show_current_model()
-            return
-        self._switch_model(arg)
+        self._append_output(self._renderer.render(sys_text, width=self._get_terminal_width()).rstrip())
 
     # =========================================================================
     # Main Run Loop
@@ -3497,12 +4133,7 @@ class TUIApp:
         # Welcome message
         title = Text("YAACLI CLI", style="bold magenta")
         self._append_output(self._renderer.render(title).rstrip())
-        current_model = self._get_current_model_profile()
-        if current_model is None:
-            self._append_output("Model: (not configured)")
-        else:
-            model_name, model_profile = current_model
-            self._append_output(f"Model: {model_name} ({model_profile.model})")
+        self._append_output(f"Model: {self._format_active_model_label()}")
         self._append_output(f"Mode: {self._mode.value.upper()}")
         self._append_output(f"Config dir: {self.config_manager.config_dir}")
         self._append_output("This is the global YAACLI config directory.")
@@ -3521,10 +4152,15 @@ class TUIApp:
             def mouse_handler(self, mouse_event: MouseEvent) -> object:
                 """Handle mouse scroll events."""
                 if mouse_event.event_type == MouseEventType.SCROLL_UP:
-                    tui_ref._scroll_output_up(3)
+                    tui_ref._scroll_offset = max(0, tui_ref._scroll_offset - 3)
+                    if tui_ref._app:
+                        tui_ref._app.invalidate()
                     return None
                 elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
-                    tui_ref._scroll_output_down(3)
+                    max_scroll = tui_ref._get_max_scroll()
+                    tui_ref._scroll_offset = min(tui_ref._scroll_offset + 3, max_scroll)
+                    if tui_ref._app:
+                        tui_ref._app.invalidate()
                     return None
                 return super().mouse_handler(mouse_event)
 
@@ -3544,12 +4180,24 @@ class TUIApp:
             wrap_lines=True,
         )
 
+        # In-TUI model selector
+        model_selector_control = FormattedTextControl(self._get_model_selector_text)
+        model_selector_window = ConditionalContainer(
+            Window(
+                content=model_selector_control,
+                height=self._get_model_selector_height,
+                style="class:model-selector",
+                wrap_lines=False,
+            ),
+            filter=Condition(lambda: self._model_selector_open),
+        )
+
         # Status bar
         status_bar = Window(
             content=FormattedTextControl(self._get_status_text),
-            height=1,
+            height=2,
             style="class:status-bar",
-            wrap_lines=False,
+            wrap_lines=True,
         )
 
         # Input area with mouse scroll support
@@ -3580,10 +4228,8 @@ class TUIApp:
             multiline=True,
             prompt=self._get_prompt,
             style="class:input-area",
-            completer=SlashCommandCompleter(self._get_slash_command_entries),
-            complete_while_typing=True,
             focusable=True,
-            height=4,
+            height=5,
             scrollbar=True,
         )
 
@@ -3600,29 +4246,15 @@ class TUIApp:
         input_area.window.content = scrollable_control
         input_area.control = scrollable_control
 
-        input_frame = Frame(
-            body=input_area,
-            title=" Composer ",
-            style="class:input-frame",
-        )
-
-        # Layout: Output | Steering | Composer | Status
+        # Layout: Output | Steering | Model Selector | Status | Input
         layout = Layout(
-            FloatContainer(
-                content=HSplit([
-                    output_window,
-                    steering_window,
-                    input_frame,
-                    status_bar,
-                ]),
-                floats=[
-                    Float(
-                        xcursor=True,
-                        ycursor=True,
-                        content=CompletionsMenu(max_height=16, scroll_offset=1),
-                    )
-                ],
-            ),
+            HSplit([
+                output_window,
+                steering_window,
+                model_selector_window,
+                status_bar,
+                input_area,
+            ]),
             focused_element=input_area,
         )
 
@@ -3636,6 +4268,7 @@ class TUIApp:
             style=self._setup_style(),
             full_screen=True,
             mouse_support=True,
+            min_redraw_interval=self._invalidate_interval,
         )
 
         # Override prompt_toolkit's exception handler to prevent "Press ENTER to
@@ -3678,21 +4311,19 @@ class TUIApp:
             self._schedule_tui_recovery(loop)
 
         self._app._handle_exception = _quiet_exception_handler  # type: ignore[assignment]
-        app = self._app
 
         # Run with error handling
         try:
             self._tui_running = True
-            await app.run_async(pre_run=lambda: self._write_terminal_sequence(app, _MODIFY_OTHER_KEYS_ENABLE))
+            await self._app.run_async()
         except Exception as e:
             # Re-raise to be caught by cli.py with proper error display
             raise RuntimeError(f"TUI crashed: {e}") from e
         finally:
             self._tui_running = False
             self._show_shutdown_status("leaving TUI")
-            self._write_terminal_sequence(app, _MODIFY_OTHER_KEYS_DISABLE)
             # Restore original prompt_toolkit exception handler
-            app._handle_exception = original_handle_exception  # type: ignore[assignment]
+            self._app._handle_exception = original_handle_exception  # type: ignore[assignment]
             # Log performance report on shutdown
             perf_log_report()
             # Ensure agent task and tracked fire-and-forget tasks are fully cancelled

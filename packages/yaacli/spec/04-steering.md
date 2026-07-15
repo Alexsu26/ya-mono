@@ -281,7 +281,7 @@ from typing import Any
 
 from pydantic_ai.capabilities import ProcessHistory
 from ya_agent_sdk.context import AgentContext, ModelConfig, ToolConfig
-from y_agent_environment import Environment
+from ya_agent_environment import Environment
 
 class TUIState(str, Enum):
     """TUI application state."""

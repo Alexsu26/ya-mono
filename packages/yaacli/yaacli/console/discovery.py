@@ -28,7 +28,7 @@ class DiscoveredSkill:
 
     @property
     def path(self) -> Path:
-        return self.config.path
+        return Path(self.config.path)
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,7 @@ def discover_skills(*, cwd: Path, config_dir: Path) -> list[DiscoveredSkill]:
             for skill in load_skills_from_dir(skills_dir).values():
                 discovered[skill.name] = DiscoveredSkill(
                     config=skill,
-                    source=_skill_source(skill.path, cwd=cwd, config_dir=config_dir),
+                    source=_skill_source(Path(skill.path), cwd=cwd, config_dir=config_dir),
                 )
 
     return sorted(discovered.values(), key=lambda skill: skill.name.lower())

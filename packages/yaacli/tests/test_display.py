@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 
+from prompt_toolkit.formatted_text import ANSI
 from yaacli.display import (
     EventRenderer,
     RenderDirective,
@@ -164,6 +165,18 @@ def test_tracker_complete_call():
     assert info.end_time is not None
 
 
+def test_tracker_preserves_explicit_end_time_on_later_implicit_completion():
+    """Test AGUI explicit timing is not overwritten by later raw stream completion."""
+    tracker = ToolCallTracker()
+    tracker.start_call("call-1", "grep", start_time=1.0)
+    tracker.complete_call("call-1", result="Found 5 matches", end_time=2.5)
+    tracker.complete_call("call-1", result="Found 5 matches")
+
+    info = tracker.tool_calls["call-1"]
+    assert info.end_time == 2.5
+    assert abs(info.duration() - 1.5) < 0.01
+
+
 def test_tracker_complete_nonexistent():
     """Test completing a non-existent call does nothing."""
     tracker = ToolCallTracker()
@@ -284,6 +297,18 @@ def test_renderer_render_markdown():
     # Should contain the text content
     assert "Title" in result
     assert "bold" in result
+
+
+def test_renderer_markdown_link_is_compatible_with_prompt_toolkit_ansi():
+    """Markdown links must not leak unsupported OSC 8 control sequences into the TUI."""
+    renderer = RichRenderer(width=80)
+    result = renderer.render_markdown("[PR: 8](https://github.com/Wh1isper/starweaver/pull/67)")
+
+    assert "\x1b]8;" not in result
+    parsed_text = "".join(text for _, text, *_ in ANSI(result).__pt_formatted_text__())
+    assert "PR: 8" in parsed_text
+    assert "https://github.com/Wh1isper/starweaver/pull/67" in parsed_text
+    assert "8;id=" not in parsed_text
 
 
 def test_renderer_render_panel():

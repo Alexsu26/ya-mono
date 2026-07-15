@@ -1,7 +1,7 @@
 """ModelSettings presets for different providers and thinking levels.
 
 This module provides pre-configured ModelSettings for common use cases across
-different model providers (Anthropic, OpenAI, DeepSeek, Gemini). Each provider has presets
+different model providers (Anthropic, OpenAI, DeepSeek, Grok, Gemini). Each provider has presets
 for different "thinking levels" (reasoning intensity).
 
 Naming Convention:
@@ -9,10 +9,15 @@ Naming Convention:
 - `{provider}_{api}_{level}` - for providers with multiple APIs, e.g., `openai_responses_high`
 
 Thinking Levels:
-- `xhigh`: Frontier reasoning depth for the hardest agentic workloads
+- `max`: Maximum reasoning effort for GPT-5.6 Sol and future models that expose it
+- `xhigh`: Frontier reasoning depth for hard agentic workloads
 - `high`: Strong reasoning depth, higher latency
 - `medium`: Balanced reasoning (default)
 - `low`: Minimal reasoning, lower latency
+
+OpenAI Reasoning Modes (GPT-5.6 Responses API):
+- `standard`: Default execution mode used by existing OpenAI Responses presets
+- `pro`: More model work at higher latency and token usage; use `openai_responses_pro_{level}`
 
 Adaptive Thinking (Anthropic Opus 4.7 / Opus 4.6 / Sonnet 4.6):
 - Uses `thinking.type: "adaptive"` instead of fixed budget_tokens
@@ -304,8 +309,9 @@ class ModelSettingsPreset(StrEnum):
     ANTHROPIC_1M_CM_LOW_INTERLEAVED_THINKING = "anthropic_1m_cm_low_interleaved_thinking"
     ANTHROPIC_1M_CM_OFF_INTERLEAVED_THINKING = "anthropic_1m_cm_off_interleaved_thinking"
 
-    # OpenAI Chat Completions presets (GPT-4, etc.)
+    # OpenAI Chat Completions presets (GPT-4, GPT-5 series, etc.)
     OPENAI_DEFAULT = "openai_default"
+    OPENAI_MAX = "openai_max"
     OPENAI_XHIGH = "openai_xhigh"
     OPENAI_HIGH = "openai_high"
     OPENAI_MEDIUM = "openai_medium"
@@ -313,11 +319,19 @@ class ModelSettingsPreset(StrEnum):
 
     # OpenAI Responses API presets (o1, o3, GPT-5 reasoning models)
     OPENAI_RESPONSES_DEFAULT = "openai_responses_default"
+    OPENAI_RESPONSES_MAX = "openai_responses_max"
     OPENAI_RESPONSES_XHIGH = "openai_responses_xhigh"
     OPENAI_RESPONSES_HIGH = "openai_responses_high"
     OPENAI_RESPONSES_MEDIUM = "openai_responses_medium"
     OPENAI_RESPONSES_LOW = "openai_responses_low"
+    OPENAI_RESPONSES_PRO = "openai_responses_pro"
+    OPENAI_RESPONSES_PRO_MAX = "openai_responses_pro_max"
+    OPENAI_RESPONSES_PRO_XHIGH = "openai_responses_pro_xhigh"
+    OPENAI_RESPONSES_PRO_HIGH = "openai_responses_pro_high"
+    OPENAI_RESPONSES_PRO_MEDIUM = "openai_responses_pro_medium"
+    OPENAI_RESPONSES_PRO_LOW = "openai_responses_pro_low"
     OPENAI_RESPONSES_DEFAULT_FAST = "openai_responses_default_fast"
+    OPENAI_RESPONSES_MAX_FAST = "openai_responses_max_fast"
     OPENAI_RESPONSES_XHIGH_FAST = "openai_responses_xhigh_fast"
     OPENAI_RESPONSES_HIGH_FAST = "openai_responses_high_fast"
     OPENAI_RESPONSES_MEDIUM_FAST = "openai_responses_medium_fast"
@@ -332,6 +346,12 @@ class ModelSettingsPreset(StrEnum):
     # MiMo V2.5 presets (OpenAI-compatible API)
     MIMO_V2_5_DEFAULT = "mimo_v2_5"
     MIMO_V2_5_PRO_DEFAULT = "mimo_v2_5_pro"
+
+    # Grok 4.5 presets (xAI)
+    GROK_4_5_DEFAULT = "grok_4_5_default"
+    GROK_4_5_HIGH = "grok_4_5_high"
+    GROK_4_5_MEDIUM = "grok_4_5_medium"
+    GROK_4_5_LOW = "grok_4_5_low"
 
     # Gemini thinking_budget presets (for Gemini 2.5)
     GEMINI_THINKING_BUDGET_DEFAULT = "gemini_thinking_budget_default"
@@ -648,13 +668,14 @@ ANTHROPIC_1M_CM_OFF_INTERLEAVED_THINKING = ANTHROPIC_1M_CM_OFF
 
 
 def _openai_chat_settings(
-    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None = None,
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] | None = None,
     max_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Create OpenAI Chat Completions settings.
 
     Note: reasoning_effort is supported for reasoning-capable OpenAI models via Chat Completions API.
-    GPT-5.5 supports ``none``, ``low``, ``medium``, ``high``, and ``xhigh``.
+    GPT-5.5 supports ``none``, ``low``, ``medium``, ``high``, and ``xhigh``;
+    GPT-5.6 Sol adds ``max`` for its deepest reasoning mode.
 
     Args:
         reasoning_effort: Reasoning intensity for reasoning-capable OpenAI models.
@@ -677,11 +698,17 @@ OPENAI_DEFAULT: dict[str, Any] = _openai_chat_settings(
 )
 """OpenAI Chat default: Same as medium, balanced reasoning and max_tokens."""
 
+OPENAI_MAX: dict[str, Any] = _openai_chat_settings(
+    reasoning_effort="max",
+    max_tokens=32 * K_TOKENS,
+)
+"""OpenAI Chat max: GPT-5.6 Sol maximum reasoning effort for hardest workloads."""
+
 OPENAI_XHIGH: dict[str, Any] = _openai_chat_settings(
     reasoning_effort="xhigh",
     max_tokens=32 * K_TOKENS,
 )
-"""OpenAI Chat xhigh: Highest reasoning effort for hard agentic workloads."""
+"""OpenAI Chat xhigh: Very high reasoning effort for hard agentic workloads."""
 
 OPENAI_HIGH: dict[str, Any] = _openai_chat_settings(
     reasoning_effort="high",
@@ -708,18 +735,21 @@ OPENAI_LOW: dict[str, Any] = _openai_chat_settings(
 
 
 def _openai_responses_settings(
-    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"],
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"],
     reasoning_summary: Literal["detailed", "concise", "auto"] = "auto",
     max_tokens: int | None = None,
     openai_service_tier: Literal["auto", "default", "flex", "priority"] | None = None,
+    reasoning_mode: Literal["standard", "pro"] | None = None,
 ) -> dict[str, Any]:
     """Create OpenAI Responses API settings for reasoning models.
 
     Args:
-        reasoning_effort: Reasoning intensity. GPT-5.5 supports 'none', 'low', 'medium', 'high', and 'xhigh'.
+        reasoning_effort: Reasoning intensity. GPT-5.5 supports 'none', 'low', 'medium', 'high', and 'xhigh'; GPT-5.6 Sol adds 'max'.
         reasoning_summary: Summary level of reasoning process.
         max_tokens: Maximum output tokens (None for model default).
         openai_service_tier: OpenAI service tier for the model request.
+        reasoning_mode: GPT-5.6 Responses API execution mode. ``standard`` is the
+            API default; ``pro`` performs more model work at higher latency and cost.
 
     Returns:
         Dict suitable for OpenAIResponsesModelSettings.
@@ -733,22 +763,31 @@ def _openai_responses_settings(
         settings["max_tokens"] = max_tokens
     if openai_service_tier is not None:
         settings["openai_service_tier"] = openai_service_tier
+    if reasoning_mode is not None:
+        settings["openai_reasoning_mode"] = reasoning_mode
     return settings
 
 
 OPENAI_RESPONSES_DEFAULT: dict[str, Any] = _openai_responses_settings(
     reasoning_effort="medium",
-    reasoning_summary="detailed",  # 改为 detailed 以获取思考摘要
+    reasoning_summary="detailed",
     max_tokens=16 * K_TOKENS,
 )
-"""OpenAI Responses default: Same as medium, balanced reasoning effort with detailed summary."""
+"""OpenAI Responses default with a detailed reasoning summary."""
+
+OPENAI_RESPONSES_MAX: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="max",
+    reasoning_summary="detailed",
+    max_tokens=64 * K_TOKENS,
+)
+"""OpenAI Responses max: GPT-5.6 Sol maximum reasoning effort with detailed summary."""
 
 OPENAI_RESPONSES_XHIGH: dict[str, Any] = _openai_responses_settings(
     reasoning_effort="xhigh",
     reasoning_summary="detailed",
     max_tokens=64 * K_TOKENS,
 )
-"""OpenAI Responses xhigh: Highest reasoning effort with detailed summary."""
+"""OpenAI Responses xhigh: Very high reasoning effort with detailed summary."""
 
 OPENAI_RESPONSES_HIGH: dict[str, Any] = _openai_responses_settings(
     reasoning_effort="high",
@@ -771,6 +810,49 @@ OPENAI_RESPONSES_LOW: dict[str, Any] = _openai_responses_settings(
 )
 """OpenAI Responses low: Minimal reasoning, faster responses."""
 
+OPENAI_RESPONSES_PRO_MAX: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="max",
+    reasoning_summary="detailed",
+    max_tokens=64 * K_TOKENS,
+    reasoning_mode="pro",
+)
+"""OpenAI Responses pro max: GPT-5.6 pro mode with maximum reasoning effort."""
+
+OPENAI_RESPONSES_PRO_XHIGH: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="xhigh",
+    reasoning_summary="detailed",
+    max_tokens=64 * K_TOKENS,
+    reasoning_mode="pro",
+)
+"""OpenAI Responses pro xhigh: GPT-5.6 pro mode with very high reasoning effort."""
+
+OPENAI_RESPONSES_PRO_HIGH: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="high",
+    reasoning_summary="detailed",
+    max_tokens=32 * K_TOKENS,
+    reasoning_mode="pro",
+)
+"""OpenAI Responses pro high: GPT-5.6 pro mode with strong reasoning effort."""
+
+OPENAI_RESPONSES_PRO_MEDIUM: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="medium",
+    reasoning_summary="auto",
+    max_tokens=16 * K_TOKENS,
+    reasoning_mode="pro",
+)
+"""OpenAI Responses pro medium: GPT-5.6 pro mode with balanced reasoning effort."""
+
+OPENAI_RESPONSES_PRO_LOW: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="low",
+    reasoning_summary="concise",
+    max_tokens=8 * K_TOKENS,
+    reasoning_mode="pro",
+)
+"""OpenAI Responses pro low: GPT-5.6 pro mode with minimal reasoning effort."""
+
+OPENAI_RESPONSES_PRO = OPENAI_RESPONSES_PRO_MEDIUM
+"""OpenAI Responses pro: Convenience alias for pro mode with medium effort."""
+
 OPENAI_RESPONSES_DEFAULT_FAST: dict[str, Any] = _openai_responses_settings(
     reasoning_effort="medium",
     reasoning_summary="auto",
@@ -779,13 +861,21 @@ OPENAI_RESPONSES_DEFAULT_FAST: dict[str, Any] = _openai_responses_settings(
 )
 """OpenAI Responses default fast: Balanced reasoning on the priority service tier."""
 
+OPENAI_RESPONSES_MAX_FAST: dict[str, Any] = _openai_responses_settings(
+    reasoning_effort="max",
+    reasoning_summary="detailed",
+    max_tokens=64 * K_TOKENS,
+    openai_service_tier="priority",
+)
+"""OpenAI Responses max fast: GPT-5.6 Sol maximum reasoning on the priority service tier."""
+
 OPENAI_RESPONSES_XHIGH_FAST: dict[str, Any] = _openai_responses_settings(
     reasoning_effort="xhigh",
     reasoning_summary="detailed",
     max_tokens=64 * K_TOKENS,
     openai_service_tier="priority",
 )
-"""OpenAI Responses xhigh fast: Highest reasoning effort on the priority service tier."""
+"""OpenAI Responses xhigh fast: Very high reasoning effort on the priority service tier."""
 
 OPENAI_RESPONSES_HIGH_FAST: dict[str, Any] = _openai_responses_settings(
     reasoning_effort="high",
@@ -905,6 +995,63 @@ MIMO_V2_5_DEFAULT: dict[str, Any] = _mimo_v2_5_settings()
 
 MIMO_V2_5_PRO_DEFAULT: dict[str, Any] = _mimo_v2_5_settings()
 """MiMo V2.5 Pro default: thinking enabled."""
+
+
+# =============================================================================
+# Grok 4.5 Presets (xAI)
+# =============================================================================
+
+
+def _grok_4_5_settings(
+    *,
+    reasoning_effort: Literal["low", "medium", "high"] = "high",
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Create Grok 4.5 xAI model settings.
+
+    Grok 4.5 supports ``reasoning_effort`` values ``low``, ``medium``, and
+    ``high``. Reasoning cannot be disabled, and the xAI API defaults to
+    ``high`` when not specified.
+
+    Args:
+        reasoning_effort: Thinking intensity for Grok 4.5.
+        max_tokens: Maximum output tokens.
+
+    Returns:
+        Dict suitable for XaiModelSettings.
+    """
+    settings: dict[str, Any] = {
+        "xai_reasoning_effort": reasoning_effort,
+        "xai_include_encrypted_content": True,
+    }
+    if max_tokens is not None:
+        settings["max_tokens"] = max_tokens
+    return settings
+
+
+GROK_4_5_DEFAULT: dict[str, Any] = _grok_4_5_settings(
+    reasoning_effort="high",
+    max_tokens=32 * K_TOKENS,
+)
+"""Grok 4.5 default: high reasoning effort, matching the xAI API default."""
+
+GROK_4_5_HIGH: dict[str, Any] = _grok_4_5_settings(
+    reasoning_effort="high",
+    max_tokens=32 * K_TOKENS,
+)
+"""Grok 4.5 high: deepest supported reasoning effort."""
+
+GROK_4_5_MEDIUM: dict[str, Any] = _grok_4_5_settings(
+    reasoning_effort="medium",
+    max_tokens=16 * K_TOKENS,
+)
+"""Grok 4.5 medium: balanced reasoning effort."""
+
+GROK_4_5_LOW: dict[str, Any] = _grok_4_5_settings(
+    reasoning_effort="low",
+    max_tokens=8 * K_TOKENS,
+)
+"""Grok 4.5 low: latency-sensitive reasoning effort."""
 
 
 # =============================================================================
@@ -1113,17 +1260,26 @@ _PRESET_REGISTRY: dict[str, dict[str, Any]] = {
     ModelSettingsPreset.ANTHROPIC_1M_CM_OFF_INTERLEAVED_THINKING.value: ANTHROPIC_1M_CM_OFF_INTERLEAVED_THINKING,
     # OpenAI Chat
     ModelSettingsPreset.OPENAI_DEFAULT.value: OPENAI_DEFAULT,
+    ModelSettingsPreset.OPENAI_MAX.value: OPENAI_MAX,
     ModelSettingsPreset.OPENAI_XHIGH.value: OPENAI_XHIGH,
     ModelSettingsPreset.OPENAI_HIGH.value: OPENAI_HIGH,
     ModelSettingsPreset.OPENAI_MEDIUM.value: OPENAI_MEDIUM,
     ModelSettingsPreset.OPENAI_LOW.value: OPENAI_LOW,
     # OpenAI Responses
     ModelSettingsPreset.OPENAI_RESPONSES_DEFAULT.value: OPENAI_RESPONSES_DEFAULT,
+    ModelSettingsPreset.OPENAI_RESPONSES_MAX.value: OPENAI_RESPONSES_MAX,
     ModelSettingsPreset.OPENAI_RESPONSES_XHIGH.value: OPENAI_RESPONSES_XHIGH,
     ModelSettingsPreset.OPENAI_RESPONSES_HIGH.value: OPENAI_RESPONSES_HIGH,
     ModelSettingsPreset.OPENAI_RESPONSES_MEDIUM.value: OPENAI_RESPONSES_MEDIUM,
     ModelSettingsPreset.OPENAI_RESPONSES_LOW.value: OPENAI_RESPONSES_LOW,
+    ModelSettingsPreset.OPENAI_RESPONSES_PRO.value: OPENAI_RESPONSES_PRO,
+    ModelSettingsPreset.OPENAI_RESPONSES_PRO_MAX.value: OPENAI_RESPONSES_PRO_MAX,
+    ModelSettingsPreset.OPENAI_RESPONSES_PRO_XHIGH.value: OPENAI_RESPONSES_PRO_XHIGH,
+    ModelSettingsPreset.OPENAI_RESPONSES_PRO_HIGH.value: OPENAI_RESPONSES_PRO_HIGH,
+    ModelSettingsPreset.OPENAI_RESPONSES_PRO_MEDIUM.value: OPENAI_RESPONSES_PRO_MEDIUM,
+    ModelSettingsPreset.OPENAI_RESPONSES_PRO_LOW.value: OPENAI_RESPONSES_PRO_LOW,
     ModelSettingsPreset.OPENAI_RESPONSES_DEFAULT_FAST.value: OPENAI_RESPONSES_DEFAULT_FAST,
+    ModelSettingsPreset.OPENAI_RESPONSES_MAX_FAST.value: OPENAI_RESPONSES_MAX_FAST,
     ModelSettingsPreset.OPENAI_RESPONSES_XHIGH_FAST.value: OPENAI_RESPONSES_XHIGH_FAST,
     ModelSettingsPreset.OPENAI_RESPONSES_HIGH_FAST.value: OPENAI_RESPONSES_HIGH_FAST,
     ModelSettingsPreset.OPENAI_RESPONSES_MEDIUM_FAST.value: OPENAI_RESPONSES_MEDIUM_FAST,
@@ -1136,6 +1292,11 @@ _PRESET_REGISTRY: dict[str, dict[str, Any]] = {
     # MiMo V2.5
     ModelSettingsPreset.MIMO_V2_5_DEFAULT.value: MIMO_V2_5_DEFAULT,
     ModelSettingsPreset.MIMO_V2_5_PRO_DEFAULT.value: MIMO_V2_5_PRO_DEFAULT,
+    # Grok 4.5
+    ModelSettingsPreset.GROK_4_5_DEFAULT.value: GROK_4_5_DEFAULT,
+    ModelSettingsPreset.GROK_4_5_HIGH.value: GROK_4_5_HIGH,
+    ModelSettingsPreset.GROK_4_5_MEDIUM.value: GROK_4_5_MEDIUM,
+    ModelSettingsPreset.GROK_4_5_LOW.value: GROK_4_5_LOW,
     # Gemini thinking_budget (for Gemini 2.5)
     ModelSettingsPreset.GEMINI_THINKING_BUDGET_DEFAULT.value: GEMINI_THINKING_BUDGET_DEFAULT,
     ModelSettingsPreset.GEMINI_THINKING_BUDGET_HIGH.value: GEMINI_THINKING_BUDGET_HIGH,
@@ -1166,11 +1327,25 @@ _PRESET_ALIASES: dict[str, str] = {
     "anthropic_1m_cm_interleaved": ModelSettingsPreset.ANTHROPIC_1M_CM_DEFAULT_INTERLEAVED_THINKING.value,
     "openai": ModelSettingsPreset.OPENAI_DEFAULT.value,
     "openai_responses": ModelSettingsPreset.OPENAI_RESPONSES_DEFAULT.value,
+    "openai_responses_standard": ModelSettingsPreset.OPENAI_RESPONSES_DEFAULT.value,
+    "openai_responses_gpt5_6_pro": ModelSettingsPreset.OPENAI_RESPONSES_PRO.value,
+    "openai_responses_gpt56_pro": ModelSettingsPreset.OPENAI_RESPONSES_PRO.value,
+    "openai_responses_gpt5_6_sol": ModelSettingsPreset.OPENAI_RESPONSES_MAX.value,
+    "openai_responses_gpt56_sol": ModelSettingsPreset.OPENAI_RESPONSES_MAX.value,
+    "openai_responses_sol": ModelSettingsPreset.OPENAI_RESPONSES_MAX.value,
+    "openai_responses_terra": ModelSettingsPreset.OPENAI_RESPONSES_MEDIUM.value,
+    "openai_responses_luna": ModelSettingsPreset.OPENAI_RESPONSES_LOW.value,
     "deepseek": ModelSettingsPreset.DEEPSEEK_V4_DEFAULT.value,
     "deepseek_v4": ModelSettingsPreset.DEEPSEEK_V4_DEFAULT.value,
     "mimo": ModelSettingsPreset.MIMO_V2_5_PRO_DEFAULT.value,
     "mimo_v2.5": ModelSettingsPreset.MIMO_V2_5_DEFAULT.value,
     "mimo_v2.5_pro": ModelSettingsPreset.MIMO_V2_5_PRO_DEFAULT.value,
+    "xai": ModelSettingsPreset.GROK_4_5_DEFAULT.value,
+    "grok": ModelSettingsPreset.GROK_4_5_DEFAULT.value,
+    "grok_4.5": ModelSettingsPreset.GROK_4_5_DEFAULT.value,
+    "grok_4.5_latest": ModelSettingsPreset.GROK_4_5_DEFAULT.value,
+    "grok_4_5": ModelSettingsPreset.GROK_4_5_DEFAULT.value,
+    "grok_4_5_latest": ModelSettingsPreset.GROK_4_5_DEFAULT.value,
     "gemini_2.5": ModelSettingsPreset.GEMINI_THINKING_BUDGET_DEFAULT.value,
     "gemini_3": ModelSettingsPreset.GEMINI_THINKING_LEVEL_DEFAULT.value,
     "gemini": ModelSettingsPreset.GEMINI_THINKING_LEVEL_DEFAULT.value,  # Default to Gemini 3
@@ -1288,6 +1463,7 @@ class ModelConfigPreset(StrEnum):
 
     # OpenAI models (GPT-5 series)
     GPT5_270K = "gpt5_270k"
+    GPT5_350K = "gpt5_350k"
     GPT5_1M = "gpt5_1m"
 
     # DeepSeek models
@@ -1297,6 +1473,9 @@ class ModelConfigPreset(StrEnum):
     # MiMo models
     MIMO_V2_5_1M = "mimo_v2_5_1m"
     MIMO_V2_5_PRO_1M = "mimo_v2_5_pro_1m"
+
+    # Grok models
+    GROK_4_5_500K = "grok_4_5_500k"
 
     # Gemini models
     GEMINI_200K = "gemini_200k"
@@ -1339,6 +1518,16 @@ _MODEL_CFG_REGISTRY: dict[str, dict[str, Any]] = {
     # OpenAI GPT-5 series (vision, no video support)
     ModelConfigPreset.GPT5_270K.value: {
         "context_window": 270_000,
+        "max_images": 20,
+        "max_videos": 0,  # GPT doesn't support video
+        "support_gif": False,
+        "split_large_images": True,
+        "image_split_max_height": 4096,
+        "image_split_overlap": 50,
+        "capabilities": {ModelCapability.vision},
+    },
+    ModelConfigPreset.GPT5_350K.value: {
+        "context_window": 350_000,
         "max_images": 20,
         "max_videos": 0,  # GPT doesn't support video
         "support_gif": False,
@@ -1405,6 +1594,17 @@ _MODEL_CFG_REGISTRY: dict[str, dict[str, Any]] = {
             ModelCapability.reasoning_foreign_incompatible,
         },
     },
+    # Grok 4.5 models (text + image, no video support)
+    ModelConfigPreset.GROK_4_5_500K.value: {
+        "context_window": 500_000,
+        "max_images": 20,
+        "max_videos": 0,
+        "support_gif": False,
+        "split_large_images": True,
+        "image_split_max_height": 4096,
+        "image_split_overlap": 50,
+        "capabilities": {ModelCapability.vision},
+    },
     # Gemini models (vision + video support)
     ModelConfigPreset.GEMINI_200K.value: {
         "context_window": 200_000,
@@ -1417,6 +1617,7 @@ _MODEL_CFG_REGISTRY: dict[str, dict[str, Any]] = {
         "capabilities": {
             ModelCapability.vision,
             ModelCapability.video_understanding,
+            ModelCapability.youtube_url,
             ModelCapability.audio_understanding,
             ModelCapability.document_understanding,
         },
@@ -1432,6 +1633,7 @@ _MODEL_CFG_REGISTRY: dict[str, dict[str, Any]] = {
         "capabilities": {
             ModelCapability.vision,
             ModelCapability.video_understanding,
+            ModelCapability.youtube_url,
             ModelCapability.audio_understanding,
             ModelCapability.document_understanding,
         },
@@ -1453,6 +1655,12 @@ _MODEL_CFG_ALIASES: dict[str, str] = {
     "mimo_v2.5_pro": ModelConfigPreset.MIMO_V2_5_PRO_1M.value,
     "mimo_v2_5": ModelConfigPreset.MIMO_V2_5_1M.value,
     "mimo_v2_5_pro": ModelConfigPreset.MIMO_V2_5_PRO_1M.value,
+    "xai": ModelConfigPreset.GROK_4_5_500K.value,
+    "grok": ModelConfigPreset.GROK_4_5_500K.value,
+    "grok_4.5": ModelConfigPreset.GROK_4_5_500K.value,
+    "grok_4.5_latest": ModelConfigPreset.GROK_4_5_500K.value,
+    "grok_4_5": ModelConfigPreset.GROK_4_5_500K.value,
+    "grok_4_5_latest": ModelConfigPreset.GROK_4_5_500K.value,
     "gemini": ModelConfigPreset.GEMINI_200K.value,
 }
 

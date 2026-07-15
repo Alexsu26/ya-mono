@@ -1,0 +1,19 @@
+{
+  "capabilities": {
+    "approvals": true,
+    "commands": [
+      "runtime.health",
+      "workspace.open"
+    ],
+    "events": [
+      "runtime.health",
+      "text.delta"
+    ],
+    "max_attachments": 32,
+    "max_message_bytes": 1048576,
+    "steering": true
+  },
+  "protocol_version": 1,
+  "runtime_version": "0.1.0",
+  "type": "handshake"
+}

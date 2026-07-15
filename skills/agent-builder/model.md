@@ -27,18 +27,83 @@ See official docs: [pydantic-ai Models](https://ai.pydantic.dev/models/)
 
 **Common formats:**
 
-| Provider         | Format                                             | Example                                |
-| ---------------- | -------------------------------------------------- | -------------------------------------- |
-| OpenAI           | `openai-chat:<model>` / `openai-responses:<model>` | `openai-chat:gpt-4o`                   |
-| Anthropic        | `anthropic:<model>`                                | `anthropic:claude-3-5-sonnet-20241022` |
-| Google           | `gemini:<model>`                                   | `gemini:gemini-1.5-pro`                |
-| Google           | `google-gla:<model>`                               | `google-gla:gemini-2.5-pro`            |
-| Google Vertex AI | `google-vertex:<model>`                            | `google-vertex:gemini-2.5-pro`         |
-| Groq             | `groq:<model>`                                     | `groq:llama-3.1-70b-versatile`         |
+| Provider                   | Format                                                        | Example                                |
+| -------------------------- | ------------------------------------------------------------- | -------------------------------------- |
+| OpenAI                     | `openai-chat:<model>` / `openai-responses:<model>`            | `openai-responses:gpt-5.6-sol`         |
+| OpenAI Responses WebSocket | `openai-responses-ws:<model>` / `openai-responses-rs:<model>` | `openai-responses-ws:gpt-5.5`          |
+| Anthropic                  | `anthropic:<model>`                                           | `anthropic:claude-3-5-sonnet-20241022` |
+| Google                     | `google:<model>`                                              | `google:gemini-2.5-pro`                |
+| Google Cloud               | `google-cloud:<model>`                                        | `google-cloud:gemini-2.5-pro`          |
+
+## Model Request Auto Retry
+
+By default, `ya-agent-sdk` uses Pydantic AI's tenacity-based HTTP retry transport for transient model provider failures. This applies to SDK-created HTTP model clients, gateway model clients, OAuth Codex HTTP fallback, and pre-stream Responses WebSocket connect/create failures.
+
+Retries are intended for transport-level or clearly transient failures only: network/request errors, stream errors before a usable stream is returned, and HTTP statuses `408,409,425,429,500,502,503,504`. `Retry-After` headers are respected for rate limits.
+
+Configure with environment variables:
+
+| Variable                                              | Default                           | Description                                           |
+| ----------------------------------------------------- | --------------------------------- | ----------------------------------------------------- |
+| `YA_AGENT_MODEL_REQUEST_RETRY_ENABLED`                | `true`                            | Enable retry transport and WebSocket pre-stream retry |
+| `YA_AGENT_MODEL_REQUEST_RETRY_ATTEMPTS`               | `5`                               | Total attempts including the first try                |
+| `YA_AGENT_MODEL_REQUEST_RETRY_BACKOFF_MULTIPLIER`     | `1`                               | Exponential backoff multiplier                        |
+| `YA_AGENT_MODEL_REQUEST_RETRY_MAX_WAIT_SECONDS`       | `30`                              | Max exponential backoff wait                          |
+| `YA_AGENT_MODEL_REQUEST_RETRY_AFTER_MAX_WAIT_SECONDS` | `300`                             | Max wait honored from `Retry-After`                   |
+| `YA_AGENT_MODEL_REQUEST_RETRY_STATUS_CODES`           | `408,409,425,429,500,502,503,504` | Comma-separated retryable HTTP statuses               |
+
+## OpenAI Responses WebSocket
+
+`ya-agent-sdk` directly includes the generic OpenAI Responses WebSocket transport. The `openai-responses-ws:<model>` and `openai-responses-rs:<model>` aliases prefer WebSocket for streaming calls and fall back to HTTP in `auto` mode when a recoverable error happens before the first stream event.
+
+```python
+model = infer_model("openai-responses-ws:gpt-5.5")
+```
+
+Transport mode is controlled by `YA_AGENT_OPENAI_RESPONSES_WEBSOCKET_MODE`:
+
+| Value       | Behavior                                                                              |
+| ----------- | ------------------------------------------------------------------------------------- |
+| `auto`      | Prefer WebSocket and temporarily fall back to HTTP on recoverable pre-stream failures |
+| `websocket` | Force WebSocket and surface WebSocket errors                                          |
+| `http`      | Use the standard HTTP Responses transport                                             |
+
+The OAuth Codex provider reuses this SDK transport and only supplies Codex-specific bearer/account headers, beta header, and payload normalization.
+
+## OpenAI Responses Presets
+
+OpenAI Responses presets configure reasoning effort, reasoning summaries, storage, max output tokens, optional priority service tier, and GPT-5.6 reasoning mode.
+
+- Existing effort presets use the API's default `standard` reasoning mode.
+- `openai_responses_pro_low`, `openai_responses_pro_medium`, `openai_responses_pro_high`, `openai_responses_pro_xhigh`, and `openai_responses_pro_max` pair GPT-5.6 `pro` mode with an explicit effort.
+- `openai_responses_pro` is the medium-effort convenience preset.
+- `openai_responses_standard` is an alias for `openai_responses_default`.
+- `openai_responses_gpt5_6_pro` and `openai_responses_gpt56_pro` are aliases for `openai_responses_pro`.
+- `openai_responses_max` uses GPT-5.6 Sol's `max` reasoning effort with detailed reasoning summaries.
+- `openai_responses_gpt5_6_sol`, `openai_responses_gpt56_sol`, and `openai_responses_sol` are aliases for `openai_responses_max`.
+- `openai_responses_terra` maps to the balanced `openai_responses_medium` preset.
+- `openai_responses_luna` maps to the lower-latency `openai_responses_low` preset.
+- `openai_responses_max_fast` combines `max` effort with the priority service tier.
+- `openai_responses_xhigh` remains available for GPT-5.5 and providers that expose `xhigh` rather than `max`.
+
+Example:
+
+```python
+from ya_agent_sdk.agents import create_agent
+
+runtime = create_agent(
+    "openai-responses:gpt-5.6",
+    model_settings="openai_responses_pro",
+)
+```
+
+Pro-effort presets send one authoritative, complete `reasoning` object through `extra_body` until Pydantic AI exposes a model setting for `reasoning.mode`. Select the matching pro-effort preset rather than overriding `openai_reasoning_effort` separately. This preserves `mode`, `effort`, and `summary` for both HTTP and WebSocket Responses transports.
+
+Use `gpt5_350k` for subscription-backed Codex access with a 350K context window. Use the other GPT-5 `model_cfg` presets when they match the provider's documented context window. The OpenAI preview announcement describes `ultra` as a product mode that leverages subagents, but does not publish a stable Responses API payload field; configure it with inline `model_settings` only after your provider documents the exact field.
 
 ## Google Vertex AI Configuration
 
-Google Vertex AI requires additional configuration via environment variables. pydantic-ai automatically reads these variables when using `google-vertex:` prefix.
+Google Cloud Vertex AI requires additional configuration via environment variables. pydantic-ai automatically reads these variables when using the `google-cloud:` prefix.
 
 ### Environment Variables
 
@@ -58,7 +123,7 @@ export GOOGLE_API_KEY=your-api-key
 ```
 
 ```python
-model = infer_model("google-vertex:gemini-2.5-pro")
+model = infer_model("google-cloud:gemini-2.5-pro")
 ```
 
 **Method 2: Application Default Credentials (ADC)**
@@ -73,7 +138,7 @@ export GOOGLE_CLOUD_LOCATION=us-central1
 ```
 
 ```python
-model = infer_model("google-vertex:gemini-2.5-pro")
+model = infer_model("google-cloud:gemini-2.5-pro")
 ```
 
 **Method 3: Service Account**
@@ -85,7 +150,7 @@ export GOOGLE_CLOUD_LOCATION=us-central1
 ```
 
 ```python
-model = infer_model("google-vertex:gemini-2.5-pro")
+model = infer_model("google-cloud:gemini-2.5-pro")
 ```
 
 ### Available Regions
@@ -133,8 +198,7 @@ Naming convention: `{GATEWAY_NAME}_API_KEY` and `{GATEWAY_NAME}_BASE_URL`
 | --------------------------------------------- | ---------------------------------------------- |
 | `openai` / `openai-chat` / `openai-responses` | `gateway@openai-chat:gpt-4o`                   |
 | `anthropic`                                   | `gateway@anthropic:claude-3-5-sonnet-20241022` |
-| `gemini` / `google-vertex`                    | `gateway@gemini:gemini-1.5-pro`                |
-| `groq`                                        | `gateway@groq:llama-3.1-70b-versatile`         |
+| `gemini` / `google-cloud`                     | `gateway@gemini:gemini-1.5-pro`                |
 | `bedrock` / `converse`                        | `gateway@bedrock:anthropic.claude-3-sonnet`    |
 
 ### Sticky Routing
@@ -142,10 +206,7 @@ Naming convention: `{GATEWAY_NAME}_API_KEY` and `{GATEWAY_NAME}_BASE_URL`
 For session affinity scenarios, pass `extra_headers`:
 
 ```python
-model = infer_model(
-    "mygateway@gemini:gemini-1.5-pro",
-    extra_headers={"x-session-id": "unique-session-id"}
-)
+model = infer_model("mygateway@gemini:gemini-1.5-pro", extra_headers={"x-session-id": "unique-session-id"})
 ```
 
 **Note**: `extra_headers` only applies to Gateway mode, primarily for providers like `gemini` and `bedrock` that require header injection via http_client.
@@ -167,10 +228,7 @@ Claude Opus 4.7 uses adaptive thinking as the primary thinking mode. The `xhigh`
 from pydantic_ai import Agent
 from ya_agent_sdk.agents.models import infer_model
 
-agent = Agent(
-    model=infer_model("mygateway@openai-chat:gpt-4o"),
-    system_prompt="You are a helpful assistant."
-)
+agent = Agent(model=infer_model("mygateway@openai-chat:gpt-4o"), system_prompt="You are a helpful assistant.")
 ```
 
 ## References

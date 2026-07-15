@@ -6,12 +6,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+import pytest
+from pydantic import ValidationError
+from yaacli.cli import load_env_from_config
 from yaacli.config import (
     DEFAULT_COMMANDS,
     CommandDefinition,
     ConfigManager,
     GeneralConfig,
-    ModelProfileConfig,
     ToolsConfig,
     YaacliConfig,
 )
@@ -31,19 +33,23 @@ def test_default_config() -> None:
     assert config.is_configured is False
     assert config.general.model_settings is None
     assert config.general.agent_stream_resume_on_error is True
-    assert config.general.agent_stream_resume_max_attempts == 2
+    assert config.general.agent_stream_resume_max_attempts == 3
+    assert config.model_profiles == {}
     assert config.general.agent_stream_resume_prompt.startswith("The previous streaming model request failed")
 
-    # Display
+    # Display and local retention
     assert config.display.code_theme == "dark"
+    assert config.display.max_output_lines == 1000
+    assert config.display.max_output_blocks == 1000
+    assert config.display.max_output_bytes == 4 * 1024 * 1024
+    assert config.display.max_stream_render_bytes == 512 * 1024
+    assert config.display.max_prompt_history == 500
+    assert config.media.max_pending_attachments == 8
+    assert config.media.max_pending_attachment_bytes == 20 * 1024 * 1024
 
-    # Browser
-    assert config.browser.cdp_url is None
-
-    # Tools
+    # Tools and security
     assert config.tools.need_approval == []
-    assert config.oauth_refresh.enabled is True
-    assert config.oauth_refresh.interval_seconds == 1800
+    assert config.security.shell_review.enabled is False
 
 
 def test_general_config_with_preset() -> None:
@@ -69,65 +75,10 @@ def test_general_config_with_dict_settings() -> None:
     assert config.model_settings["max_tokens"] == 8192
 
 
-def test_model_profiles_include_legacy_default() -> None:
-    """Legacy [general] model is exposed as the default profile."""
-    config = YaacliConfig(
-        general=GeneralConfig(
-            model="openai-chat:gpt-4o",
-            model_settings="openai_default",
-            model_cfg="openai",
-        )
-    )
-
-    profiles = config.get_model_profiles()
-
-    assert profiles["default"].model == "openai-chat:gpt-4o"
-    assert profiles["default"].model_settings == "openai_default"
-    assert profiles["default"].model_cfg == "openai"
-    assert config.get_startup_model_profile() == ("default", profiles["default"])
-
-
-def test_model_profiles_active_model() -> None:
-    """Named profiles can be selected as the startup model."""
-    deepseek = ModelProfileConfig(
-        model="deepseek:deepseek-v4-flash",
-        model_settings="deepseek",
-        model_cfg="deepseek",
-    )
-    config = YaacliConfig(
-        general=GeneralConfig(active_model="deepseek"),
-        models={"deepseek": deepseek},
-    )
-
-    assert config.is_configured is True
-    assert config.get_model_profile("deepseek") == deepseek
-    assert config.get_startup_model_profile() == ("deepseek", deepseek)
-
-
-def test_model_profiles_first_named_profile_without_active() -> None:
-    """Named profiles work without legacy [general] fields."""
-    deepseek = ModelProfileConfig(model="deepseek:deepseek-v4-flash")
-    config = YaacliConfig(models={"deepseek": deepseek})
-
-    assert config.is_configured is True
-    assert config.get_startup_model_profile() == ("deepseek", deepseek)
-
-
-def test_model_profiles_accept_upstream_model_profiles_alias() -> None:
-    """Upstream-style [model_profiles.*] entries are selectable in yaacli."""
-    codex = ModelProfileConfig(
-        label="Subs Codex (OpenAI)",
-        model="oauth@codex:gpt-5.5",
-        model_settings="openai_responses_high",
-        model_cfg="gpt5_270k",
-    )
-    config = YaacliConfig(model_profiles={"subs-codex": codex})
-
-    profiles = config.get_model_profiles()
-
-    assert profiles["subs-codex"] == codex
-    assert config.is_configured is True
-    assert config.get_startup_model_profile() == ("subs-codex", codex)
+def test_general_config_accepts_former_loop_iteration_setting() -> None:
+    """Test migration from the former /loop iteration config key."""
+    config = GeneralConfig.model_validate({"max_loop_iterations": 7})
+    assert config.max_goal_iterations == 7
 
 
 def test_tools_config() -> None:
@@ -149,13 +100,6 @@ def test_load_defaults(config_manager: ConfigManager, clean_env: None) -> None:
     assert config.is_configured is False
     assert config.tools.need_approval == []
     assert config_manager.loaded_sources == []
-
-
-def test_primary_config_dirs_use_yaacli_names() -> None:
-    """yaacli is the only config namespace."""
-    assert ConfigManager.PROJECT_CONFIG_DIR == ".yaacli"
-    assert not hasattr(ConfigManager, "LEGACY_PROJECT_CONFIG_DIR")
-    assert not hasattr(ConfigManager, "LEGACY_CONFIG_DIR")
 
 
 def test_load_global_config(
@@ -180,44 +124,66 @@ code_theme = "light"
     assert config.general.model_settings == "openai_high"
     assert config.display.code_theme == "light"
     assert config.tools.need_approval == []
+    assert config.security.shell_review.enabled is False
 
 
-def test_load_global_oauth_and_model_profiles_config(
+def test_load_global_model_profiles_config(
     config_manager: ConfigManager,
     temp_config_dir: Path,
     clean_env: None,
 ) -> None:
-    """Load upstream OAuth-backed model profile syntax."""
+    """Test loading selectable model profiles from global config.toml."""
     config_file = temp_config_dir / "config.toml"
     config_file.write_text("""
 [general]
-model = "gateway@anthropic:gcp-claude-opus-4-7"
-model_settings = "anthropic_adaptive_1m_cm_default"
-model_cfg = "claude_1m"
+model = "anthropic:claude-sonnet-4-5"
+model_settings = "anthropic_adaptive_high"
+model_cfg = "claude_200k"
 
-[model_profiles.subs-codex]
-label = "Subs Codex (OpenAI)"
-model = "oauth@codex:gpt-5.5"
+[model_profiles.fast]
+label = "Fast"
+model = "openai-responses:gpt-5-mini"
+model_settings = "openai_responses_low"
 model_cfg = "gpt5_270k"
-model_settings = "openai_responses_high"
-
-[oauth_refresh]
-enabled = true
-interval_seconds = 1200
-failure_retry_seconds = 30
-refresh_on_startup = false
 """)
 
     config = config_manager.load()
 
-    profile = config.get_model_profile("subs-codex")
-    assert profile.label == "Subs Codex (OpenAI)"
-    assert profile.model == "oauth@codex:gpt-5.5"
-    assert profile.model_cfg == "gpt5_270k"
-    assert profile.model_settings == "openai_responses_high"
-    assert config.oauth_refresh.interval_seconds == 1200
-    assert config.oauth_refresh.failure_retry_seconds == 30
-    assert config.oauth_refresh.refresh_on_startup is False
+    assert config.general.model == "anthropic:claude-sonnet-4-5"
+    assert "fast" in config.model_profiles
+    fast = config.model_profiles["fast"]
+    assert fast.label == "Fast"
+    assert fast.model == "openai-responses:gpt-5-mini"
+    assert fast.model_settings == "openai_responses_low"
+    assert fast.model_cfg == "gpt5_270k"
+
+
+def test_load_global_security_shell_review_config(
+    config_manager: ConfigManager,
+    temp_config_dir: Path,
+    clean_env: None,
+) -> None:
+    """Test loading security.shell_review from global config.toml."""
+    config_file = temp_config_dir / "config.toml"
+    config_file.write_text("""
+[general]
+model = "openai-chat:gpt-4o"
+
+[security.shell_review]
+enabled = true
+model = "gateway@openai-responses:gpt-5.4-mini"
+model_settings = "openai_responses_low"
+on_needs_approval = "defer"
+risk_threshold = "extra_high"
+""")
+
+    config = config_manager.load()
+
+    assert config.security.shell_review.enabled is True
+    assert config.security.shell_review.model == "gateway@openai-responses:gpt-5.4-mini"
+    assert config.security.shell_review.model_settings == "openai_responses_low"
+    assert config.security.shell_review.on_needs_approval == "defer"
+    assert config.security.shell_review.risk_threshold == "extra_high"
 
 
 def test_load_project_tools_config(
@@ -226,7 +192,7 @@ def test_load_project_tools_config(
     clean_env: None,
 ) -> None:
     """Test loading project tools.toml (tools only)."""
-    project_config_dir = temp_project_dir / ConfigManager.PROJECT_CONFIG_DIR
+    project_config_dir = temp_project_dir / ".yaacli"
     project_config_dir.mkdir()
     config_file = project_config_dir / "tools.toml"
     config_file.write_text("""
@@ -258,7 +224,7 @@ model = "openai-chat:gpt-4o"
 code_theme = "light"
 """)
 
-    project_config_dir = temp_project_dir / ConfigManager.PROJECT_CONFIG_DIR
+    project_config_dir = temp_project_dir / ".yaacli"
     project_config_dir.mkdir()
     project_config = project_config_dir / "tools.toml"
     project_config.write_text("""
@@ -305,7 +271,7 @@ need_approval = ["global_tool"]
 """)
 
     # Project tools (should override)
-    project_config_dir = temp_project_dir / ConfigManager.PROJECT_CONFIG_DIR
+    project_config_dir = temp_project_dir / ".yaacli"
     project_config_dir.mkdir()
     project_tools = project_config_dir / "tools.toml"
     project_tools.write_text("""
@@ -317,6 +283,49 @@ need_approval = ["project_tool"]
 
     # Project tools takes priority
     assert config.tools.need_approval == ["project_tool"]
+
+
+def test_load_global_oauth_refresh_config(
+    config_manager: ConfigManager,
+    temp_config_dir: Path,
+    clean_env: None,
+) -> None:
+    """Test loading OAuth proactive refresh config."""
+    config_file = temp_config_dir / "config.toml"
+    config_file.write_text("""
+[general]
+model = "oauth@codex:gpt-5.5"
+
+[oauth_refresh]
+enabled = true
+interval_seconds = 1200
+failure_retry_seconds = 30
+refresh_on_startup = false
+""")
+
+    config = config_manager.load()
+
+    assert config.oauth_refresh.enabled is True
+    assert config.oauth_refresh.interval_seconds == 1200
+    assert config.oauth_refresh.failure_retry_seconds == 30
+    assert config.oauth_refresh.refresh_on_startup is False
+
+
+def test_oauth_refresh_config_requires_positive_intervals(
+    config_manager: ConfigManager,
+    temp_config_dir: Path,
+    clean_env: None,
+) -> None:
+    """Test OAuth proactive refresh interval validation."""
+    config_file = temp_config_dir / "config.toml"
+    config_file.write_text("""
+[oauth_refresh]
+interval_seconds = 0
+failure_retry_seconds = -1
+""")
+
+    with pytest.raises(ValidationError):
+        config_manager.load()
 
 
 def test_env_overrides_tui_only(
@@ -335,15 +344,17 @@ code_theme = "dark"
 """)
 
     os.environ["YAACLI_CODE_THEME"] = "light"
-    os.environ["YAACLI_CDP_URL"] = "auto"
     os.environ["YAACLI_AGENT_STREAM_RESUME_MAX_ATTEMPTS"] = "3"
+    os.environ["YAACLI_OAUTH_REFRESH_INTERVAL_SECONDS"] = "900"
+    os.environ["YAACLI_OAUTH_REFRESH_ON_STARTUP"] = "false"
 
     config = config_manager.load()
 
     assert config.display.code_theme == "light"
-    assert config.browser.cdp_url == "auto"
     assert config.general.model == "openai-chat:gpt-4o"
     assert config.general.agent_stream_resume_max_attempts == 3
+    assert config.oauth_refresh.interval_seconds == 900
+    assert config.oauth_refresh.refresh_on_startup is False
 
 
 def test_project_config_overrides_global(
@@ -365,7 +376,7 @@ code_theme = "dark"
 """)
 
     # Project config (replaces global entirely)
-    project_config_dir = temp_project_dir / ConfigManager.PROJECT_CONFIG_DIR
+    project_config_dir = temp_project_dir / ".yaacli"
     project_config_dir.mkdir()
     project_config = project_config_dir / "config.toml"
     project_config.write_text("""
@@ -389,7 +400,7 @@ def test_tools_toml_ignores_non_tools(
     clean_env: None,
 ) -> None:
     """Test that tools.toml ignores non-tools sections."""
-    project_config_dir = temp_project_dir / ConfigManager.PROJECT_CONFIG_DIR
+    project_config_dir = temp_project_dir / ".yaacli"
     project_config_dir.mkdir()
     config_file = project_config_dir / "tools.toml"
     config_file.write_text("""
@@ -447,7 +458,7 @@ def test_save_project_config(
     temp_project_dir: Path,
 ) -> None:
     """Test save_project_config."""
-    config_file = temp_project_dir / ConfigManager.PROJECT_CONFIG_DIR / "tools.toml"
+    config_file = temp_project_dir / ".yaacli" / "tools.toml"
     assert not config_file.exists()
 
     result = config_manager.save_project_config()
@@ -456,39 +467,6 @@ def test_save_project_config(
     content = config_file.read_text()
     assert "[tools]" in content
     assert "need_approval" in content
-
-
-def test_ignored_legacy_global_config_dir_is_not_migrated(tmp_path: Path, monkeypatch: Any) -> None:
-    """Default config manager ignores legacy global config directories."""
-    old_dir = tmp_path / ("." + "x" + "uno" + "cli")
-    new_dir = tmp_path / ".yaacli"
-    project_dir = tmp_path / "project"
-    old_dir.mkdir()
-    project_dir.mkdir()
-    (old_dir / "config.toml").write_text('[general]\nmodel = "openai-chat:gpt-4o"\n')
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr(ConfigManager, "DEFAULT_CONFIG_DIR", new_dir)
-
-    config_manager = ConfigManager(project_dir=project_dir)
-
-    assert not (new_dir / "config.toml").exists()
-    assert config_manager.load().general.model == ""
-
-
-def test_ignored_legacy_project_config_dir_is_not_migrated(tmp_path: Path) -> None:
-    """Config manager ignores legacy project config directories."""
-    config_dir = tmp_path / "global"
-    project_dir = tmp_path / "project"
-    old_project_dir = project_dir / ("." + "x" + "uno" + "cli")
-    new_project_dir = project_dir / ".yaacli"
-    config_dir.mkdir()
-    old_project_dir.mkdir(parents=True)
-    (old_project_dir / "tools.toml").write_text('[tools]\nneed_approval = ["legacy_tool"]\n')
-
-    config_manager = ConfigManager(config_dir=config_dir, project_dir=project_dir)
-
-    assert not (new_project_dir / "tools.toml").exists()
-    assert config_manager.load().tools.need_approval == []
 
 
 # =============================================================================
@@ -540,7 +518,7 @@ def test_load_mcp_config_project_priority(
     global_mcp = temp_config_dir / "mcp.json"
     global_mcp.write_text('{"servers": {"global_server": {"transport": "stdio", "command": "global"}}}')
 
-    project_config_dir = temp_project_dir / ConfigManager.PROJECT_CONFIG_DIR
+    project_config_dir = temp_project_dir / ".yaacli"
     project_config_dir.mkdir()
     project_mcp = project_config_dir / "mcp.json"
     project_mcp.write_text('{"servers": {"project_server": {"transport": "stdio", "command": "project"}}}')
@@ -563,7 +541,7 @@ def test_get_mcp_config_file(
     global_mcp.write_text("{}")
     assert config_manager.get_mcp_config_file() == global_mcp
 
-    project_config_dir = temp_project_dir / ConfigManager.PROJECT_CONFIG_DIR
+    project_config_dir = temp_project_dir / ".yaacli"
     project_config_dir.mkdir()
     project_mcp = project_config_dir / "mcp.json"
     project_mcp.write_text("{}")
@@ -626,7 +604,7 @@ def test_user_command_overrides_default() -> None:
 def test_load_commands_from_config_file(
     temp_config_dir: Path,
     temp_project_dir: Path,
-    monkeypatch: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test loading commands from config.toml."""
     monkeypatch.chdir(temp_project_dir)
@@ -674,6 +652,7 @@ def test_ensure_config_dir_creates_gitignore(tmp_path: Path) -> None:
     assert "sessions/" in content
     assert "message_history/" in content
     assert "worktrees/" in content
+    assert "state.json" in content
 
 
 def test_ensure_config_dir_gitignore_idempotent(tmp_path: Path) -> None:
@@ -703,116 +682,14 @@ def test_ensure_config_dir_gitignore_appends_missing(tmp_path: Path) -> None:
     assert "sessions/" in content
     assert "message_history/" in content
     assert "worktrees/" in content
+    assert "state.json" in content
     assert "custom_ignore/" in content  # User entries preserved
 
 
-# =============================================================================
-# Theme persistence
-# =============================================================================
+def test_load_env_from_config_overrides_existing_process_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The explicit config environment wins inside the YAACLI process."""
+    monkeypatch.setenv("CODEMIRRORGPT_BASE_URL", "https://old.example/v1")
 
+    load_env_from_config(YaacliConfig(env={"CODEMIRRORGPT_BASE_URL": "https://new.example/v1"}))
 
-def test_upsert_toml_table_key_replaces_existing_value_and_keeps_comment() -> None:
-    from yaacli.config import _upsert_toml_table_key
-
-    text = (
-        "[display]\n"
-        'code_theme = "dark"\n'
-        'theme = "tokyo-night"  # my preferred\n'
-        "show_token_usage = true\n"
-        "[session]\nfoo = 1\n"
-    )
-    updated = _upsert_toml_table_key(text, "display", "theme", '"cappuccino"')
-
-    # Value swapped, inline comment preserved (spacing normalized to one space).
-    assert 'theme = "cappuccino" # my preferred' in updated
-    assert 'code_theme = "dark"' in updated
-    assert "show_token_usage = true" in updated
-    # Other tables survive untouched.
-    assert "[session]\nfoo = 1" in updated
-    # And it round-trips through a real TOML parser.
-    import tomllib
-
-    assert tomllib.loads(updated)["display"]["theme"] == "cappuccino"
-
-
-def test_upsert_toml_table_key_inserts_when_table_lacks_key() -> None:
-    from yaacli.config import _upsert_toml_table_key
-
-    text = '[display]\n# highlight\ncode_theme = "dark"\n'
-    updated = _upsert_toml_table_key(text, "display", "theme", '"cappuccino"')
-
-    assert 'theme = "cappuccino"' in updated
-    assert 'code_theme = "dark"' in updated
-    import tomllib
-
-    assert tomllib.loads(updated)["display"]["theme"] == "cappuccino"
-
-
-def test_upsert_toml_table_key_appends_missing_table() -> None:
-    from yaacli.config import _upsert_toml_table_key
-
-    text = '[general]\nmodel = "x"\n'
-    updated = _upsert_toml_table_key(text, "display", "theme", '"cappuccino"')
-
-    assert "[display]" in updated
-    assert 'theme = "cappuccino"' in updated
-    assert 'model = "x"' in updated
-    import tomllib
-
-    parsed = tomllib.loads(updated)
-    assert parsed["display"]["theme"] == "cappuccino"
-    assert parsed["general"]["model"] == "x"
-
-
-def test_save_display_theme_creates_and_round_trips(
-    config_manager: ConfigManager,
-    temp_config_dir: Path,
-    clean_env: None,
-) -> None:
-    """Saving a theme writes config.toml and the value reloads."""
-    config_manager.load()  # no config.toml yet -> no source file
-    written = config_manager.save_display_theme("cappuccino")
-
-    assert written is not None
-    assert written == temp_config_dir / "config.toml"
-    assert 'theme = "cappuccino"' in written.read_text()
-
-    reloaded = ConfigManager(config_dir=temp_config_dir, project_dir=config_manager.project_dir).load()
-    assert reloaded.display.theme == "cappuccino"
-
-
-def test_save_display_theme_updates_value_in_place(
-    config_manager: ConfigManager,
-    temp_config_dir: Path,
-    clean_env: None,
-) -> None:
-    config_file = temp_config_dir / "config.toml"
-    config_file.write_text('[display]\ncode_theme = "dark"\ntheme = "tokyo-night"\nshow_token_usage = true\n')
-    config_manager.load()
-
-    written = config_manager.save_display_theme("cappuccino")
-
-    assert written == config_file
-    content = config_file.read_text()
-    assert 'theme = "cappuccino"' in content
-    assert "tokyo-night" not in content
-    # Sibling keys are preserved.
-    assert 'code_theme = "dark"' in content
-    assert "show_token_usage = true" in content
-
-
-def test_display_theme_env_override(
-    config_manager: ConfigManager,
-    temp_config_dir: Path,
-    clean_env: None,
-) -> None:
-    """YAACLI_DISPLAY_THEME overrides config.toml [display] theme."""
-    (temp_config_dir / "config.toml").write_text('[display]\ntheme = "tokyo-night"\n')
-    os.environ["YAACLI_DISPLAY_THEME"] = "cappuccino"
-
-    config = config_manager.load()
-    assert config.display.theme == "cappuccino"
-
-
-def test_default_display_theme_is_tokyo_night() -> None:
-    assert YaacliConfig().display.theme == "tokyo-night"
+    assert os.environ["CODEMIRRORGPT_BASE_URL"] == "https://new.example/v1"

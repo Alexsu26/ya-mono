@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from datetime import UTC, datetime
 
-import httpx
+import httpx2 as httpx
 from ya_oauth.codex import CODEX_CLIENT_ID, CODEX_TOKEN_ENDPOINT, CodexOAuthClient
 from ya_oauth.jwt import account_from_id_token
 from ya_oauth.store import OAuthStore
@@ -151,5 +152,6 @@ def test_store_permissions(tmp_path) -> None:
     store = OAuthStore(tmp_path / ".yaai" / "auth.json")
     store.save(store.load())
 
-    assert oct(store.path.parent.stat().st_mode & 0o777) == "0o700"
-    assert oct(store.path.stat().st_mode & 0o777) == "0o600"
+    if os.name == "posix":
+        assert oct(store.path.parent.stat().st_mode & 0o777) == "0o700"
+        assert oct(store.path.stat().st_mode & 0o777) == "0o600"

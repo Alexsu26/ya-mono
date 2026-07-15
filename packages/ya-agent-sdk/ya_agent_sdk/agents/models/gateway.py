@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Awaitable, Callable
-from dataclasses import replace
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import httpx
@@ -11,6 +10,7 @@ from pydantic_ai.models import Model
 from pydantic_ai.models import infer_model as legacy_infer_model
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers import Provider
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from ya_agent_sdk.agents.models.utils import create_async_http_client
 
@@ -20,7 +20,16 @@ _OPENAI_PROVIDER_ERROR = (
     "or 'openai-responses' for the Responses API."
 )
 _OPENAI_PROVIDER_ALIASES: tuple[str, ...] = ("openai", "chat", "responses")
+_OPENAI_RESPONSES_WEBSOCKET_PROVIDER_ALIASES: tuple[str, ...] = ("openai-responses-rs", "openai-responses-ws")
 _AICODEMIRROR_OPENAI_CODEX_PATH = "/api/codex/backend-api/codex"
+
+
+def normalize_legacy_provider_alias(model: str) -> str:
+    """Normalize Google provider aliases to Pydantic AI v2 provider names."""
+    provider_name, sep, model_name = model.partition(":")
+    if not sep or provider_name == "google" or not provider_name.startswith("google-"):
+        return model
+    return f"google-cloud:{model_name}"
 
 
 def _supports_required_tool_choice(model_name: str) -> bool:
@@ -138,7 +147,11 @@ def _is_aicodemirror_base_url(base_url: str) -> bool:
 
 def _normalize_gateway_base_url(provider_name: str, base_url: str) -> str:
     """Normalize gateway base URLs for provider SDK expectations."""
-    if provider_name in ("openai-chat", "openai-responses") and _is_aicodemirror_base_url(base_url):
+    if provider_name in (
+        "openai-chat",
+        "openai-responses",
+        *_OPENAI_RESPONSES_WEBSOCKET_PROVIDER_ALIASES,
+    ) and _is_aicodemirror_base_url(base_url):
         trimmed = base_url.rstrip("/")
         if trimmed.endswith(_AICODEMIRROR_OPENAI_CODEX_PATH):
             return f"{trimmed}/v1"
@@ -154,12 +167,16 @@ def _build_openai_responses_profile(model_name: str, provider: Provider[Any]) ->
     provider_model_profile = getattr(provider, "model_profile", None)
     if not callable(provider_model_profile):
         return None
-    profile = OpenAIModelProfile.from_profile(provider_model_profile(model_name))
+    raw_profile = provider_model_profile(model_name)
+    if not isinstance(raw_profile, Mapping):
+        return None
+    profile: dict[str, Any] = dict(cast(Mapping[str, Any], raw_profile))
 
     # AICodeMirror exposes the Responses shape but is not the first-party OpenAI
     # endpoint. Avoid replaying newer OpenAI-only fields that can break long
     # tool-heavy turns when model names such as gpt-5.5 enable them by default.
-    return replace(profile, openai_supports_phase=False)
+    profile["openai_supports_phase"] = False
+    return cast(OpenAIModelProfile, profile)
 
 
 def _build_openai_responses_model(model_name: str, provider: Provider[Any]) -> Model:
@@ -201,11 +218,9 @@ def _build_gateway_http_client(
         "converse",
     )
 
-    if extra_headers and needs_extra_headers_patch:
-        http_client = create_async_http_client(extra_headers=extra_headers)
-    else:
-        http_client = create_async_http_client()
-
+    http_client = create_async_http_client(
+        extra_headers=extra_headers if extra_headers and needs_extra_headers_patch else None,
+    )
     http_client.event_hooks = {"request": [_request_hook(api_key)]}
     return http_client
 
@@ -222,9 +237,8 @@ def _build_gateway_provider(
     if provider_name in (
         "openai-chat",
         "openai-responses",
+        *_OPENAI_RESPONSES_WEBSOCKET_PROVIDER_ALIASES,
     ):
-        from pydantic_ai.providers.openai import OpenAIProvider
-
         base_url = _normalize_gateway_base_url(provider_name, base_url)
         return OpenAIProvider(api_key=api_key, base_url=base_url, http_client=http_client)
     if provider_name == "groq":
@@ -251,7 +265,11 @@ def _build_gateway_provider(
             base_url=base_url,
             region_name=gateway_name,  # Fake region name to avoid NoRegionError
         )
-    if provider_name in ("google-cloud", "google", "google-vertex", "google-gla"):
+    if provider_name == "google":
+        from pydantic_ai.providers.google import GoogleProvider
+
+        return GoogleProvider(api_key=api_key, base_url=base_url, http_client=http_client)
+    if provider_name in ("google-cloud", "google-vertex", "google-gla"):
         from pydantic_ai.providers.google_cloud import GoogleCloudProvider
 
         return GoogleCloudProvider(api_key=api_key, base_url=base_url, http_client=http_client)
@@ -298,6 +316,55 @@ def _split_provider_and_model(model: str) -> tuple[str | None, str]:
     return provider, model_name
 
 
+def _build_gateway_responses_websocket_model(
+    model_name: str,
+    provider: Provider[Any],
+    *,
+    api_key: str,
+    extra_headers: dict[str, str] | None = None,
+) -> Model:
+    """Construct a Responses WebSocket model for OpenAI-compatible gateways."""
+    from ya_agent_sdk.agents.models.websocket import WebsocketResponsesModel, env_responses_websocket_mode
+
+    if not isinstance(provider, OpenAIProvider):
+        raise TypeError("Responses WebSocket gateway provider must be an OpenAIProvider")
+    return WebsocketResponsesModel(
+        model_name,
+        provider=provider,
+        websocket_headers_builder=_gateway_responses_websocket_headers_builder(
+            provider,
+            api_key=api_key,
+            extra_headers=extra_headers,
+        ),
+        websocket_mode=env_responses_websocket_mode("YA_AGENT_OPENAI_RESPONSES_WEBSOCKET_MODE", default="auto"),
+    )
+
+
+def _gateway_responses_websocket_headers_builder(
+    provider: OpenAIProvider,
+    *,
+    api_key: str,
+    extra_headers: dict[str, str] | None,
+) -> Callable[[Mapping[str, str]], Awaitable[dict[str, str]]]:
+    """Build gateway WebSocket handshake headers without relying on OpenAI client internals."""
+
+    async def _builder(request_extra_headers: Mapping[str, str]) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        default_headers = provider.client.default_headers
+        if isinstance(default_headers, Mapping):
+            for key, value in default_headers.items():
+                if value is None or value.__class__.__name__ in {"Omit", "NotGiven"}:
+                    continue
+                headers[str(key)] = str(value)
+        headers.update(extra_headers or {})
+        headers.update(request_extra_headers)
+        if not any(key.lower() == "authorization" for key in headers):
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    return _builder
+
+
 def infer_model(gateway_name: str, model: str, extra_headers: dict[str, str] | None = None) -> Model:
     """Infer model from string, optionally with extra HTTP headers.
 
@@ -317,11 +384,24 @@ def infer_model(gateway_name: str, model: str, extra_headers: dict[str, str] | N
         ``OpenAIModelProfile``. This preserves reasoning round-tripping for
         tool-call turns.
     """
+    model = normalize_legacy_provider_alias(model)
     provider_factory = make_gateway_provider(gateway_name, extra_headers)
 
     provider_prefix, model_name = _split_provider_and_model(model)
     if provider_prefix in _OPENAI_PROVIDER_ALIASES:
         raise ValueError(_OPENAI_PROVIDER_ERROR)
+    if provider_prefix in _OPENAI_RESPONSES_WEBSOCKET_PROVIDER_ALIASES:
+        provider = provider_factory(provider_prefix)
+        api_key, _base_url = _read_gateway_credentials(
+            f"{gateway_name.upper()}_API_KEY",
+            f"{gateway_name.upper()}_BASE_URL",
+        )
+        return _build_gateway_responses_websocket_model(
+            model_name,
+            provider,
+            api_key=api_key,
+            extra_headers=extra_headers,
+        )
     if provider_prefix == "openai-chat":
         profile = _build_openai_chat_profile(model_name)
         if profile is not None:

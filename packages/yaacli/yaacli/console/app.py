@@ -165,6 +165,26 @@ class ConsoleApp:
         """No-op for the non-Textual console; v2 surfaces this in StatusBar."""
         return
 
+    def handle_subagent_start(self, agent_id: str, name: str, prompt_preview: str = "") -> None:
+        """Render a compact lifecycle breadcrumb for a background subagent."""
+        self.show_breadcrumb(f"→ subagent {name} started ({agent_id})")
+
+    def handle_subagent_progress(self, agent_id: str, tool_name: str, tool_count: int) -> None:
+        """Keep background progress quiet in the modal console."""
+        return
+
+    def handle_subagent_complete(
+        self,
+        agent_id: str,
+        *,
+        success: bool = True,
+        result_preview: str = "",
+        duration_seconds: float = 0.0,
+    ) -> None:
+        """Render a compact completion breadcrumb for a background subagent."""
+        state = "completed" if success else "failed"
+        self.show_breadcrumb(f"→ subagent {agent_id} {state}")
+
     # -------- batch / one-shot blocks -------------------------------------------
 
     def show_edit(self, path: str, edits: Iterable[tuple[str, str]]) -> None:

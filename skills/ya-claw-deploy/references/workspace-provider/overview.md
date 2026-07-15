@@ -33,13 +33,13 @@ The current deployment matrix has three practical shapes:
 
 ```mermaid
 flowchart TB
-    REQ[Run Request] --> PROVIDER[WorkspaceProvider]
-    PROVIDER --> BIND[WorkspaceBinding]
-    BIND --> FACTORY[DefaultEnvironmentFactory]
-    FACTORY --> LOCAL[LocalEnvironmentFactory]
-    FACTORY --> DOCKER[DockerEnvironmentFactory]
-    LOCAL --> LOCAL_ENV[LocalFileOperator + LocalShell]
-    DOCKER --> DOCKER_ENV[VirtualLocalFileOperator + DockerShell]
+    REQ["Run Request"] --> PROVIDER["WorkspaceProvider"]
+    PROVIDER --> BIND["WorkspaceBinding"]
+    BIND --> FACTORY["DefaultEnvironmentFactory"]
+    FACTORY --> LOCAL["LocalEnvironmentFactory"]
+    FACTORY --> DOCKER["DockerEnvironmentFactory"]
+    LOCAL --> LOCAL_ENV["LocalFileOperator + policy-driven LocalShell"]
+    DOCKER --> DOCKER_ENV["VirtualLocalFileOperator + DockerShell"]
 ```
 
 ## Selection Guidance

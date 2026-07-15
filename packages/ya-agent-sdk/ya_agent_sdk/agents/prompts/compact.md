@@ -1,7 +1,11 @@
 Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
 This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
 
-Before providing your final summary, wrap your analysis in `analysis` field to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
+Before providing your final summary, wrap your analysis in `analysis` field to organize your thoughts and ensure you've covered all necessary points.
+
+Do not carry a merely inspected or rejected candidate's workflow, mandatory requirements, referenced-resource instructions, or proposed next steps into any continuation section. If historically relevant, record only that it was inspected and not activated.
+
+In your analysis process:
 
 1. Chronologically analyze each message and section of the conversation. For each section thoroughly identify:
    - The user's explicit requests and intents
@@ -76,8 +80,8 @@ Here's an example of how your output should be structured:
    - [I edited file Z; build succeeded]
    - [I proposed approach A; user rejected, prefers B]
 
-9. Skills Documentation:
-   [If applicable: List specific skills accessed (e.g., /skills/ai-integration/SKILL.md) and reminder to re-read them]
+9. Activated Skills:
+   [If applicable: List only Skills that were activated and remain relevant to unfinished work, and remind the next agent to re-read them. Exclude Skills that were merely inspected or rejected as candidates.]
 
 10. Files to Inspect on Resume:
    [If applicable: List file paths that may need to be inspected when resuming, e.g., src/main.py, config.yaml]

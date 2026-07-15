@@ -92,7 +92,7 @@ class BlockSink(Protocol):
 def extract_tool_result_text(event: FunctionToolResultEvent) -> tuple[str, bool]:
     """Best-effort: get a string + error flag from a tool result event."""
     try:
-        content = event.result.content
+        content = event.part.content
     except AttributeError:
         return ("", False)
 
@@ -146,6 +146,7 @@ class ConsoleSession:
 
     def handle(self, event: StreamEvent) -> None:
         """Handle a single stream event with enhanced error handling."""
+        msg: Any | None = None
         try:
             agent_id = getattr(event, "agent_id", "main") or "main"
             msg = getattr(event, "event", None)
@@ -162,15 +163,15 @@ class ConsoleSession:
 
             self._handle_event_internal(agent_id, msg)
 
-        except Exception as e:
+        except Exception:
             # Catch all exceptions to prevent stream interruption
-            logger.exception(f"Error handling event {type(msg).__name__ if msg else 'unknown'}: {e}")
+            logger.exception("Error handling event %s", type(msg).__name__ if msg else "unknown")
             # Notify user of the error but continue processing
             try:
-                self.sink.show_breadcrumb(f"⚠️  事件处理错误: {type(e).__name__}")
-            except:
+                self.sink.show_breadcrumb("Event handling error; see log for details")
+            except Exception:
                 # If even breadcrumb fails, just log and continue
-                logger.error(f"Failed to show error breadcrumb: {e}")
+                logger.exception("Failed to show error breadcrumb")
 
     def _handle_event_internal(self, agent_id: str, msg: Any) -> None:
         """Internal event handling logic (extracted for exception handling)."""
@@ -252,9 +253,9 @@ class ConsoleSession:
                 self.sink.handle_thinking_delta(msg.part.content)
                 self._saw_thinking = True
             elif _thinking_part_is_hidden(msg.part):
-                # 加密的 thinking：显示简短的进度提示，避免用户以为程序卡住
+                # Keep encrypted thinking visibly active so the stream does not appear stuck.
                 logger.debug("Encrypted thinking detected, showing notice")
-                self.sink.handle_thinking_delta("● 正在思考（Extended thinking 已加密）...")
+                self.sink.handle_thinking_delta("● 正在思考 (Extended thinking 已加密)...")
                 self._saw_thinking = True
             return
 

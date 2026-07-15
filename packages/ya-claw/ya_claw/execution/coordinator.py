@@ -60,6 +60,7 @@ from ya_claw.workspace import (
     WorkspaceProvider,
     build_workspace_sandbox_metadata,
 )
+from ya_claw.workspace.docker_lifecycle import build_docker_container_ref
 from ya_claw.workspace.models import (
     SANDBOX_SCOPE_RUN,
     SANDBOX_SCOPE_SESSION,
@@ -1760,6 +1761,9 @@ async def _publish_run_status_notification(
                 "latest_run_id": run_record.id,
                 "latest_run_sequence_no": run_record.sequence_no,
                 "latest_run_status": run_record.status,
+                "termination_reason": run_record.termination_reason,
+                "error_message": run_record.error_message,
+                "updated_at": (run_record.finished_at or run_record.started_at or run_record.created_at).isoformat(),
             },
         )
 
@@ -1849,9 +1853,12 @@ def _next_sandbox_generation(*, existing: dict[str, Any], fingerprint: str, scop
 
 
 def _build_scoped_container_ref(*, scope: SandboxScopeLiteral, session_id: str, run_id: str, generation: int) -> str:
-    if scope == SANDBOX_SCOPE_RUN:
-        return f"ya-claw-run-{run_id[:12]}"
-    return f"ya-claw-session-{session_id[:12]}-g{generation}"
+    return build_docker_container_ref(
+        scope=scope,
+        session_id=session_id,
+        run_id=run_id,
+        generation=generation,
+    )
 
 
 def _utc_now_iso() -> str:

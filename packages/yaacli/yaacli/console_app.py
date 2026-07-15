@@ -13,6 +13,7 @@ import json
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import TracebackType
 from typing import Any
 
 from prompt_toolkit import PromptSession
@@ -90,7 +91,7 @@ class ConsoleTUI:
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
-        exc_tb: object,
+        exc_tb: TracebackType | None,
     ) -> None:
         await self._exit_stack.__aexit__(exc_type, exc_val, exc_tb)
 
@@ -242,8 +243,7 @@ class ConsoleTUI:
                 await session.stream(stream)
                 # Persist message history once per turn
                 try:
-                    if hasattr(stream, "all_messages") and callable(stream.all_messages):
-                        self._message_history = list(stream.all_messages())
+                    self._message_history = stream.recoverable_messages()
                 except Exception:
                     logger.debug("Could not persist message history", exc_info=True)
                 # Final structured output, if any
