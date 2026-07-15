@@ -380,7 +380,7 @@ def load_env_from_config(config: YaacliConfig) -> None:
     """Load environment variables from config [env] section."""
     if config.env:
         for key, value in config.env.items():
-            if value and key not in os.environ:
+            if value:
                 os.environ[key] = value
 
 

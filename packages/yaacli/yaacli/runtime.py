@@ -307,7 +307,40 @@ def create_tui_runtime(
         workspace_dir = Path.cwd()
     project_config_dir = workspace_dir / ConfigManager.PROJECT_CONFIG_DIR
     env_kwargs["default_path"] = workspace_dir
-    env_kwargs["allowed_paths"] = [global_config_dir, shared_agents_dir, workspace_dir, project_config_dir]
+
+    # Build allowed_paths list, including symlink targets from ~/.agents/skills
+    allowed_paths = [global_config_dir, shared_agents_dir, workspace_dir, project_config_dir]
+
+    # Add symlink target directories from ~/.agents/skills to allowed_paths
+    # This allows skills symlinked from external directories (e.g., ~/code/skills) to be accessed
+    skills_dir = shared_agents_dir / "skills"
+    if skills_dir.exists() and skills_dir.is_dir():
+        # Collect all unique parent directories of symlink targets
+        symlink_roots = set()
+        for item in skills_dir.iterdir():
+            if item.is_symlink():
+                try:
+                    real_path = item.resolve()
+                    if real_path.exists():
+                        # Add the ultimate parent directory containing the skills
+                        # e.g., /home/user/code/skills/skills/engineering/ask-matt -> add /home/user/code/skills
+                        parts = real_path.parts
+                        # Find 'skills' directory in the path and add its parent
+                        for i, part in enumerate(parts):
+                            if part == "skills" and i > 0:
+                                skills_root = Path(*parts[:i+1])
+                                if skills_root not in allowed_paths and skills_root.exists():
+                                    symlink_roots.add(skills_root)
+                                break
+                except (OSError, RuntimeError) as e:
+                    logger.debug(f"Could not resolve symlink {item.name}: {e}")
+
+        # Add collected roots to allowed_paths
+        for root in symlink_roots:
+            allowed_paths.append(root)
+            logger.info(f"Added symlink target directory: {root}")
+
+    env_kwargs["allowed_paths"] = allowed_paths
 
     # Shell environment isolation: configurable via config.toml
     env_kwargs["include_os_env"] = config.include_os_env

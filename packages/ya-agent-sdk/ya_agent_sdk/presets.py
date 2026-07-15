@@ -738,10 +738,10 @@ def _openai_responses_settings(
 
 OPENAI_RESPONSES_DEFAULT: dict[str, Any] = _openai_responses_settings(
     reasoning_effort="medium",
-    reasoning_summary="auto",
+    reasoning_summary="detailed",  # 改为 detailed 以获取思考摘要
     max_tokens=16 * K_TOKENS,
 )
-"""OpenAI Responses default: Same as medium, balanced reasoning effort."""
+"""OpenAI Responses default: Same as medium, balanced reasoning effort with detailed summary."""
 
 OPENAI_RESPONSES_XHIGH: dict[str, Any] = _openai_responses_settings(
     reasoning_effort="xhigh",

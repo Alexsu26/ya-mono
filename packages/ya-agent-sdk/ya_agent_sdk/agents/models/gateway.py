@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from pydantic_ai.models import Model
@@ -18,6 +20,7 @@ _OPENAI_PROVIDER_ERROR = (
     "or 'openai-responses' for the Responses API."
 )
 _OPENAI_PROVIDER_ALIASES: tuple[str, ...] = ("openai", "chat", "responses")
+_AICODEMIRROR_OPENAI_CODEX_PATH = "/api/codex/backend-api/codex"
 
 
 def _supports_required_tool_choice(model_name: str) -> bool:
@@ -124,6 +127,52 @@ def _build_openai_chat_model(model_name: str, provider: Provider[Any]) -> Model:
     return OpenAIChatModel(model_name=model_name, provider=provider, profile=_build_openai_chat_profile(model_name))
 
 
+def _is_aicodemirror_base_url(base_url: str) -> bool:
+    """Return whether a base URL points at AICodeMirror."""
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return False
+    return parsed.netloc.lower() == "api.aicodemirror.com"
+
+
+def _normalize_gateway_base_url(provider_name: str, base_url: str) -> str:
+    """Normalize gateway base URLs for provider SDK expectations."""
+    if provider_name in ("openai-chat", "openai-responses") and _is_aicodemirror_base_url(base_url):
+        trimmed = base_url.rstrip("/")
+        if trimmed.endswith(_AICODEMIRROR_OPENAI_CODEX_PATH):
+            return f"{trimmed}/v1"
+    return base_url
+
+
+def _build_openai_responses_profile(model_name: str, provider: Provider[Any]) -> OpenAIModelProfile | None:
+    """Build OpenAI Responses profile patches needed by OpenAI-compatible gateways."""
+    base_url = getattr(provider, "base_url", "")
+    if not isinstance(base_url, str) or not _is_aicodemirror_base_url(base_url):
+        return None
+
+    provider_model_profile = getattr(provider, "model_profile", None)
+    if not callable(provider_model_profile):
+        return None
+    profile = OpenAIModelProfile.from_profile(provider_model_profile(model_name))
+
+    # AICodeMirror exposes the Responses shape but is not the first-party OpenAI
+    # endpoint. Avoid replaying newer OpenAI-only fields that can break long
+    # tool-heavy turns when model names such as gpt-5.5 enable them by default.
+    return replace(profile, openai_supports_phase=False)
+
+
+def _build_openai_responses_model(model_name: str, provider: Provider[Any]) -> Model:
+    """Construct an OpenAIResponsesModel with gateway compatibility patches."""
+    from pydantic_ai.models.openai import OpenAIResponsesModel
+
+    return OpenAIResponsesModel(
+        model_name=model_name,
+        provider=provider,
+        profile=_build_openai_responses_profile(model_name, provider),
+    )
+
+
 def _read_gateway_credentials(api_key_env_var: str, base_url_env_var: str) -> tuple[str, str]:
     api_key = os.getenv(api_key_env_var)
     if not api_key:
@@ -176,6 +225,7 @@ def _build_gateway_provider(
     ):
         from pydantic_ai.providers.openai import OpenAIProvider
 
+        base_url = _normalize_gateway_base_url(provider_name, base_url)
         return OpenAIProvider(api_key=api_key, base_url=base_url, http_client=http_client)
     if provider_name == "groq":
         from pydantic_ai.providers.groq import GroqProvider
@@ -186,7 +236,12 @@ def _build_gateway_provider(
         from pydantic_ai.providers.anthropic import AnthropicProvider
 
         return AnthropicProvider(
-            anthropic_client=AsyncAnthropic(auth_token=api_key, base_url=base_url, http_client=http_client)
+            anthropic_client=AsyncAnthropic(
+                api_key=api_key,
+                auth_token=api_key,
+                base_url=base_url,
+                http_client=http_client,
+            )
         )
     if provider_name in ("bedrock", "converse"):
         from pydantic_ai.providers.bedrock import BedrockProvider
@@ -272,5 +327,8 @@ def infer_model(gateway_name: str, model: str, extra_headers: dict[str, str] | N
         if profile is not None:
             provider = provider_factory(provider_prefix)
             return _build_openai_chat_model(model_name, provider)
+    if provider_prefix == "openai-responses":
+        provider = provider_factory(provider_prefix)
+        return _build_openai_responses_model(model_name, provider)
 
     return legacy_infer_model(model, provider_factory)

@@ -43,6 +43,19 @@ model = ""
 # model_settings = "openai_responses_high"
 # model_cfg = "gpt5_270k"
 #
+# AICodeMirror examples:
+# [models.aicodemirror-gpt]
+# label = "AICodeMirror GPT"
+# model = "codemirrorgpt@openai-responses:gpt-5.1-codex"
+# model_settings = { openai_store = false, openai_reasoning_effort = "high", max_tokens = 32768 }
+# model_cfg = "gpt5_270k"
+#
+# [models.aicodemirror-opus]
+# label = "AICodeMirror Opus"
+# model = "codemirrorclaude@anthropic:claude-opus-4-8"
+# model_settings = { max_tokens = 32768 }
+# model_cfg = "claude_200k"
+#
 # Or custom configuration:
 # [general.model_cfg]
 # context_window = 200000
@@ -103,6 +116,10 @@ agent_stream_resume_prompt = "The previous streaming model request failed before
 # OPENAI_API_KEY = "sk-..."
 # GOOGLE_API_KEY = "..."
 # DEEPSEEK_API_KEY = "sk-..."
+# CODEMIRRORGPT_API_KEY = "..."
+# CODEMIRRORGPT_BASE_URL = "https://api.aicodemirror.com/api/codex/backend-api/codex/v1"
+# CODEMIRRORCLAUDE_API_KEY = "..."
+# CODEMIRRORCLAUDE_BASE_URL = "https://api.aicodemirror.com/api/claudecode"
 
 [oauth_refresh]
 # Proactively refresh OAuth-backed model provider tokens during CLI lifetime.

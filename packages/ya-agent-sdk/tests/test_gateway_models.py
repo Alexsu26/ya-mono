@@ -1,7 +1,8 @@
 """Tests for gateway model inference helpers."""
 
 import pytest
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from ya_agent_sdk.agents.models.gateway import (
     _is_deepseek_model,
@@ -72,6 +73,35 @@ def test_infer_gateway_mimo_v2_5_uses_reasoning_content_profile(monkeypatch) -> 
     assert profile.thinking_always_enabled is True
     assert profile.openai_chat_thinking_field == "reasoning_content"
     assert profile.openai_chat_send_back_thinking_parts == "field"
+
+
+def test_infer_gateway_aicodemirror_openai_responses_normalizes_base_url_and_profile(monkeypatch) -> None:
+    """AICodeMirror Codex Responses uses an OpenAI-compatible /v1 base URL."""
+    monkeypatch.setenv("CODEMIRRORGPT_API_KEY", "test-key")
+    monkeypatch.setenv("CODEMIRRORGPT_BASE_URL", "https://api.aicodemirror.com/api/codex/backend-api/codex")
+
+    model = infer_model("codemirrorgpt", "openai-responses:gpt-5.5")
+
+    assert isinstance(model, OpenAIResponsesModel)
+    assert model.base_url == "https://api.aicodemirror.com/api/codex/backend-api/codex/v1/"
+    profile = OpenAIModelProfile.from_profile(model.profile)
+    assert profile.openai_supports_phase is False
+    assert profile.openai_supports_reasoning is True
+
+
+def test_infer_gateway_anthropic_sends_gateway_key_as_api_key_and_auth_token(monkeypatch) -> None:
+    """Anthropic-compatible gateways should not accidentally mix in global Anthropic env credentials."""
+    monkeypatch.setenv("CODEMIRRORCLAUDE_API_KEY", "test-key")
+    monkeypatch.setenv("CODEMIRRORCLAUDE_BASE_URL", "https://api.aicodemirror.com/api/claudecode")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "wrong-global-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "wrong-global-token")
+
+    model = infer_model("codemirrorclaude", "anthropic:claude-opus-4-8")
+
+    assert isinstance(model, AnthropicModel)
+    assert model.base_url == "https://api.aicodemirror.com/api/claudecode/"
+    assert model.client.auth_headers["X-Api-Key"] == "test-key"
+    assert model.client.auth_headers["Authorization"] == "Bearer test-key"
 
 
 def test_infer_gateway_deepseek_r1_uses_tool_choice_profile_patch(monkeypatch) -> None:

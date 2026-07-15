@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -41,6 +42,17 @@ class EmptyStream:
 
 def configured() -> YaacliConfig:
     return YaacliConfig(general=GeneralConfig(model="openai-chat:gpt-4"))
+
+
+def test_load_env_from_config_overrides_existing_process_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Values in config.toml [env] should be the provider env used by this CLI process."""
+    from yaacli.cli import load_env_from_config
+
+    monkeypatch.setenv("CODEMIRRORGPT_BASE_URL", "https://old.example/v1")
+
+    load_env_from_config(YaacliConfig(env={"CODEMIRRORGPT_BASE_URL": "https://new.example/v1"}))
+
+    assert os.environ["CODEMIRRORGPT_BASE_URL"] == "https://new.example/v1"
 
 
 def test_cli_headless_option_exists() -> None:
