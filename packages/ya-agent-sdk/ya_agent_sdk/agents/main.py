@@ -1343,6 +1343,8 @@ async def stream_agent(  # noqa: C901
     main_done = asyncio.Event()
     poll_done = asyncio.Event()
     partial_text = PartialTextAccumulator()
+    current_run: AgentRun[AgentDepsT, OutputT] | None = None
+    streamer_ref: AgentStreamer[AgentDepsT, OutputT] | None = None
 
     logger.debug(
         "Starting stream_agent with user_prompt=%s",
@@ -1523,6 +1525,7 @@ async def stream_agent(  # noqa: C901
         is_resume_attempt: bool,
     ) -> None:
         """Run one agent iteration attempt with hooks and lifecycle events."""
+        nonlocal current_run
         await emit_lifecycle_event(
             AgentExecutionStartEvent(
                 event_id=ctx.run_id,
@@ -1541,7 +1544,9 @@ async def stream_agent(  # noqa: C901
             message_history=effective_message_history,
             deferred_tool_results=effective_deferred_tool_results,
         ) as run:
-            streamer.run = run
+            current_run = run
+            if streamer_ref is not None:
+                streamer_ref.run = run
 
             start_ctx = AgentStartContext(
                 runtime=runtime, agent_info=main_agent_info, output_queue=output_queue, run=run
@@ -1732,7 +1737,7 @@ async def stream_agent(  # noqa: C901
 
                 next_attempt_index = attempt_index + 1
                 resume_history = close_unreturned_tool_calls(
-                    extract_resume_history(streamer.run, current_message_history),
+                    extract_resume_history(current_run, current_message_history),
                     error_str,
                 )
                 recovery = recover_retry_message_history(e, resume_history, ctx)
@@ -1894,6 +1899,8 @@ async def stream_agent(  # noqa: C901
         _partial_text=partial_text,
         _tool_id_wrapper=ctx.tool_id_wrapper,
     )
+    streamer_ref = streamer
+    streamer.run = current_run
 
     try:
         yield streamer

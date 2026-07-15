@@ -154,6 +154,28 @@ def test_create_tui_runtime_uses_persisted_model_profile(tmp_path: Path) -> None
     assert runtime.ctx.model_cfg.context_window == 1_000_000
 
 
+def test_create_tui_runtime_uses_active_models_profile(tmp_path: Path) -> None:
+    """Runtime preserves the fork's [models] plus general.active_model contract."""
+    config = YaacliConfig(
+        general=GeneralConfig(active_model="opus"),
+        models={
+            "opus": ModelProfileConfig(
+                model="openai-chat:gpt-4",
+                model_cfg="claude_200k",
+            ),
+        },
+    )
+
+    runtime = create_tui_runtime(
+        config=config,
+        working_dir=tmp_path,
+        config_dir=tmp_path / "config",
+    )
+
+    assert runtime.agent.model is not None
+    assert runtime.ctx.model_cfg.context_window == 200_000
+
+
 async def test_goal_context_handoff_extension_marks_active_goal() -> None:
     """YAACLI lifecycle extension should mark active goals after context handoff."""
     from yaacli.session import TUIContext

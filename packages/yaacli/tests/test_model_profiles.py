@@ -8,6 +8,7 @@ from yaacli.config import GeneralConfig, ModelProfileConfig, YaacliConfig
 from yaacli.model_profiles import (
     DEFAULT_MODEL_PROFILE_ID,
     build_model_profiles,
+    get_model_profile,
     get_startup_model_profile,
     load_state,
     save_selected_model_profile_id,
@@ -41,6 +42,45 @@ def test_build_model_profiles_includes_default_and_configured_profiles() -> None
     assert profiles[1].model == "openai-responses:gpt-5-mini"
 
 
+def test_build_model_profiles_includes_models_table_profiles() -> None:
+    """Fork-style [models.*] profiles remain selectable after the upstream merge."""
+    config = YaacliConfig(
+        general=GeneralConfig(active_model="opus"),
+        models={
+            "opus": ModelProfileConfig(
+                label="AICodeMirror Opus 4.8",
+                model="codemirrorclaude@anthropic:claude-opus-4-8",
+                model_cfg="claude_200k",
+            ),
+        },
+    )
+
+    profiles = build_model_profiles(config)
+    profile = get_model_profile(config, "opus")
+
+    assert [resolved.id for resolved in profiles] == ["opus"]
+    assert profile is not None
+    assert profile.label == "AICodeMirror Opus 4.8"
+    assert profile.model == "codemirrorclaude@anthropic:claude-opus-4-8"
+
+
+def test_startup_profile_uses_active_model_when_no_selection_is_persisted(tmp_path: Path) -> None:
+    """The fork's general.active_model selects a [models.*] startup profile."""
+    config = YaacliConfig(
+        general=GeneralConfig(active_model="opus"),
+        models={
+            "fast": ModelProfileConfig(model="openai-responses:gpt-5-mini"),
+            "opus": ModelProfileConfig(model="codemirrorclaude@anthropic:claude-opus-4-8"),
+        },
+    )
+
+    profile = get_startup_model_profile(config, tmp_path)
+
+    assert profile is not None
+    assert profile.id == "opus"
+    assert profile.model == "codemirrorclaude@anthropic:claude-opus-4-8"
+
+
 def test_save_and_load_selected_model_profile_id(tmp_path: Path) -> None:
     """Last selected profile id is persisted in state.json."""
     save_selected_model_profile_id(tmp_path, "fast")
@@ -54,9 +94,10 @@ def test_save_and_load_selected_model_profile_id(tmp_path: Path) -> None:
 def test_startup_profile_uses_persisted_selection_when_available(tmp_path: Path) -> None:
     """Startup profile restores the persisted selection when config still has it."""
     config = YaacliConfig(
-        general=GeneralConfig(model="anthropic:claude-sonnet-4-5"),
+        general=GeneralConfig(model="anthropic:claude-sonnet-4-5", active_model="slow"),
         model_profiles={
             "fast": ModelProfileConfig(label="Fast", model="openai-responses:gpt-5-mini"),
+            "slow": ModelProfileConfig(label="Slow", model="anthropic:claude-opus-4-5"),
         },
     )
     save_selected_model_profile_id(tmp_path, "fast")

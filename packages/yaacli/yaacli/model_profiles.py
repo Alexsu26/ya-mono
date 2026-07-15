@@ -83,25 +83,25 @@ def save_selected_model_profile_id(config_dir: Path, profile_id: str) -> None:
 def build_model_profiles(config: YaacliConfig) -> list[ResolvedModelProfile]:
     """Build selectable model profiles from config.
 
-    The first profile is always the startup default from [general] when configured.
-    Additional profiles come from [model_profiles.*].
+    Profiles may come from the fork's [models.*], upstream's
+    [model_profiles.*], or the legacy [general] model fields.
     """
+    configured_profiles = config.get_model_profiles()
+    ordered_profiles = list(configured_profiles.items())
+    if config.general.model and DEFAULT_MODEL_PROFILE_ID in configured_profiles:
+        default_profile = configured_profiles[DEFAULT_MODEL_PROFILE_ID]
+        ordered_profiles = [
+            (DEFAULT_MODEL_PROFILE_ID, default_profile),
+            *(
+                (profile_id, profile)
+                for profile_id, profile in ordered_profiles
+                if profile_id != DEFAULT_MODEL_PROFILE_ID
+            ),
+        ]
+
     profiles: list[ResolvedModelProfile] = []
-
-    if config.general.model:
-        profiles.append(
-            ResolvedModelProfile(
-                id=DEFAULT_MODEL_PROFILE_ID,
-                label="Default",
-                model=config.general.model,
-                model_settings=config.general.model_settings,
-                model_cfg=config.general.model_cfg,
-                is_default=True,
-            )
-        )
-
-    for profile_id, profile in config.model_profiles.items():
-        label = profile.label or profile_id
+    for profile_id, profile in ordered_profiles:
+        label = profile.label or ("Default" if profile_id == DEFAULT_MODEL_PROFILE_ID else profile_id)
         profiles.append(
             ResolvedModelProfile(
                 id=profile_id,
@@ -109,6 +109,7 @@ def build_model_profiles(config: YaacliConfig) -> list[ResolvedModelProfile]:
                 model=profile.model,
                 model_settings=profile.model_settings,
                 model_cfg=profile.model_cfg,
+                is_default=profile_id == DEFAULT_MODEL_PROFILE_ID,
             )
         )
 
@@ -126,8 +127,8 @@ def get_model_profile(config: YaacliConfig, profile_id: str) -> ResolvedModelPro
 def get_startup_model_profile(config: YaacliConfig, config_dir: Path) -> ResolvedModelProfile | None:
     """Return the model profile to use at startup.
 
-    The persisted selection wins when it still exists in config. The [general]
-    profile remains the fallback startup default.
+    A valid persisted selection wins, followed by general.active_model. The
+    legacy [general] profile and then the first configured profile are fallbacks.
     """
     profiles = build_model_profiles(config)
     if not profiles:
@@ -135,10 +136,16 @@ def get_startup_model_profile(config: YaacliConfig, config_dir: Path) -> Resolve
 
     state = load_state(config_dir)
     selected_id = state.model_profile.selected_profile_id
-    if selected_id:
-        for profile in profiles:
-            if profile.id == selected_id:
-                return profile
+    profiles_by_id = {profile.id: profile for profile in profiles}
+    if selected_id and selected_id in profiles_by_id:
+        return profiles_by_id[selected_id]
+
+    active_model = config.general.active_model
+    if active_model and active_model in profiles_by_id:
+        return profiles_by_id[active_model]
+
+    if DEFAULT_MODEL_PROFILE_ID in profiles_by_id:
+        return profiles_by_id[DEFAULT_MODEL_PROFILE_ID]
 
     return profiles[0]
 

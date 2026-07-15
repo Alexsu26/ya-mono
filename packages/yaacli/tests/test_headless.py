@@ -181,6 +181,7 @@ async def test_headless_prompt_uses_model_profile_and_auto_denies_hitl(
     profile.model_settings = None
     profile.model_cfg = None
     config.model_profiles = {"fast": profile}
+    config.get_model_profiles.return_value = {"fast": profile}
 
     config_manager = MagicMock(spec=ConfigManager)
     config_manager.config_dir = tmp_path / "config"
