@@ -19,6 +19,7 @@ Example::
 """
 
 import json
+from typing import Any, cast
 
 from pydantic_ai.messages import (
     ModelMessage,
@@ -69,8 +70,11 @@ async def fix_truncated_tool_args(
                     json.loads(part.args)
                 except json.JSONDecodeError:
                     logger.warning(f"({msg.model_name})Dropping unparseable tool args: {part}")
-                    part.args = {
-                        "system": "This tool's args is not a valid JSON. "
-                        "Please refer the return value of the tool to try again."
-                    }
+                    part.args = cast(
+                        Any,
+                        {
+                            "system": "This tool's args is not a valid JSON. "
+                            "Please refer the return value of the tool to try again."
+                        },
+                    )
     return message_history

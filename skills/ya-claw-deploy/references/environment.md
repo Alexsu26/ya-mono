@@ -45,35 +45,86 @@ YA Claw loads settings from process environment and `.env` files. `YA_CLAW_*` va
 | `YA_CLAW_PROFILE_SEED_FILE`  | YAML seed file path, commonly `packages/ya-claw/profiles.yaml` in development |
 | `YA_CLAW_AUTO_SEED_PROFILES` | Upsert seeded profiles on startup                                             |
 
+## Allocator Tuning
+
+The official YA Claw service and workspace Docker images set these allocator defaults for long-lived Python workloads:
+
+| Variable                 | Default  | Purpose                                                         |
+| ------------------------ | -------- | --------------------------------------------------------------- |
+| `MALLOC_ARENA_MAX`       | `2`      | Limits glibc malloc arena growth across threads                 |
+| `MALLOC_TRIM_THRESHOLD_` | `131072` | Encourages glibc heap trimming after freed blocks reach 128 KiB |
+| `PYTHONMALLOC`           | `malloc` | Routes Python allocations through libc malloc                   |
+
+Use the same values for systemd or custom container deployments when memory residency matters.
+
 ## Workspace Provider Settings
 
-| Variable                                                | Purpose                                                                   |
-| ------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `YA_CLAW_WORKSPACE_PROVIDER_BACKEND`                    | `docker` for Docker shell execution, `local` for local shell execution    |
-| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_IMAGE`               | Workspace image, default `ghcr.io/wh1isper/ya-claw-workspace:latest`      |
-| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_HOST_WORKSPACE_DIR`  | Docker daemon-visible workspace path for service Docker + Docker shell    |
-| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_UID`                 | UID inside auto-started workspace containers                              |
-| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_GID`                 | GID inside auto-started workspace containers                              |
-| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_EXEC_USER`           | Docker exec user; default `auto` resolves to workspace UID:GID            |
-| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_HOME`                | Default HOME for Docker exec commands, default `/home/claw`               |
-| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_CONTAINER_CACHE_DIR` | Stable workspace container ID cache directory                             |
-| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_EXTRA_MOUNTS`        | Comma-separated Docker extra mounts using host_path:container_path[:mode] |
-| `YA_CLAW_WORKSPACE_ENV_VARS`                            | Comma-separated process env names forwarded into workspace environments   |
+| Variable                                                | Purpose                                                                                                                                                  |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `YA_CLAW_WORKSPACE_PROVIDER_BACKEND`                    | `docker` for Docker shell execution, `local` for local shell execution                                                                                   |
+| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_IMAGE`               | Workspace image, default `ghcr.io/wh1isper/ya-claw-workspace:latest`                                                                                     |
+| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_HOST_WORKSPACE_DIR`  | Docker daemon-visible workspace path for service Docker + Docker shell                                                                                   |
+| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_UID`                 | UID inside auto-started workspace containers                                                                                                             |
+| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_GID`                 | GID inside auto-started workspace containers                                                                                                             |
+| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_EXEC_USER`           | Docker exec user; default `auto` resolves to workspace UID:GID                                                                                           |
+| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_HOME`                | Default HOME for Docker exec commands, default `/home/claw`                                                                                              |
+| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_CONTAINER_CACHE_DIR` | Stable workspace container metadata root; session cache path is `sessions/{session_id}/workspace.json`, run cache path is `runs/{run_id}/workspace.json` |
+| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_EXTRA_MOUNTS`        | Comma-separated Docker extra mounts using host_path:container_path[:mode]                                                                                |
+| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_RETENTION_POLICY`    | Session sandbox retention, `stop_on_idle` or `keep_warm`; default `stop_on_idle`                                                                         |
+| `YA_CLAW_WORKSPACE_PROVIDER_DOCKER_IDLE_TTL_SECONDS`    | Idle seconds before stopping session sandboxes under `stop_on_idle`; default `3600`                                                                      |
+| `YA_CLAW_WORKSPACE_ENV_VARS`                            | Comma-separated process env names forwarded into workspace environments                                                                                  |
+
+## Shell Sandbox Settings
+
+These settings apply to local workspace shell execution. Docker workspace provider deployments use the Docker workspace container boundary; local shell deployments use policy-driven `LocalShell` with a resolved shell sandbox policy when shell sandboxing is enabled.
+
+| Variable                               | Default | Purpose                                                                                                        |
+| -------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
+| `YA_CLAW_SHELL_SANDBOX_ENABLED`        | `true`  | Enables local shell sandbox policy for local workspace environments                                            |
+| `YA_CLAW_SHELL_SANDBOX_BACKEND`        | `auto`  | Backend preference: `auto`, `linux_bwrap_seccomp`, `macos_seatbelt`, `windows_restricted_token`, or `raw_host` |
+| `YA_CLAW_SHELL_SANDBOX_NETWORK`        | `full`  | Network policy: `blocked`, `restricted`, `proxy`, or `full`                                                    |
+| `YA_CLAW_SHELL_SANDBOX_ALLOW_RAW_HOST` | `false` | Allows raw host shell fallback or explicit `raw_host` backend when profile policy also permits it              |
+
+`auto` selects `linux_bwrap_seccomp` on Linux, `macos_seatbelt` on macOS, and `windows_restricted_token` on Windows. Linux local shell sandboxing requires `bubblewrap` (`bwrap`) for the default backend. macOS local shell sandboxing uses `/usr/bin/sandbox-exec`. The Windows backend is planned and currently behaves as a guarded path.
+
+Profile-level `security.shell_sandbox` can override profile, backend preference, network policy, environment allowlist, raw host approval, and audit metadata. See [`profiles.md`](profiles.md#shell-sandbox-policy).
 
 ## Schedule and Heartbeat Settings
 
-| Variable                             | Default                                    | Purpose                                                                  |
-| ------------------------------------ | ------------------------------------------ | ------------------------------------------------------------------------ |
-| `YA_CLAW_SCHEDULE_DISPATCH_ENABLED`  | `true`                                     | Enables cron schedule dispatch                                           |
-| `YA_CLAW_SCHEDULE_TICK_SECONDS`      | `5`                                        | Dispatcher scan interval in seconds                                      |
-| `YA_CLAW_SCHEDULE_MAX_DUE_PER_TICK`  | `20`                                       | Maximum due schedule fires processed per scan                            |
-| `YA_CLAW_HEARTBEAT_ENABLED`          | `false`                                    | Enables the heartbeat dispatcher                                         |
-| `YA_CLAW_HEARTBEAT_INTERVAL_SECONDS` | `300`                                      | Seconds between heartbeat fires                                          |
-| `YA_CLAW_HEARTBEAT_PROFILE`          | unset                                      | Profile used for heartbeat runs; falls back to `YA_CLAW_DEFAULT_PROFILE` |
-| `YA_CLAW_HEARTBEAT_PROMPT`           | `Run heartbeat according to HEARTBEAT.md.` | Prompt submitted for heartbeat runs                                      |
-| `YA_CLAW_HEARTBEAT_ON_ACTIVE`        | `skip`                                     | Active-run policy for heartbeat dispatch                                 |
+| Variable                                         | Default                                    | Purpose                                                                  |
+| ------------------------------------------------ | ------------------------------------------ | ------------------------------------------------------------------------ |
+| `YA_CLAW_SCHEDULE_DISPATCH_ENABLED`              | `true`                                     | Enables cron schedule dispatch                                           |
+| `YA_CLAW_SCHEDULE_TICK_SECONDS`                  | `5`                                        | Dispatcher scan interval in seconds                                      |
+| `YA_CLAW_SCHEDULE_MAX_DUE_PER_TICK`              | `20`                                       | Maximum due schedule fires processed per scan                            |
+| `YA_CLAW_HEARTBEAT_ENABLED`                      | `false`                                    | Enables the heartbeat dispatcher                                         |
+| `YA_CLAW_HEARTBEAT_INTERVAL_SECONDS`             | `300`                                      | Seconds between heartbeat fires                                          |
+| `YA_CLAW_HEARTBEAT_PROFILE`                      | unset                                      | Profile used for heartbeat runs; falls back to `YA_CLAW_DEFAULT_PROFILE` |
+| `YA_CLAW_HEARTBEAT_PROMPT`                       | `Run heartbeat according to HEARTBEAT.md.` | Prompt submitted for heartbeat runs                                      |
+| `YA_CLAW_HEARTBEAT_ON_ACTIVE`                    | `skip`                                     | Active-run policy for heartbeat dispatch                                 |
+| `YA_CLAW_UNATTENDED_SHELL_REVIEW_RISK_THRESHOLD` | unset                                      | Fallback shell review risk threshold for schedule/heartbeat runs         |
 
 Heartbeat guidance lives at `<YA_CLAW_WORKSPACE_DIR>/HEARTBEAT.md`. See [`schedules-heartbeat.md`](schedules-heartbeat.md) for deployment steps, API checks, and backup notes.
+
+## Session Agency Settings
+
+| Variable                                                | Default      | Purpose                                                         |
+| ------------------------------------------------------- | ------------ | --------------------------------------------------------------- |
+| `YA_CLAW_AGENCY_ENABLED`                                | `true`       | Default enablement for source conversation session agency state |
+| `YA_CLAW_AGENCY_IDLE_AFTER_SECONDS`                     | `600`        | Idle age before inactivity signals are created                  |
+| `YA_CLAW_AGENCY_COOLDOWN_SECONDS`                       | `1800`       | Minimum delay between automatic agency actions per source       |
+| `YA_CLAW_AGENCY_PROFILE`                                | unset        | Profile override for agency runs; falls back to source/default  |
+| `YA_CLAW_AGENCY_TICK_SECONDS`                           | `30`         | Agency dispatcher scan interval                                 |
+| `YA_CLAW_AGENCY_MAX_SIGNALS_PER_TICK`                   | `20`         | Maximum pending signals batched per dispatch                    |
+| `YA_CLAW_AGENCY_MAX_SESSIONS_PER_TICK`                  | `10`         | Maximum source sessions scanned per tick                        |
+| `YA_CLAW_AGENCY_MEMORY_CAPTURE_ENABLED`                 | `true`       | Allows agency output to feed session memory extraction          |
+| `YA_CLAW_AGENCY_CONTEXT_MAX_CHARS`                      | `8000`       | Maximum agency context block size                               |
+| `YA_CLAW_AGENCY_RECENT_FILES_LIMIT`                     | `5`          | Recent agency file index limit                                  |
+| `YA_CLAW_AGENCY_INDEX_TARGET_CHARS`                     | `16000`      | Target size for `memory/AGENCY.md`                              |
+| `YA_CLAW_AGENCY_INDEX_MAX_CHARS`                        | `32000`      | Hard size cap used by compaction guidance                       |
+| `YA_CLAW_AGENCY_ACTION_LOG_RECENT_CHARS`                | `32000`      | Recent action log window loaded into agency context             |
+| `YA_CLAW_AGENCY_UNATTENDED_SHELL_REVIEW_RISK_THRESHOLD` | `extra_high` | Agency-specific unattended shell review threshold               |
+
+Session agency creates paired internal `session_type="agency"` sessions and `trigger_type="agency"` runs. See [`agency.md`](agency.md) for behavior, API checks, safety policy, backup, and troubleshooting.
 
 ## Session and Run Pruning Settings
 
@@ -116,7 +167,7 @@ This mode deletes old `run-store/{run_id}` directories and keeps `sessions`, `ru
 | `YA_CLAW_BRIDGE_LARK_APP_ID`          | Lark/Feishu app ID for bridge websocket ingress                               |
 | `YA_CLAW_BRIDGE_LARK_APP_SECRET`      | Lark/Feishu app secret for bridge websocket ingress                           |
 | `YA_CLAW_BRIDGE_LARK_DEFAULT_PROFILE` | Profile used for Lark-triggered runs; falls back to `YA_CLAW_DEFAULT_PROFILE` |
-| `YA_CLAW_BRIDGE_LARK_EVENT_TYPES`     | Accepted Lark event allowlist                                                 |
+| `YA_CLAW_BRIDGE_LARK_EVENT_TYPES`     | Accepted Lark event allowlist; include `card.action.trigger` for HITL buttons |
 | `YA_CLAW_BRIDGE_LARK_REPLY_IDENTITY`  | `bot` or `user`                                                               |
 | `YA_CLAW_BRIDGE_LARK_DOMAIN`          | Lark/Feishu OpenAPI domain                                                    |
 | `LARK_APP_ID`                         | Workspace `lark-cli` app ID; overrides bridge-derived workspace value         |
@@ -153,12 +204,20 @@ YA_CLAW_WORKSPACE_DIR=/var/lib/ya-claw/workspace
 YA_CLAW_WORKSPACE_PROVIDER_BACKEND=docker
 YA_CLAW_WORKSPACE_PROVIDER_DOCKER_HOST_WORKSPACE_DIR=/srv/ya-claw/workspace
 YA_CLAW_WORKSPACE_PROVIDER_DOCKER_IMAGE=ghcr.io/wh1isper/ya-claw-workspace:latest
+YA_CLAW_SHELL_SANDBOX_ENABLED=true
+YA_CLAW_SHELL_SANDBOX_BACKEND=auto
+YA_CLAW_SHELL_SANDBOX_NETWORK=full
+YA_CLAW_SHELL_SANDBOX_ALLOW_RAW_HOST=false
 YA_CLAW_PROFILE_SEED_FILE=/etc/ya-claw/profiles.yaml
 YA_CLAW_AUTO_SEED_PROFILES=true
 YA_CLAW_SCHEDULE_DISPATCH_ENABLED=true
 YA_CLAW_HEARTBEAT_ENABLED=false
 YA_CLAW_HEARTBEAT_INTERVAL_SECONDS=300
 YA_CLAW_HEARTBEAT_PROFILE=default
+YA_CLAW_AGENCY_ENABLED=true
+YA_CLAW_AGENCY_IDLE_AFTER_SECONDS=600
+YA_CLAW_AGENCY_COOLDOWN_SECONDS=1800
+YA_CLAW_AGENCY_PROFILE=default
 YA_CLAW_SESSION_PRUNE_ENABLED=true
 YA_CLAW_SESSION_PRUNE_RUN_KEEP_RECENT=10
 YA_CLAW_SESSION_PRUNE_RUN_OLDER_THAN_DAYS=30
@@ -170,6 +229,11 @@ YA_CLAW_BRIDGE_ENABLED_ADAPTERS=lark
 YA_CLAW_BRIDGE_LARK_APP_ID=cli_xxx
 YA_CLAW_BRIDGE_LARK_APP_SECRET=replace-with-app-secret
 YA_CLAW_BRIDGE_LARK_DEFAULT_PROFILE=default
+YA_CLAW_BRIDGE_LARK_EVENT_TYPES=im.chat.member.bot.added_v1,im.chat.member.user.added_v1,im.message.receive_v1,drive.notice.comment_add_v1,card.action.trigger
+YA_CLAW_AGENCY_UNATTENDED_SHELL_REVIEW_RISK_THRESHOLD=extra_high
+MALLOC_ARENA_MAX=2
+MALLOC_TRIM_THRESHOLD_=131072
+PYTHONMALLOC=malloc
 LARK_APP_ID=cli_xxx
 LARK_APP_SECRET=replace-with-workspace-lark-secret
 MY_TOOL_API_KEY=replace-with-tool-key

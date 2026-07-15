@@ -59,6 +59,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.bench/
 cover/
 
 # Translations
@@ -104,6 +105,8 @@ celerybeat.pid
 
 # Environments
 .env
+.yaai/
+**/.yaai/
 .venv
 env/
 venv/
@@ -156,6 +159,16 @@ yaacli/yaacli/skills/building-agents
 # Frontend
 node_modules/
 apps/*/dist/
+!apps/ya-desktop/
+!apps/ya-desktop/src/
+!apps/ya-desktop/src/**
+!apps/ya-desktop/src-tauri/
+!apps/ya-desktop/src-tauri/resources/
+!apps/ya-desktop/src-tauri/resources/uv/
+!apps/ya-desktop/src-tauri/resources/uv/.gitkeep
+apps/ya-desktop/src-tauri/resources/uv/uv
+apps/ya-desktop/src-tauri/resources/uv/uv.exe
+apps/ya-desktop/src-tauri/gen/schemas/linux-schema.json
 *.tsbuildinfo
 
 # Generated artifacts (agent run outputs, PPTX extracts, etc.)

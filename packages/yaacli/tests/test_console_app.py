@@ -65,7 +65,7 @@ def test_session_handles_tool_call_lifecycle(console_app: ConsoleApp) -> None:
     session.handle(_FakeStreamEvent(event=FunctionToolCallEvent(part=call)))
 
     return_part = ToolReturnPart(tool_name="Bash", content="file1\nfile2\n", tool_call_id="t1")
-    session.handle(_FakeStreamEvent(event=FunctionToolResultEvent(result=return_part)))
+    session.handle(_FakeStreamEvent(event=FunctionToolResultEvent(part=return_part)))
     console_app.close_turn()
 
     out = console_app.console.file.getvalue()
@@ -94,7 +94,7 @@ def test_session_marks_tool_error_when_result_is_error_string(console_app: Conso
         content="Tool execution error: nonzero exit",
         tool_call_id="t9",
     )
-    session.handle(_FakeStreamEvent(event=FunctionToolResultEvent(result=return_part)))
+    session.handle(_FakeStreamEvent(event=FunctionToolResultEvent(part=return_part)))
     console_app.close_turn()
 
     out = console_app.console.file.getvalue()

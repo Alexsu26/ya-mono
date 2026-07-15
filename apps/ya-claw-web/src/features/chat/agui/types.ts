@@ -6,12 +6,14 @@ export type TimelineBlock =
   | ReasoningBlock
   | ToolCallBlock
   | RuntimeEventBlock
+  | RunCompleteBlock
   | TaskBoardBlock
   | ContextMeterBlock
   | UsageBlock
   | SubagentBlock
   | FileChangeBlock
   | NoteSnapshotBlock
+  | SteeringBlock
   | RawCustomBlock
 
 export type UserInputBlock = {
@@ -54,6 +56,13 @@ export type RuntimeEventBlock = {
   title: string
   status: 'info' | 'running' | 'success' | 'warning' | 'error'
   payload: unknown
+}
+
+export type RunCompleteBlock = {
+  kind: 'run_complete'
+  id: string
+  outputText: string
+  result: unknown
 }
 
 export type TaskInfo = {
@@ -110,6 +119,17 @@ export type NoteSnapshotBlock = {
   kind: 'note_snapshot'
   id: string
   entries: Record<string, string>
+}
+
+export type SteeringBlock = {
+  kind: 'steering'
+  id: string
+  title: string
+  status: 'delivered' | 'injected'
+  inputParts: InputPart[]
+  prompt?: unknown
+  delivery?: string
+  payload: unknown
 }
 
 export type RawCustomBlock = {

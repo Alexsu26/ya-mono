@@ -46,9 +46,7 @@ class ListSchedulesTool(BaseTool):
     async def get_instruction(self, ctx: RunContext[AgentContext]) -> str | None:
         if _get_schedule_client(ctx) is None:
             return None
-        return (
-            "List schedules you own in the current YA Claw session. Use this before creating duplicate scheduled jobs."
-        )
+        return "Check existing current-session schedules before creating duplicate scheduled jobs."
 
     async def call(
         self,
@@ -84,10 +82,8 @@ class CreateScheduleTool(BaseTool):
         if _get_schedule_client(ctx) is None:
             return None
         return (
-            "Create recurring cron schedules with a plain text prompt. "
-            "The schedule inherits the current profile. "
-            "Use continue_current_session for timed messages in this conversation, "
-            "start_from_current_session for recurring branches, and enabled=false to create a paused schedule."
+            "Use current-session continuation for timed messages in this conversation, "
+            "source-session branching for recurring branches, and paused schedules for drafts."
         )
 
     async def call(
@@ -146,10 +142,8 @@ class CreateOnceScheduleTool(BaseTool):
         if _get_schedule_client(ctx) is None:
             return None
         return (
-            "Create one-time schedules with a plain text prompt and an absolute run_at datetime. "
-            "The schedule inherits the current profile. "
-            "Use continue_current_session for timed messages in this conversation, "
-            "start_from_current_session for one-time branches, and enabled=false to create a paused schedule."
+            "Use current-session continuation for one-time reminders in this conversation, "
+            "source-session branching for one-time follow-up branches, and paused schedules for drafts."
         )
 
     async def call(

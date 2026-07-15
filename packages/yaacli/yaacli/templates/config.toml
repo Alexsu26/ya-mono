@@ -15,12 +15,13 @@
 model = ""
 
 # Model settings: preset name or custom dict
-# Available presets: anthropic_default, openai_default, gemini_thinking_level_default, etc.
+# Available presets: anthropic_default, openai_default, openai_responses_pro,
+# openai_responses_max, grok_4_5_default, gemini_thinking_level_default, etc.
 # model_settings = "anthropic_default"
 
 # Model config for context management (context window, capabilities, etc.)
-# Presets: claude_200k, claude_1m, gpt5_270k, gemini_200k, gemini_1m
-# Aliases: claude, anthropic, openai, gemini
+# Presets: claude_200k, claude_1m, gpt5_270k, gpt5_350k, grok_4_5_500k, gemini_200k, gemini_1m
+# Aliases: claude, anthropic, openai, xai, grok, gemini
 # model_cfg = "claude_200k"
 #
 # /model can switch between selectable profiles for the current session.
@@ -43,6 +44,19 @@ model = ""
 # model_settings = "openai_responses_high"
 # model_cfg = "gpt5_270k"
 #
+# AICodeMirror examples:
+# [models.aicodemirror-gpt]
+# label = "AICodeMirror GPT"
+# model = "codemirrorgpt@openai-responses:gpt-5.1-codex"
+# model_settings = { openai_store = false, openai_reasoning_effort = "high", max_tokens = 32768 }
+# model_cfg = "gpt5_270k"
+#
+# [models.aicodemirror-opus]
+# label = "AICodeMirror Opus"
+# model = "codemirrorclaude@anthropic:claude-opus-4-8"
+# model_settings = { max_tokens = 32768 }
+# model_cfg = "claude_200k"
+#
 # Or custom configuration:
 # [general.model_cfg]
 # context_window = 200000
@@ -50,18 +64,18 @@ model = ""
 # max_videos = 0
 # compact_threshold = 0.90
 # proactive_context_management_threshold = 0.5
-# capabilities = ["vision"]  # Options: vision, video_understanding, document_understanding
+# capabilities = ["vision"]  # Options: vision, image_url, video_understanding, video_url, youtube_url, audio_understanding, document_understanding
 
 # Maximum requests per session
 max_requests = 1000
 
 # Retry interrupted provider/SSE streams by resuming from recovered message history.
 agent_stream_resume_on_error = true
-agent_stream_resume_max_attempts = 2
+agent_stream_resume_max_attempts = 3
 agent_stream_resume_prompt = "The previous streaming model request failed before the agent finished. Continue the task from the available conversation history. Avoid repeating completed work."
 
-# Maximum iterations for /loop command
-# max_loop_iterations = 10
+# Maximum iterations for /goal command
+# max_goal_iterations = 10
 
 # Custom system prompt file path (optional)
 # If empty, uses built-in default from CLI package
@@ -103,6 +117,10 @@ agent_stream_resume_prompt = "The previous streaming model request failed before
 # OPENAI_API_KEY = "sk-..."
 # GOOGLE_API_KEY = "..."
 # DEEPSEEK_API_KEY = "sk-..."
+# CODEMIRRORGPT_API_KEY = "..."
+# CODEMIRRORGPT_BASE_URL = "https://api.aicodemirror.com/api/codex/backend-api/codex/v1"
+# CODEMIRRORCLAUDE_API_KEY = "..."
+# CODEMIRRORCLAUDE_BASE_URL = "https://api.aicodemirror.com/api/claudecode"
 
 [oauth_refresh]
 # Proactively refresh OAuth-backed model provider tokens during CLI lifetime.
@@ -120,6 +138,14 @@ theme = "tokyo-night"
 max_tool_result_lines = 5
 # Maximum length for tool argument display
 max_arg_length = 100
+# Rendered transcript retention budgets.
+max_output_lines = 1000
+max_output_blocks = 1000
+max_output_bytes = 4194304
+# Maximum raw streamed bytes retained/rendered before the transcript projection.
+max_stream_render_bytes = 524288
+# Maximum submitted prompts retained for history navigation.
+max_prompt_history = 500
 # Show token usage in status bar
 show_token_usage = true
 # Show elapsed time

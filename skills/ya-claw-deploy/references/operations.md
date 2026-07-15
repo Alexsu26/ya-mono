@@ -40,8 +40,25 @@ Look for:
 - seeded profile names
 - execution supervisor startup
 - runtime instance registration
+- agency dispatcher startup when session agency is enabled
 - bridge supervisor startup when embedded bridge is enabled
 - workspace container creation or reuse errors
+
+## Agency Checks
+
+Session agency uses paired internal agency sessions and durable agency signals. Use the dedicated operations guide for configuration, API checks, backup, and troubleshooting: [`agency.md`](agency.md).
+
+Quick manual signal check:
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer ${YA_CLAW_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"manual","client_token":"ops-check-1","prompt_override":"Run a short agency deployment check."}' \
+  http://127.0.0.1:9042/api/v1/sessions/${SESSION_ID}/agency:signal
+```
+
+Expected delivery is `submitted`, `steered`, or `duplicate`. Agency runs appear with `trigger_type="agency"`, and agency workspace state lives under `memory/AGENCY.md` and `memory/agency/**`.
 
 ## Bridge Checks
 
@@ -63,12 +80,12 @@ YA_CLAW_BRIDGE_LARK_APP_SECRET=replace-with-app-secret
 For Docker shell shapes:
 
 ```bash
-docker ps --filter 'name=ya-claw-workspace'
-docker logs ya-claw-workspace-<fingerprint>
-docker exec -it ya-claw-workspace-<fingerprint> pwd
-docker exec -it ya-claw-workspace-<fingerprint> ls -la /workspace
-docker exec -it ya-claw-workspace-<fingerprint> agent-browser --help
-docker exec -it ya-claw-workspace-<fingerprint> lark-cli --version
+docker ps --filter 'name=ya-claw-session'
+docker ps --filter 'name=ya-claw-run'
+docker logs ya-claw-session-<session-short>-g<generation>
+docker exec -it ya-claw-session-<session-short>-g<generation> pwd
+docker exec -it ya-claw-session-<session-short>-g<generation> ls -la /workspace
+docker exec -it ya-claw-session-<session-short>-g<generation> lark-cli --version
 ```
 
 For service local + local shell:
@@ -77,11 +94,11 @@ For service local + local shell:
 sudo -u ya-claw sh -lc 'cd /var/lib/ya-claw/workspace && pwd && ls -la'
 ```
 
-Remove a stale workspace container and cache after changing the workspace image or mount contract:
+Remove a stale session workspace container and cache after changing the workspace image or mount contract:
 
 ```bash
-docker rm -f ya-claw-workspace-<fingerprint>
-rm -f /var/lib/ya-claw/data/docker-workspace-containers/workspace.json
+docker rm -f ya-claw-session-<session-short>-g<generation>
+rm -f /var/lib/ya-claw/data/docker-workspace-containers/sessions/<session-id>/workspace.json
 ```
 
 ## API Smoke Test
@@ -112,7 +129,29 @@ docker compose up -d
 curl http://127.0.0.1:9042/healthz
 ```
 
-Local image baseline:
+systemd + uv-managed tool baseline:
+
+```bash
+sudo env \
+  UV_TOOL_DIR=/opt/ya-claw/tools \
+  UV_TOOL_BIN_DIR=/opt/ya-claw/bin \
+  uv tool upgrade ya-claw
+sudo systemctl restart ya-claw
+curl http://127.0.0.1:9042/healthz
+```
+
+Pin a specific version:
+
+```bash
+YA_CLAW_VERSION=replace-with-release-version
+sudo env \
+  UV_TOOL_DIR=/opt/ya-claw/tools \
+  UV_TOOL_BIN_DIR=/opt/ya-claw/bin \
+  uv tool install "ya-claw==${YA_CLAW_VERSION}" --python 3.13 --force
+sudo systemctl restart ya-claw
+```
+
+Local source image baseline:
 
 ```bash
 git pull
@@ -158,7 +197,7 @@ YA_CLAW_SESSION_PRUNE_HEARTBEAT_KEEP_RECENT=10
 YA_CLAW_SESSION_PRUNE_HEARTBEAT_OLDER_THAN_DAYS=7
 ```
 
-This mode deletes `sessions` and `runs` rows for old heartbeat sessions and schedule isolate/fork generated sessions. It protects active schedule source/target sessions, parent sessions, active sessions, active run sessions, and sessions referenced by external `restore_from_run_id` links.
+This mode deletes `sessions` and `runs` rows for old heartbeat sessions and schedule isolate/fork generated sessions. Before deleting a Docker-backed session, pruning places a persistent claim on the session, removes all recorded session- and run-scoped sandbox containers and caches, and only then deletes database rows. A failed sandbox cleanup keeps the claim as a durable retry queue entry; later prune passes scan claims directly and do not depend on retained fire records. New runs, forks, schedule references, child sessions, and restore references reject or wait for a claimed session. If generated-session pruning is disabled before a service restart, startup releases leftover claims instead of leaving sessions unavailable. The filter also protects active schedule source/target sessions, parent sessions, active sessions, active run sessions, and sessions referenced by external `restore_from_run_id` links.
 
 Fire-record database retention is separately enabled:
 
@@ -230,5 +269,9 @@ YA_CLAW_AUTO_SEED_PROFILES=true
 ```
 
 ```bash
-uv run --package ya-claw ya-claw profiles seed --seed-file /etc/ya-claw/profiles.yaml
+ya-claw profiles seed --seed-file /etc/ya-claw/profiles.yaml
 ```
+
+### Agency Signal Dispatch Errors
+
+Read [`agency.md`](agency.md) for agency-specific checks, including dispatcher logs, profile availability, pending signal state, and workspace permissions.

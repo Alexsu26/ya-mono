@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelHTTPError, UserError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -39,6 +40,32 @@ def _make_runtime(tmp_path: Path, model: FunctionModel):
     return create_agent(model=model, env=env)
 
 
+async def test_stream_agent_eager_startup_failure_preserves_original_exception(tmp_path: Path) -> None:
+    """Eager producer startup must not access the streamer before it is constructed."""
+    env = LocalEnvironment(
+        allowed_paths=[tmp_path],
+        default_path=tmp_path,
+        tmp_base_dir=tmp_path,
+    )
+    runtime = create_agent(
+        model=None,
+        env=env,
+        model_cfg=ModelConfig(stream_resume_on_error=True, stream_resume_max_attempts=2),
+    )
+
+    async with runtime:
+        loop = asyncio.get_running_loop()
+        previous_task_factory = loop.get_task_factory()
+        loop.set_task_factory(asyncio.eager_task_factory)
+        try:
+            with pytest.raises(UserError, match=r"model.*must either be set"):
+                async with stream_agent(runtime, "hello") as streamer:
+                    async for _event in streamer:
+                        pass
+        finally:
+            loop.set_task_factory(previous_task_factory)
+
+
 async def test_stream_agent_resumes_after_stream_error(tmp_path: Path) -> None:
     calls: list[list[ModelMessage]] = []
 
@@ -66,14 +93,22 @@ async def test_stream_agent_resumes_after_stream_error(tmp_path: Path) -> None:
 
     assert len(calls) == 2
     resume_messages = calls[1]
-    assert len(resume_messages) == 1
-    resume_request = resume_messages[0]
+    assert len(resume_messages) == 3
+
+    original_request = resume_messages[0]
+    assert isinstance(original_request, ModelRequest)
+    assert any(isinstance(part, UserPromptPart) and part.content == "start task" for part in original_request.parts)
+
+    partial_response = resume_messages[1]
+    assert isinstance(partial_response, ModelResponse)
+    assert partial_response.state == "interrupted"
+    assert [part.content for part in partial_response.parts] == ["partial answer"]
+
+    resume_request = resume_messages[2]
     assert isinstance(resume_request, ModelRequest)
-    assert any(isinstance(part, UserPromptPart) and part.content == "start task" for part in resume_request.parts)
     assert any(
         isinstance(part, UserPromptPart) and part.content == "continue from checkpoint" for part in resume_request.parts
     )
-    assert not any(isinstance(message, ModelResponse) for message in resume_messages)
     assert streamer.run is not None
     assert streamer.run.result is not None
     assert streamer.run.result.output == " resumed answer"

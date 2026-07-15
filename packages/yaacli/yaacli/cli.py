@@ -23,8 +23,6 @@ from dotenv import load_dotenv
 
 from yaacli import __version__  # pyright: ignore[reportAttributeAccessIssue]
 from yaacli.config import ConfigManager, WorktreeMetadata, YaacliConfig
-from yaacli.headless import HeadlessExecutionError
-from yaacli.headless import run_headless as _run_headless
 from yaacli.logging import LOG_FILE_NAME, configure_logging, get_logger
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -41,11 +39,14 @@ PROVIDER_ENV_VARS = {
     "openai": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
     "openai-chat": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
     "openai-responses": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    "openai-responses-rs": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    "openai-responses-ws": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    "google": ("GOOGLE_API_KEY", None),
+    "google-cloud": ("GOOGLE_API_KEY", None),
     "google-gla": ("GOOGLE_API_KEY", None),
     "google-vertex": ("GOOGLE_API_KEY", None),
     "gemini": ("GOOGLE_API_KEY", None),
-    "groq": ("GROQ_API_KEY", "GROQ_BASE_URL"),
-    "deepseek": ("DEEPSEEK_API_KEY", None),
+    "xai": ("XAI_API_KEY", None),
     "bedrock": (None, None),  # Uses AWS credentials
 }
 
@@ -55,11 +56,14 @@ PROVIDER_MODEL_SETTINGS = {
     "openai": "openai_default",
     "openai-chat": "openai_default",
     "openai-responses": "openai_responses_default",
+    "openai-responses-rs": "openai_responses_default",
+    "openai-responses-ws": "openai_responses_default",
+    "google": "gemini_thinking_budget_default",
+    "google-cloud": "gemini_thinking_budget_default",
     "google-gla": "gemini_thinking_budget_default",
     "google-vertex": "gemini_thinking_budget_default",
     "gemini": "gemini_thinking_budget_default",
-    "groq": None,  # No preset
-    "deepseek": "deepseek",
+    "xai": "grok_4_5_default",
     "bedrock": None,
 }
 
@@ -72,11 +76,14 @@ PROVIDER_MODEL_CFG = {
     "openai": "gpt5_270k",
     "openai-chat": "gpt5_270k",
     "openai-responses": "gpt5_270k",
+    "openai-responses-rs": "gpt5_270k",
+    "openai-responses-ws": "gpt5_270k",
+    "google": "gemini_1m",
+    "google-cloud": "gemini_1m",
     "google-gla": "gemini_1m",
     "google-vertex": "gemini_1m",
     "gemini": "gemini_1m",
-    "groq": None,  # Unknown - no capabilities
-    "deepseek": "deepseek",
+    "xai": "grok_4_5_500k",
     "bedrock": None,
 }
 
@@ -201,8 +208,8 @@ def run_setup_wizard(config_manager: ConfigManager) -> bool:
     click.echo("  Examples:")
     click.echo("    - anthropic:claude-sonnet-4-20250514")
     click.echo("    - openai-chat:gpt-4o")
-    click.echo("    - google-gla:gemini-2.5-pro")
-    click.echo("    - deepseek:deepseek-v4-flash")
+    click.echo("    - google:gemini-2.5-pro")
+    click.echo("    - xai:grok-4.5")
     click.echo("    - mygateway@anthropic:claude-sonnet-4")
     click.echo()
 
@@ -380,7 +387,7 @@ def load_env_from_config(config: YaacliConfig) -> None:
     """Load environment variables from config [env] section."""
     if config.env:
         for key, value in config.env.items():
-            if value and key not in os.environ:
+            if value:
                 os.environ[key] = value
 
 
@@ -560,15 +567,31 @@ def _create_worktree(branch_name: str | None) -> tuple[Path, str, bool]:
 # =============================================================================
 
 
-@click.command()
+def _prepare_cli_runtime(verbose: bool) -> tuple[ConfigManager, YaacliConfig]:
+    configure_logging(verbose=verbose)
+    logger.info("Starting yaacli v%s", __version__)
+    load_package_env_files()
+    config_manager = ConfigManager()
+    config = config_manager.load()
+    ensure_builtin_assets(config_manager)
+    if not config.is_configured:
+        if not run_setup_wizard(config_manager):
+            raise click.exceptions.Exit(0)
+        config = config_manager.reload()
+    load_env_from_config(config)
+    return config_manager, config
+
+
+def _prepare_session_cli_runtime(verbose: bool) -> ConfigManager:
+    configure_logging(verbose=verbose)
+    logger.info("Starting yaacli sessions command v%s", __version__)
+    config_manager = ConfigManager()
+    config_manager.ensure_config_dir()
+    return config_manager
+
+
+@click.group(invoke_without_command=True)
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
-@click.option(
-    "-P",
-    "--print",
-    "print_mode",
-    is_flag=True,
-    help="Run a prompt headlessly and print the final response.",
-)
 @click.option("-w", "--worktree", is_flag=True, default=False, help="Run in a git worktree.")
 @click.option(
     "-b",
@@ -578,16 +601,42 @@ def _create_worktree(branch_name: str | None) -> tuple[Path, str, bool]:
     metavar="BRANCH",
     help="Branch name for worktree (implies --worktree).",
 )
-@click.argument("prompt_parts", nargs=-1)
+@click.option("-p", "--prompt", default=None, metavar="PROMPT", help="Run one prompt in headless mode.")
+@click.option(
+    "--worker",
+    is_flag=True,
+    default=False,
+    help="Run headless as a worker without synchronous delegate subagents.",
+)
+@click.option("-s", "--session", "session_id", default=None, metavar="SESSION_ID", help="Restore a saved session.")
+@click.option(
+    "--profile",
+    "model_profile_id",
+    default=None,
+    metavar="PROFILE_ID",
+    help="Model profile ID to use for this run.",
+)
+@click.option(
+    "--model-profile",
+    "model_profile_id_alias",
+    default=None,
+    metavar="PROFILE_ID",
+    help="Alias for --profile.",
+)
 @click.version_option(version=__version__, prog_name="yaacli")
+@click.pass_context
 def cli(
+    ctx: click.Context,
     verbose: bool,
-    print_mode: bool,
     worktree: bool,
     worktree_branch: str | None,
-    prompt_parts: tuple[str, ...],
+    prompt: str | None,
+    worker: bool,
+    session_id: str | None,
+    model_profile_id: str | None,
+    model_profile_id_alias: str | None,
 ) -> None:
-    """YAACLI - AI-powered coding assistant.
+    """YAACLI CLI - AI-powered coding assistant.
 
     Inside TUI, use slash commands:
       /help     - Show available commands
@@ -600,37 +649,23 @@ def cli(
       /load     - Load session from folder
       /clear    - Clear conversation
       /exit     - Exit application
+
+    Headless mode:
+      yaacli -p "Fix the failing tests"
+      yaacli -p "Continue" --session <session-id> --profile <profile-id>
+
+    Session commands:
+      yaacli sessions list
+      yaacli sessions show <session-id>
     """
-    configure_logging(verbose=verbose)
-    logger.info("Starting yaacli v%s", __version__)
+    if ctx.invoked_subcommand is not None:
+        return
 
-    if prompt_parts and not print_mode:
-        raise click.UsageError("Prompt arguments require -P/--print.")
+    effective_model_profile_id = model_profile_id_alias or model_profile_id
+    if worker and prompt is None:
+        raise click.UsageError("--worker requires --prompt/-p headless mode.")
 
-    load_package_env_files()
-
-    # Load configuration
-    config_manager = ConfigManager()
-    config = config_manager.load()
-
-    # Ensure builtin assets exist (subagents, skills)
-    # This runs on every startup to pick up new assets from package updates
-    ensure_builtin_assets(config_manager)
-
-    # Check if configuration exists
-    if not config.is_configured:
-        if print_mode:
-            raise click.ClickException(
-                f"yaacli is not configured. Run `yaacli` once to set up, "
-                f"or create {config_manager.config_dir / 'config.toml'}."
-            )
-        if not run_setup_wizard(config_manager):
-            sys.exit(0)
-        # Reload config after setup
-        config = config_manager.reload()
-
-    # Load env vars from config
-    load_env_from_config(config)
+    config_manager, config = _prepare_cli_runtime(verbose)
 
     # Set up worktree if requested
     worktree_dir: Path | None = None
@@ -638,36 +673,41 @@ def cli(
     if worktree or worktree_branch is not None:
         worktree_dir, actual_branch, is_resume = _create_worktree(worktree_branch)
         if is_resume:
-            click.echo(click.style("Resuming worktree:", fg="cyan", bold=True), err=print_mode)
+            click.echo(click.style("Resuming worktree:", fg="cyan", bold=True))
         else:
-            click.echo(click.style("Worktree created:", fg="cyan", bold=True), err=print_mode)
-        click.echo(f"  Branch:    {actual_branch}", err=print_mode)
-        click.echo(f"  Directory: {worktree_dir}", err=print_mode)
-        click.echo(err=print_mode)
+            click.echo(click.style("Worktree created:", fg="cyan", bold=True))
+        click.echo(f"  Branch:    {actual_branch}")
+        click.echo(f"  Directory: {worktree_dir}")
+        click.echo()
 
     working_dir = worktree_dir or Path.cwd()
 
-    if print_mode:
-        prompt = _read_headless_prompt(prompt_parts)
-        try:
-            output = asyncio.run(_run_headless(config, config_manager, prompt=prompt, working_dir=working_dir))
-        except KeyboardInterrupt:
-            click.echo("\nInterrupted.", err=True)
-            sys.exit(130)
-        except HeadlessExecutionError as e:
-            raise click.ClickException(str(e)) from e
-        except Exception as e:
-            logger.exception("Fatal headless error")
-            raise click.ClickException(str(e) or repr(e)) from e
-
-        click.echo(output)
-        sys.exit(0)
-
-    # Run the TUI
+    # Run the selected frontend
     exit_code = 0
-    session_id: str | None = None
+    completed_session_id: str | None = None
     try:
-        session_id = asyncio.run(_run_tui(config, config_manager, verbose, working_dir=working_dir))
+        if prompt is not None:
+            completed_session_id = asyncio.run(
+                _run_headless_prompt(
+                    config,
+                    config_manager,
+                    prompt,
+                    working_dir=working_dir,
+                    session_id=session_id,
+                    model_profile_id=effective_model_profile_id,
+                    worker=worker,
+                )
+            )
+        else:
+            completed_session_id = asyncio.run(
+                _run_tui(
+                    config,
+                    config_manager,
+                    verbose,
+                    working_dir=working_dir,
+                    model_profile_id=effective_model_profile_id,
+                )
+            )
     except KeyboardInterrupt:
         click.echo("\nGoodbye!")
         exit_code = 130
@@ -699,14 +739,17 @@ def cli(
         exit_code = 1
 
     # Show resume hints on exit
-    if session_id or worktree_dir is not None:
+    if completed_session_id or worktree_dir is not None:
         click.echo()
 
-    if session_id:
-        click.echo(click.style(f"Session: {session_id}", fg="cyan", bold=True))
-        click.echo()
-        click.echo("To resume this session:")
-        click.echo(f"  /session {session_id}")
+    if completed_session_id:
+        click.echo(click.style(f"Session: {completed_session_id}", fg="cyan", bold=True), err=prompt is not None)
+        click.echo(err=prompt is not None)
+        click.echo("To resume this session:", err=prompt is not None)
+        if prompt is not None:
+            click.echo(f"  yaacli -p '<prompt>' -s {completed_session_id}", err=True)
+        else:
+            click.echo(f"  /session {completed_session_id}")
 
     if worktree_dir is not None:
         click.echo()
@@ -722,19 +765,29 @@ def cli(
     sys.exit(exit_code)
 
 
-def _read_headless_prompt(prompt_parts: tuple[str, ...]) -> str:
-    """Resolve the prompt for headless mode from argv or stdin."""
-    if prompt_parts:
-        prompt = " ".join(prompt_parts).strip()
-    elif not sys.stdin.isatty():
-        prompt = sys.stdin.read().strip()
-    else:
-        prompt = ""
+async def _run_headless_prompt(
+    config: YaacliConfig,
+    config_manager: ConfigManager,
+    prompt: str,
+    *,
+    working_dir: Path | None = None,
+    session_id: str | None = None,
+    model_profile_id: str | None = None,
+    worker: bool = False,
+) -> str | None:
+    """Run one prompt in headless mode and stream display events as NDJSON."""
+    from yaacli.headless import run_headless_prompt
 
-    if not prompt:
-        raise click.UsageError("Headless mode requires a prompt argument or stdin input.")
-
-    return prompt
+    result = await run_headless_prompt(
+        config=config,
+        config_manager=config_manager,
+        prompt=prompt,
+        working_dir=working_dir or Path.cwd(),
+        session_id=session_id,
+        model_profile_id=model_profile_id,
+        worker=worker,
+    )
+    return result.session_id
 
 
 async def _run_tui(
@@ -743,18 +796,18 @@ async def _run_tui(
     verbose: bool,
     *,
     working_dir: Path | None = None,
+    model_profile_id: str | None = None,
 ) -> str | None:
-    """Run the TUI application.
+    """Run the selected TUI frontend.
 
-    Honors the ``YAACLI_TUI`` env var:
-      - unset / ``v2`` / ``textual`` → Textual-based V2 TUI
-      - ``console`` / ``stream`` / ``streaming`` → modal-prompt v2 fallback
-      - ``v1`` / ``legacy`` / ``prompt_toolkit`` → v1 prompt_toolkit full-screen TUI
+    ``YAACLI_TUI`` defaults to the fork's Textual console. ``console`` keeps
+    the streaming fallback and ``legacy`` selects the upstream prompt-toolkit
+    frontend.
 
     Returns:
         Session ID if the session has saved data, None otherwise.
     """
-    tui_flavor = (os.environ.get("YAACLI_TUI") or "v2").strip().lower()
+    tui_flavor = (os.environ.get("YAACLI_TUI") or "textual").strip().lower()
     if tui_flavor in {"", "v2", "textual"}:
         from yaacli.console.textual_app import run_textual_tui
 
@@ -763,6 +816,7 @@ async def _run_tui(
             config_manager,
             verbose=verbose,
             working_dir=working_dir,
+            model_profile_id=model_profile_id,
         )
     if tui_flavor in {"console", "stream", "streaming"}:
         from yaacli.console_app import run_console_tui
@@ -774,9 +828,16 @@ async def _run_tui(
             working_dir=working_dir,
         )
     if tui_flavor not in {"v1", "legacy", "prompt_toolkit", "prompt-toolkit"}:
-        logger.warning("Unknown YAACLI_TUI=%r; falling back to legacy v1 TUI", tui_flavor)
+        logger.warning("Unknown YAACLI_TUI=%r; falling back to legacy TUI", tui_flavor)
 
     from yaacli.app import TUIApp
+    from yaacli.model_profiles import get_model_profile
+
+    model_profile = None
+    if model_profile_id:
+        model_profile = get_model_profile(config, model_profile_id)
+        if model_profile is None:
+            raise click.ClickException(f"Unknown model profile: {model_profile_id}")
 
     async with TUIApp(
         config=config,
@@ -784,8 +845,104 @@ async def _run_tui(
         verbose=verbose,
         working_dir=working_dir or Path.cwd(),
     ) as app:
+        if model_profile is not None:
+            await app._switch_model_profile(model_profile)
         await app.run()
         return app.session_id if app.has_session_data else None
+
+
+@cli.group()
+def sessions() -> None:
+    """Manage saved YAACLI sessions."""
+
+
+def _session_info_payload(entry: object) -> dict[str, object]:
+    payload = {
+        name: getattr(entry, name)
+        for name in (
+            "id",
+            "path",
+            "updated_at",
+            "created_at",
+            "working_dir",
+            "output_text",
+            "message_count",
+            "display_event_count",
+            "metadata",
+        )
+    }
+    payload["path"] = str(payload["path"])
+    return payload
+
+
+@sessions.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+@click.option("--limit", default=20, show_default=True, type=int, help="Maximum sessions to display.")
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+def sessions_list(as_json: bool, limit: int, verbose: bool) -> None:
+    """List saved sessions."""
+    from yaacli.sessions import list_sessions
+
+    config_manager = _prepare_session_cli_runtime(verbose)
+    entries = list_sessions(config_manager)[: max(limit, 0)]
+    if as_json:
+        click.echo(json.dumps([_session_info_payload(entry) for entry in entries], ensure_ascii=False, indent=2))
+        return
+
+    if not entries:
+        click.echo("No sessions found.")
+        return
+
+    click.echo("Session ID     Updated              Messages  Events  Working Dir")
+    for entry in entries:
+        updated = entry.updated_at[:19].replace("T", " ")
+        message_count = "-" if entry.message_count is None else str(entry.message_count)
+        event_count = "-" if entry.display_event_count is None else str(entry.display_event_count)
+        click.echo(f"{entry.id:<14} {updated:<20} {message_count:<8} {event_count:<6} {entry.working_dir or '-'}")
+
+
+@sessions.command("show")
+@click.argument("session_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON details.")
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+def sessions_show(session_id: str, as_json: bool, verbose: bool) -> None:
+    """Show a saved session."""
+    from yaacli.sessions import get_session_info
+
+    config_manager = _prepare_session_cli_runtime(verbose)
+    entry = get_session_info(config_manager, session_id)
+    payload = _session_info_payload(entry)
+    if as_json:
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    click.echo(f"Session: {entry.id}")
+    click.echo(f"Path: {entry.path}")
+    click.echo(f"Created: {entry.created_at or '-'}")
+    click.echo(f"Updated: {entry.updated_at}")
+    click.echo(f"Working dir: {entry.working_dir or '-'}")
+    click.echo(f"Messages: {entry.message_count if entry.message_count is not None else '-'}")
+    click.echo(f"Display events: {entry.display_event_count if entry.display_event_count is not None else '-'}")
+    if entry.output_text:
+        click.echo("Output:")
+        click.echo(entry.output_text)
+
+
+@sessions.command("delete")
+@click.argument("session_id")
+@click.option("--yes", is_flag=True, help="Skip confirmation.")
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+def sessions_delete(session_id: str, yes: bool, verbose: bool) -> None:
+    """Delete a saved session."""
+    from yaacli.sessions import delete_session, get_session_info
+
+    config_manager = _prepare_session_cli_runtime(verbose)
+    entry = get_session_info(config_manager, session_id)
+    if not yes and not click.confirm(f"Delete session {entry.id}?"):
+        click.echo("Cancelled.")
+        return
+    deleted = delete_session(config_manager, entry.id)
+    click.echo(f"Deleted session: {deleted.id}")
 
 
 def main() -> None:

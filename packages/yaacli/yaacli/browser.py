@@ -20,14 +20,13 @@ Example:
 
 from __future__ import annotations
 
+from importlib import import_module
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from yaacli.logging import get_logger
 
 if TYPE_CHECKING:
-    from ya_agent_sdk.toolsets.browser_use import BrowserUseToolset
-
     from yaacli.config import BrowserConfig
 
 logger = get_logger(__name__)
@@ -54,9 +53,9 @@ class BrowserManager:
             config: Browser configuration.
         """
         self._config = config
-        self._sandbox: object | None = None  # DockerBrowserSandbox if started
+        self._sandbox: Any | None = None
         self._cdp_url: str | None = None
-        self._toolset: BrowserUseToolset | None = None
+        self._toolset: Any | None = None
 
     @property
     def cdp_url(self) -> str | None:
@@ -106,14 +105,15 @@ class BrowserManager:
             CDP URL if successful, None on failure.
         """
         try:
-            from ya_agent_sdk.sandbox.browser.docker_ import DockerBrowserSandbox
-        except ImportError:
+            browser_module = import_module("ya_agent_sdk.sandbox.browser.docker_")
+            docker_browser_sandbox = browser_module.DockerBrowserSandbox
+        except (AttributeError, ImportError):
             logger.warning("Docker browser sandbox not available. Install with: pip install ya-agent-sdk[docker]")
             return None
 
         try:
             logger.info("Starting Docker browser sandbox...")
-            sandbox = DockerBrowserSandbox(
+            sandbox = docker_browser_sandbox(
                 image=self._config.browser_image,
             )
             cdp_url = await sandbox.start_browser()
@@ -129,7 +129,7 @@ class BrowserManager:
             )
             return None
 
-    def get_browser_toolset(self) -> BrowserUseToolset | None:
+    def get_browser_toolset(self) -> Any | None:
         """Get BrowserUseToolset if browser is available.
 
         Returns:
@@ -140,11 +140,11 @@ class BrowserManager:
 
         if self._toolset is None:
             try:
-                from ya_agent_sdk.toolsets.browser_use import BrowserUseToolset
-
-                self._toolset = BrowserUseToolset(cdp_url=self._cdp_url)
+                toolset_module = import_module("ya_agent_sdk.toolsets.browser_use")
+                browser_use_toolset = toolset_module.BrowserUseToolset
+                self._toolset = browser_use_toolset(cdp_url=self._cdp_url)
                 logger.debug("Created BrowserUseToolset")
-            except ImportError:
+            except (AttributeError, ImportError):
                 logger.warning("BrowserUseToolset not available")
                 return None
 

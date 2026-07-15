@@ -70,12 +70,17 @@ from ya_agent_sdk.presets import (
     DEEPSEEK_V4_HIGH,
     DEEPSEEK_V4_MAX,
     DEEPSEEK_V4_OFF,
+    GROK_4_5_DEFAULT,
+    GROK_4_5_HIGH,
+    GROK_4_5_LOW,
+    GROK_4_5_MEDIUM,
     INHERIT,
     MIMO_V2_5_DEFAULT,
     MIMO_V2_5_PRO_DEFAULT,
     OPENAI_DEFAULT,
     OPENAI_HIGH,
     OPENAI_LOW,
+    OPENAI_MAX,
     OPENAI_MEDIUM,
     OPENAI_RESPONSES_DEFAULT,
     OPENAI_RESPONSES_DEFAULT_FAST,
@@ -83,8 +88,16 @@ from ya_agent_sdk.presets import (
     OPENAI_RESPONSES_HIGH_FAST,
     OPENAI_RESPONSES_LOW,
     OPENAI_RESPONSES_LOW_FAST,
+    OPENAI_RESPONSES_MAX,
+    OPENAI_RESPONSES_MAX_FAST,
     OPENAI_RESPONSES_MEDIUM,
     OPENAI_RESPONSES_MEDIUM_FAST,
+    OPENAI_RESPONSES_PRO,
+    OPENAI_RESPONSES_PRO_HIGH,
+    OPENAI_RESPONSES_PRO_LOW,
+    OPENAI_RESPONSES_PRO_MAX,
+    OPENAI_RESPONSES_PRO_MEDIUM,
+    OPENAI_RESPONSES_PRO_XHIGH,
     OPENAI_RESPONSES_XHIGH,
     OPENAI_RESPONSES_XHIGH_FAST,
     OPENAI_XHIGH,
@@ -377,33 +390,45 @@ def test_anthropic_adaptive_max_tokens_ordering() -> None:
 
 def test_openai_chat_presets_structure() -> None:
     """Test that OpenAI Chat presets have expected structure."""
-    for preset in [OPENAI_DEFAULT, OPENAI_XHIGH, OPENAI_HIGH, OPENAI_MEDIUM, OPENAI_LOW]:
+    for preset in [OPENAI_DEFAULT, OPENAI_MAX, OPENAI_XHIGH, OPENAI_HIGH, OPENAI_MEDIUM, OPENAI_LOW]:
         assert "openai_reasoning_effort" in preset
         assert "max_tokens" in preset
 
+    assert OPENAI_MAX["openai_reasoning_effort"] == "max"
     assert OPENAI_XHIGH["openai_reasoning_effort"] == "xhigh"
+    assert OPENAI_MAX["max_tokens"] == OPENAI_XHIGH["max_tokens"]
     assert OPENAI_XHIGH["max_tokens"] > OPENAI_HIGH["max_tokens"]
 
 
 def test_openai_responses_presets_structure() -> None:
     """Test that OpenAI Responses presets have expected structure."""
-    for preset in [
+    responses_presets = [
         OPENAI_RESPONSES_DEFAULT,
+        OPENAI_RESPONSES_MAX,
         OPENAI_RESPONSES_XHIGH,
         OPENAI_RESPONSES_HIGH,
         OPENAI_RESPONSES_MEDIUM,
         OPENAI_RESPONSES_LOW,
+        OPENAI_RESPONSES_PRO,
+        OPENAI_RESPONSES_PRO_MAX,
+        OPENAI_RESPONSES_PRO_XHIGH,
+        OPENAI_RESPONSES_PRO_HIGH,
+        OPENAI_RESPONSES_PRO_MEDIUM,
+        OPENAI_RESPONSES_PRO_LOW,
         OPENAI_RESPONSES_DEFAULT_FAST,
+        OPENAI_RESPONSES_MAX_FAST,
         OPENAI_RESPONSES_XHIGH_FAST,
         OPENAI_RESPONSES_HIGH_FAST,
         OPENAI_RESPONSES_MEDIUM_FAST,
         OPENAI_RESPONSES_LOW_FAST,
-    ]:
+    ]
+    for preset in responses_presets:
         assert "openai_reasoning_effort" in preset
         assert "openai_reasoning_summary" in preset
 
     for preset in [
         OPENAI_RESPONSES_DEFAULT_FAST,
+        OPENAI_RESPONSES_MAX_FAST,
         OPENAI_RESPONSES_XHIGH_FAST,
         OPENAI_RESPONSES_HIGH_FAST,
         OPENAI_RESPONSES_MEDIUM_FAST,
@@ -411,11 +436,32 @@ def test_openai_responses_presets_structure() -> None:
     ]:
         assert preset["openai_service_tier"] == "priority"
 
+    pro_presets = [
+        OPENAI_RESPONSES_PRO,
+        OPENAI_RESPONSES_PRO_MAX,
+        OPENAI_RESPONSES_PRO_XHIGH,
+        OPENAI_RESPONSES_PRO_HIGH,
+        OPENAI_RESPONSES_PRO_MEDIUM,
+        OPENAI_RESPONSES_PRO_LOW,
+    ]
+    for preset in pro_presets:
+        assert preset["openai_reasoning_mode"] == "pro"
+        assert "extra_body" not in preset
+
+    assert OPENAI_RESPONSES_PRO == OPENAI_RESPONSES_PRO_MEDIUM
+    assert OPENAI_RESPONSES_PRO_MAX["openai_reasoning_effort"] == "max"
+    assert OPENAI_RESPONSES_PRO_XHIGH["openai_reasoning_effort"] == "xhigh"
+    assert OPENAI_RESPONSES_PRO_HIGH["openai_reasoning_effort"] == "high"
+    assert OPENAI_RESPONSES_PRO_MEDIUM["openai_reasoning_effort"] == "medium"
+    assert OPENAI_RESPONSES_PRO_LOW["openai_reasoning_effort"] == "low"
+    assert OPENAI_RESPONSES_MAX["openai_reasoning_effort"] == "max"
+    assert OPENAI_RESPONSES_MAX_FAST["openai_reasoning_effort"] == "max"
     assert OPENAI_RESPONSES_XHIGH["openai_reasoning_effort"] == "xhigh"
     assert OPENAI_RESPONSES_XHIGH_FAST["openai_reasoning_effort"] == "xhigh"
     assert OPENAI_RESPONSES_HIGH_FAST["openai_reasoning_effort"] == "high"
     assert OPENAI_RESPONSES_MEDIUM_FAST["openai_reasoning_effort"] == "medium"
     assert OPENAI_RESPONSES_LOW_FAST["openai_reasoning_effort"] == "low"
+    assert OPENAI_RESPONSES_MAX["max_tokens"] == OPENAI_RESPONSES_XHIGH["max_tokens"]
     assert OPENAI_RESPONSES_XHIGH["max_tokens"] > OPENAI_RESPONSES_HIGH["max_tokens"]
 
 
@@ -459,11 +505,26 @@ def test_get_model_settings_by_enum() -> None:
     settings_1m_interleaved = get_model_settings(ModelSettingsPreset.ANTHROPIC_1M_HIGH_INTERLEAVED_THINKING)
     assert settings_1m_interleaved == ANTHROPIC_1M_HIGH_INTERLEAVED_THINKING
 
+    settings_openai_max = get_model_settings(ModelSettingsPreset.OPENAI_MAX)
+    assert settings_openai_max == OPENAI_MAX
+
     settings_openai_xhigh = get_model_settings(ModelSettingsPreset.OPENAI_XHIGH)
     assert settings_openai_xhigh == OPENAI_XHIGH
 
+    settings_openai_responses_max = get_model_settings(ModelSettingsPreset.OPENAI_RESPONSES_MAX)
+    assert settings_openai_responses_max == OPENAI_RESPONSES_MAX
+
     settings_openai_responses_xhigh = get_model_settings(ModelSettingsPreset.OPENAI_RESPONSES_XHIGH)
     assert settings_openai_responses_xhigh == OPENAI_RESPONSES_XHIGH
+
+    settings_openai_responses_max_fast = get_model_settings(ModelSettingsPreset.OPENAI_RESPONSES_MAX_FAST)
+    assert settings_openai_responses_max_fast == OPENAI_RESPONSES_MAX_FAST
+
+    settings_openai_responses_pro = get_model_settings(ModelSettingsPreset.OPENAI_RESPONSES_PRO)
+    assert settings_openai_responses_pro == OPENAI_RESPONSES_PRO
+
+    settings_openai_responses_pro_high = get_model_settings(ModelSettingsPreset.OPENAI_RESPONSES_PRO_HIGH)
+    assert settings_openai_responses_pro_high == OPENAI_RESPONSES_PRO_HIGH
 
     settings_openai_responses_high_fast = get_model_settings(ModelSettingsPreset.OPENAI_RESPONSES_HIGH_FAST)
     assert settings_openai_responses_high_fast == OPENAI_RESPONSES_HIGH_FAST
@@ -487,11 +548,26 @@ def test_get_model_settings_by_string() -> None:
     settings_1m = get_model_settings("anthropic_1m_high")
     assert settings_1m == ANTHROPIC_1M_HIGH
 
+    settings_openai_max = get_model_settings("openai_max")
+    assert settings_openai_max == OPENAI_MAX
+
     settings_openai_xhigh = get_model_settings("openai_xhigh")
     assert settings_openai_xhigh == OPENAI_XHIGH
 
+    settings_openai_responses_max = get_model_settings("openai_responses_max")
+    assert settings_openai_responses_max == OPENAI_RESPONSES_MAX
+
     settings_openai_responses_xhigh = get_model_settings("openai_responses_xhigh")
     assert settings_openai_responses_xhigh == OPENAI_RESPONSES_XHIGH
+
+    settings_openai_responses_max_fast = get_model_settings("openai_responses_max_fast")
+    assert settings_openai_responses_max_fast == OPENAI_RESPONSES_MAX_FAST
+
+    settings_openai_responses_pro = get_model_settings("openai_responses_pro")
+    assert settings_openai_responses_pro == OPENAI_RESPONSES_PRO
+
+    settings_openai_responses_pro_high = get_model_settings("openai_responses_pro_high")
+    assert settings_openai_responses_pro_high == OPENAI_RESPONSES_PRO_HIGH
 
     settings_openai_responses_high_fast = get_model_settings("openai_responses_high_fast")
     assert settings_openai_responses_high_fast == OPENAI_RESPONSES_HIGH_FAST
@@ -501,6 +577,21 @@ def test_get_model_settings_by_string() -> None:
 
     settings_mimo = get_model_settings("mimo_v2_5_pro")
     assert settings_mimo == MIMO_V2_5_PRO_DEFAULT
+
+    settings_grok = get_model_settings("grok_4_5_high")
+    assert settings_grok == GROK_4_5_HIGH
+
+
+def test_grok_4_5_presets_structure() -> None:
+    """Test Grok 4.5 reasoning effort presets."""
+    assert GROK_4_5_DEFAULT == GROK_4_5_HIGH
+    assert GROK_4_5_DEFAULT["xai_reasoning_effort"] == "high"
+    assert GROK_4_5_DEFAULT["xai_include_encrypted_content"] is True
+    assert GROK_4_5_DEFAULT["max_tokens"] == 32 * 1024
+    assert GROK_4_5_MEDIUM["xai_reasoning_effort"] == "medium"
+    assert GROK_4_5_MEDIUM["max_tokens"] == 16 * 1024
+    assert GROK_4_5_LOW["xai_reasoning_effort"] == "low"
+    assert GROK_4_5_LOW["max_tokens"] == 8 * 1024
 
 
 def test_get_model_settings_by_alias() -> None:
@@ -545,6 +636,30 @@ def test_get_model_settings_by_alias() -> None:
     settings = get_model_settings("openai")
     assert settings == OPENAI_DEFAULT
 
+    settings = get_model_settings("openai_responses_standard")
+    assert settings == OPENAI_RESPONSES_DEFAULT
+
+    settings = get_model_settings("openai_responses_gpt5_6_pro")
+    assert settings == OPENAI_RESPONSES_PRO
+
+    settings = get_model_settings("openai_responses_gpt56_pro")
+    assert settings == OPENAI_RESPONSES_PRO
+
+    settings = get_model_settings("openai_responses_gpt5_6_sol")
+    assert settings == OPENAI_RESPONSES_MAX
+
+    settings = get_model_settings("openai_responses_gpt56_sol")
+    assert settings == OPENAI_RESPONSES_MAX
+
+    settings = get_model_settings("openai_responses_sol")
+    assert settings == OPENAI_RESPONSES_MAX
+
+    settings = get_model_settings("openai_responses_terra")
+    assert settings == OPENAI_RESPONSES_MEDIUM
+
+    settings = get_model_settings("openai_responses_luna")
+    assert settings == OPENAI_RESPONSES_LOW
+
     settings = get_model_settings("deepseek")
     assert settings == DEEPSEEK_V4_DEFAULT
 
@@ -559,6 +674,18 @@ def test_get_model_settings_by_alias() -> None:
 
     settings = get_model_settings("mimo_v2.5_pro")
     assert settings == MIMO_V2_5_PRO_DEFAULT
+
+    settings = get_model_settings("xai")
+    assert settings == GROK_4_5_DEFAULT
+
+    settings = get_model_settings("grok")
+    assert settings == GROK_4_5_DEFAULT
+
+    settings = get_model_settings("grok_4.5")
+    assert settings == GROK_4_5_DEFAULT
+
+    settings = get_model_settings("grok_4_5_latest")
+    assert settings == GROK_4_5_DEFAULT
 
 
 def test_get_model_settings_invalid() -> None:
@@ -685,6 +812,15 @@ def test_list_presets() -> None:
         "gemini_thinking_level_low",
         "gemini_thinking_level_medium",
         "gemini_thinking_level_minimal",
+        "grok",
+        "grok_4.5",
+        "grok_4.5_latest",
+        "grok_4_5",
+        "grok_4_5_default",
+        "grok_4_5_high",
+        "grok_4_5_latest",
+        "grok_4_5_low",
+        "grok_4_5_medium",
         "high",
         "low",
         "medium",
@@ -697,19 +833,37 @@ def test_list_presets() -> None:
         "openai_default",
         "openai_high",
         "openai_low",
+        "openai_max",
         "openai_medium",
         "openai_responses",
         "openai_responses_default",
         "openai_responses_default_fast",
+        "openai_responses_gpt56_pro",
+        "openai_responses_gpt56_sol",
+        "openai_responses_gpt5_6_pro",
+        "openai_responses_gpt5_6_sol",
         "openai_responses_high",
         "openai_responses_high_fast",
         "openai_responses_low",
         "openai_responses_low_fast",
+        "openai_responses_luna",
+        "openai_responses_max",
+        "openai_responses_max_fast",
         "openai_responses_medium",
         "openai_responses_medium_fast",
+        "openai_responses_pro",
+        "openai_responses_pro_high",
+        "openai_responses_pro_low",
+        "openai_responses_pro_max",
+        "openai_responses_pro_medium",
+        "openai_responses_pro_xhigh",
+        "openai_responses_sol",
+        "openai_responses_standard",
+        "openai_responses_terra",
         "openai_responses_xhigh",
         "openai_responses_xhigh_fast",
         "openai_xhigh",
+        "xai",
     ])
 
 
@@ -861,6 +1015,13 @@ def test_model_cfg_presets_structure() -> None:
     assert cfg_1m["image_split_max_height"] == 4096
     assert cfg_1m["image_split_overlap"] == 50
 
+    cfg_gpt_350k = get_model_cfg("gpt5_350k")
+    assert cfg_gpt_350k["context_window"] == 350_000
+    assert cfg_gpt_350k["max_videos"] == 0  # GPT doesn't support video
+    assert cfg_gpt_350k["split_large_images"] is True
+    assert cfg_gpt_350k["image_split_max_height"] == 4096
+    assert cfg_gpt_350k["image_split_overlap"] == 50
+
     cfg_gpt_1m = get_model_cfg("gpt5_1m")
     assert cfg_gpt_1m["context_window"] == 922_000
     assert cfg_gpt_1m["max_videos"] == 0  # GPT doesn't support video
@@ -909,6 +1070,10 @@ def test_model_cfg_capabilities() -> None:
     assert ModelCapability.vision in cfg_gpt["capabilities"]
     assert ModelCapability.video_understanding not in cfg_gpt["capabilities"]
 
+    cfg_gpt_350k = get_model_cfg("gpt5_350k")
+    assert ModelCapability.vision in cfg_gpt_350k["capabilities"]
+    assert ModelCapability.video_understanding not in cfg_gpt_350k["capabilities"]
+
     cfg_gpt_1m = get_model_cfg("gpt5_1m")
     assert ModelCapability.vision in cfg_gpt_1m["capabilities"]
     assert ModelCapability.video_understanding not in cfg_gpt_1m["capabilities"]
@@ -933,10 +1098,18 @@ def test_model_cfg_capabilities() -> None:
         ModelCapability.reasoning_foreign_incompatible,
     }
 
+    # Grok 4.5: vision, no video
+    cfg_grok = get_model_cfg("grok_4_5_500k")
+    assert cfg_grok["context_window"] == 500_000
+    assert cfg_grok["max_images"] == 20
+    assert cfg_grok["max_videos"] == 0
+    assert cfg_grok["capabilities"] == {ModelCapability.vision}
+
     # Gemini: vision + video + document
     cfg_gemini = get_model_cfg("gemini_1m")
     assert ModelCapability.vision in cfg_gemini["capabilities"]
     assert ModelCapability.video_understanding in cfg_gemini["capabilities"]
+    assert ModelCapability.youtube_url in cfg_gemini["capabilities"]
     assert ModelCapability.document_understanding in cfg_gemini["capabilities"]
 
 
@@ -947,6 +1120,10 @@ def test_get_model_cfg_by_enum() -> None:
 
     cfg_400k = get_model_cfg(ModelConfigPreset.CLAUDE_400K)
     assert cfg_400k["context_window"] == 400_000
+
+    cfg_gpt_350k = get_model_cfg(ModelConfigPreset.GPT5_350K)
+    assert cfg_gpt_350k["context_window"] == 350_000
+    assert cfg_gpt_350k["max_videos"] == 0  # GPT doesn't support video
 
     cfg_gpt = get_model_cfg(ModelConfigPreset.GPT5_1M)
     assert cfg_gpt["context_window"] == 922_000
@@ -965,6 +1142,10 @@ def test_get_model_cfg_by_enum() -> None:
     assert cfg_mimo_pro["context_window"] == 1_000_000
     assert cfg_mimo_pro["max_videos"] == 0
 
+    cfg_grok = get_model_cfg(ModelConfigPreset.GROK_4_5_500K)
+    assert cfg_grok["context_window"] == 500_000
+    assert cfg_grok["max_videos"] == 0
+
     cfg_gemini = get_model_cfg(ModelConfigPreset.GEMINI_1M)
     assert cfg_gemini["context_window"] == 1_000_000
     assert cfg_gemini["max_videos"] == 1  # Gemini supports video
@@ -981,6 +1162,10 @@ def test_get_model_cfg_by_string() -> None:
     cfg_gpt = get_model_cfg("gpt5_270k")
     assert cfg_gpt["context_window"] == 270_000
     assert cfg_gpt["max_videos"] == 0  # GPT doesn't support video
+
+    cfg_gpt_350k = get_model_cfg("gpt5_350k")
+    assert cfg_gpt_350k["context_window"] == 350_000
+    assert cfg_gpt_350k["max_videos"] == 0  # GPT doesn't support video
 
     cfg_gpt_1m = get_model_cfg("gpt5_1m")
     assert cfg_gpt_1m["context_window"] == 922_000
@@ -1002,6 +1187,10 @@ def test_get_model_cfg_by_string() -> None:
     cfg_mimo_pro = get_model_cfg("mimo_v2_5_pro_1m")
     assert cfg_mimo_pro["context_window"] == 1_000_000
     assert cfg_mimo_pro["max_videos"] == 0
+
+    cfg_grok = get_model_cfg("grok_4_5_500k")
+    assert cfg_grok["context_window"] == 500_000
+    assert cfg_grok["max_videos"] == 0
 
 
 def test_get_model_cfg_by_alias() -> None:
@@ -1045,6 +1234,18 @@ def test_get_model_cfg_by_alias() -> None:
 
     cfg = get_model_cfg("mimo_v2_5_pro")
     assert cfg["context_window"] == 1_000_000
+
+    cfg = get_model_cfg("xai")
+    assert cfg["context_window"] == 500_000
+
+    cfg = get_model_cfg("grok")
+    assert cfg["context_window"] == 500_000
+
+    cfg = get_model_cfg("grok_4.5_latest")
+    assert cfg["context_window"] == 500_000
+
+    cfg = get_model_cfg("grok_4_5_latest")
+    assert cfg["context_window"] == 500_000
 
 
 def test_get_model_cfg_invalid() -> None:
@@ -1107,6 +1308,13 @@ def test_list_model_cfg_presets() -> None:
         "gpt5",
         "gpt5_1m",
         "gpt5_270k",
+        "gpt5_350k",
+        "grok",
+        "grok_4.5",
+        "grok_4.5_latest",
+        "grok_4_5",
+        "grok_4_5_500k",
+        "grok_4_5_latest",
         "mimo",
         "mimo_v2.5",
         "mimo_v2.5_pro",
@@ -1115,4 +1323,5 @@ def test_list_model_cfg_presets() -> None:
         "mimo_v2_5_pro",
         "mimo_v2_5_pro_1m",
         "openai",
+        "xai",
     ])

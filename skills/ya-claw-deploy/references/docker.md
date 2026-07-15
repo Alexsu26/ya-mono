@@ -8,13 +8,13 @@ Read [`workspace-provider/service-docker-docker-shell.md`](workspace-provider/se
 
 ```mermaid
 flowchart TB
-    RP[Reverse Proxy or Direct Client] --> SVC[YA Claw Server Container]
-    SVC --> DB[(SQLite file or PostgreSQL)]
-    SVC --> DATA[/var/lib/ya-claw/data]
-    SVC --> SERVICE_WS[/var/lib/ya-claw/workspace]
-    SVC --> SOCK[/var/run/docker.sock]
-    SOCK --> WSC[Reusable ya-claw-workspace Container]
-    HOST_WS[/srv/ya-claw/workspace] <--> WSC
+    RP["Reverse Proxy or Direct Client"] --> SVC["YA Claw Server Container"]
+    SVC --> DB[("SQLite file or PostgreSQL")]
+    SVC --> DATA["/var/lib/ya-claw/data"]
+    SVC --> SERVICE_WS["/var/lib/ya-claw/workspace"]
+    SVC --> SOCK["/var/run/docker.sock"]
+    SOCK --> WSC["Reusable ya-claw-workspace Container"]
+    HOST_WS["/srv/ya-claw/workspace"] <--> WSC
 ```
 
 ## Images
@@ -59,7 +59,12 @@ YA_CLAW_HOST=0.0.0.0
 YA_CLAW_PORT=9042
 YA_CLAW_AUTO_MIGRATE=true
 YA_CLAW_WEB_DIST_DIR=/srv/ya-claw/web-dist
+MALLOC_ARENA_MAX=2
+MALLOC_TRIM_THRESHOLD_=131072
+PYTHONMALLOC=malloc
 ```
+
+The workspace image also sets the same allocator defaults, so Python tools and CLIs in reusable workspace containers inherit the tuning.
 
 ## Environment
 
@@ -83,6 +88,9 @@ YA_CLAW_WORKSPACE_PROVIDER_DOCKER_EXEC_USER=auto
 YA_CLAW_WORKSPACE_PROVIDER_DOCKER_HOME=/home/claw
 YA_CLAW_PROFILE_SEED_FILE=/etc/ya-claw/profiles.yaml
 YA_CLAW_AUTO_SEED_PROFILES=true
+MALLOC_ARENA_MAX=2
+MALLOC_TRIM_THRESHOLD_=131072
+PYTHONMALLOC=malloc
 GATEWAY_API_KEY=replace-with-provider-key
 GATEWAY_BASE_URL=https://gateway.example.com
 ```
@@ -144,6 +152,6 @@ curl \
 After the first run that needs workspace execution:
 
 ```bash
-docker ps --filter 'name=ya-claw-workspace'
-docker inspect ya-claw-workspace-<fingerprint> --format '{{ json .Mounts }}'
+docker ps --filter 'name=ya-claw-session'
+docker inspect ya-claw-session-<session-short>-g<generation> --format '{{ json .Mounts }}'
 ```

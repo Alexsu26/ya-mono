@@ -35,23 +35,32 @@ class ContextUpdateEvent(AgentEvent):
 
 
 # =============================================================================
-# Loop Events
+# Goal Events
 # =============================================================================
 
 
-class LoopCompleteReason(StrEnum):
-    """Enumerated reasons for loop completion."""
+class GoalCompleteReason(StrEnum):
+    """Enumerated reasons for goal-mode termination."""
 
     verified = "verified"
-    """Agent verified the task is complete."""
+    """Agent verified the goal is complete."""
 
     max_iterations = "max_iterations"
     """Reached the maximum iteration limit."""
 
+    cancelled = "cancelled"
+    """User cancelled the active goal."""
+
+    error = "error"
+    """Goal stopped because agent execution failed."""
+
+    unverified_stop = "unverified_stop"
+    """Goal mode ended without an accepted verification marker."""
+
 
 @dataclass
-class LoopIterationEvent(AgentEvent):
-    """Emitted when the loop guard triggers a new iteration.
+class GoalIterationEvent(AgentEvent):
+    """Emitted when the goal guard triggers a new iteration.
 
     Attributes:
         iteration: Current iteration number (1-based).
@@ -65,15 +74,15 @@ class LoopIterationEvent(AgentEvent):
 
 
 @dataclass
-class LoopCompleteEvent(AgentEvent):
-    """Emitted when loop mode ends.
+class GoalCompleteEvent(AgentEvent):
+    """Emitted when goal mode ends.
 
     Attributes:
         iteration: Final iteration count.
-        reason: Why the loop ended (enumerated).
+        reason: Why the goal ended (enumerated).
         task: Original task description.
     """
 
     iteration: int = 0
-    reason: LoopCompleteReason = LoopCompleteReason.verified
+    reason: GoalCompleteReason = GoalCompleteReason.verified
     task: str = ""

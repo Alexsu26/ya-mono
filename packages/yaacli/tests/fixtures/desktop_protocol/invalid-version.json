@@ -1,0 +1,13 @@
+{
+  "capabilities": {
+    "approvals": true,
+    "commands": [],
+    "events": [],
+    "max_attachments": 32,
+    "max_message_bytes": 1048576,
+    "steering": true
+  },
+  "protocol_version": 999,
+  "runtime_version": "future",
+  "type": "handshake"
+}

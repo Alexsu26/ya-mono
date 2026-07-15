@@ -386,6 +386,12 @@ class AgentRuntime(Generic[AgentDepsT, OutputT, EnvT]):
 # =============================================================================
 
 
+def _model_uses_context_headers(model: Model | KnownModelName | str | None) -> bool:
+    if not isinstance(model, str):
+        return False
+    return model.startswith(("oauth@codex:", "openai-responses-rs:", "openai-responses-ws:"))
+
+
 def _load_system_prompt(
     template: str | None = None,
     template_vars: dict[str, Any] | None = None,
@@ -456,6 +462,8 @@ def create_agent(
     subagent_configs: Sequence[SubagentConfig] | None = None,
     include_builtin_subagents: bool = False,
     unified_subagents: bool = False,
+    unified_subagent_tool_name: str = "delegate",
+    hide_unified_subagent_tool: bool = False,
     inherit_hooks: bool = True,
     # --- Capabilities ---
     pre_capabilities: Sequence[AbstractCapability[AgentDepsT]] | None = None,
@@ -502,8 +510,10 @@ def create_agent(
 
         subagent_configs: Sequence of SubagentConfig for custom subagents.
         include_builtin_subagents: If True, include builtin subagents from presets/.
-        unified_subagents: If True, create a single 'delegate' tool that can call any
+        unified_subagents: If True, create a single unified tool that can call any
             subagent by name. If False (default), create separate tools for each subagent.
+        unified_subagent_tool_name: Tool name for unified subagents. Defaults to "delegate".
+        hide_unified_subagent_tool: Hide the unified subagent tool from model-visible tools and instructions while keeping it callable by code.
         pre_hooks: Dict mapping tool names to pre-hook functions.
         post_hooks: Dict mapping tool names to post-hook functions.
         global_hooks: GlobalHooks instance for all tools.
@@ -513,14 +523,15 @@ def create_agent(
 
         compact_model: Model for legacy compact filter. Falls back to AgentSettings.
         compact_model_settings: Model settings for legacy compact filter.
-        compact_model_cfg: ModelConfig for compact filter. Defaults to main model_cfg.
+        compact_model_cfg: Optional compact-specific ModelConfig override. When
+            None, compact uses the runtime context model_cfg.
         use_cache_friendly_compact_filter: Select the cache-friendly compact filter by default.
             Set to False to use the legacy compact agent implementation.
 
         pre_capabilities: Pydantic AI capabilities that run before SDK history
             capabilities. Use this for ProcessHistory capabilities that must see
-            the raw message history before compact, handoff, auto-load, and runtime
-            instruction filters.
+            the raw message history before compact, handoff, file inspection reminder,
+            and runtime instruction filters.
         capabilities: Pydantic AI capabilities to attach after SDK history capabilities.
             Capabilities bundle tools, lifecycle hooks, instructions, and model settings
             into reusable composable units. See pydantic-ai capabilities documentation.
@@ -613,13 +624,13 @@ def create_agent(
     ]
     compact_filter = (
         create_cache_friendly_compact_filter(
-            model_cfg=compact_model_cfg or effective_model_cfg,
+            model_cfg=compact_model_cfg,
         )
         if use_cache_friendly_compact_filter
         else create_compact_filter(
             model=compact_model,
             model_settings=compact_model_settings,
-            model_cfg=compact_model_cfg or effective_model_cfg,
+            model_cfg=compact_model_cfg,
             main_model=model,
             main_model_settings=model_settings,
         )
@@ -687,6 +698,8 @@ def create_agent(
                 model_settings=model_settings,
                 model_cfg=effective_model_cfg,
                 unified=unified_subagents,
+                unified_tool_name=unified_subagent_tool_name,
+                hidden=hide_unified_subagent_tool,
                 inherit_hooks=inherit_hooks,
                 pre_capabilities=subagent_pre_capabilities,
                 capabilities=subagent_capabilities,
@@ -709,9 +722,7 @@ def create_agent(
     effective_system_prompt = _load_system_prompt(system_prompt, system_prompt_template_vars)
 
     # --- Create Model with Wrapper ---
-    model_extra_headers = (
-        ctx.get_model_extra_headers() if isinstance(model, str) and model.startswith("oauth@codex:") else None
-    )
+    model_extra_headers = ctx.get_model_extra_headers() if _model_uses_context_headers(model) else None
     base_model = infer_model(model, extra_headers=model_extra_headers) if isinstance(model, str) else model
     effective_model: Model | None = base_model
     if base_model is not None and ctx.model_wrapper is not None:
@@ -1091,6 +1102,7 @@ class AgentStreamer(Generic[AgentDepsT, OutputT]):
             if self._tool_id_wrapper is not None:
                 messages = self._tool_id_wrapper.wrap_messages(None, messages)
             if messages and isinstance(messages[-1], ModelResponse):
+                self._mark_interrupted_response(messages[-1])
                 return messages
         partial_response = self._partial_text.build_response()
         if partial_response is not None:
@@ -1098,6 +1110,18 @@ class AgentStreamer(Generic[AgentDepsT, OutputT]):
             if self._tool_id_wrapper is not None:
                 messages = self._tool_id_wrapper.wrap_messages(None, messages)
         return messages
+
+    @staticmethod
+    def _mark_interrupted_response(response: ModelResponse) -> None:
+        """Annotate pydantic-ai v2 interrupted partial responses with SDK metadata."""
+        if response.state != "interrupted":
+            return
+        metadata = dict(response.metadata or {})
+        sdk_metadata = dict(metadata.get("ya_agent_sdk") or {})
+        sdk_metadata.setdefault("partial", True)
+        sdk_metadata.setdefault("reason", "stream_interrupted")
+        metadata["ya_agent_sdk"] = sdk_metadata
+        response.metadata = metadata
 
     def interrupt(self) -> None:
         """Interrupt the stream immediately, cancelling all running tasks.
@@ -1319,6 +1343,8 @@ async def stream_agent(  # noqa: C901
     main_done = asyncio.Event()
     poll_done = asyncio.Event()
     partial_text = PartialTextAccumulator()
+    current_run: AgentRun[AgentDepsT, OutputT] | None = None
+    streamer_ref: AgentStreamer[AgentDepsT, OutputT] | None = None
 
     logger.debug(
         "Starting stream_agent with user_prompt=%s",
@@ -1499,6 +1525,7 @@ async def stream_agent(  # noqa: C901
         is_resume_attempt: bool,
     ) -> None:
         """Run one agent iteration attempt with hooks and lifecycle events."""
+        nonlocal current_run
         await emit_lifecycle_event(
             AgentExecutionStartEvent(
                 event_id=ctx.run_id,
@@ -1517,7 +1544,9 @@ async def stream_agent(  # noqa: C901
             message_history=effective_message_history,
             deferred_tool_results=effective_deferred_tool_results,
         ) as run:
-            streamer.run = run
+            current_run = run
+            if streamer_ref is not None:
+                streamer_ref.run = run
 
             start_ctx = AgentStartContext(
                 runtime=runtime, agent_info=main_agent_info, output_queue=output_queue, run=run
@@ -1708,7 +1737,7 @@ async def stream_agent(  # noqa: C901
 
                 next_attempt_index = attempt_index + 1
                 resume_history = close_unreturned_tool_calls(
-                    extract_resume_history(streamer.run, current_message_history),
+                    extract_resume_history(current_run, current_message_history),
                     error_str,
                 )
                 recovery = recover_retry_message_history(e, resume_history, ctx)
@@ -1870,6 +1899,8 @@ async def stream_agent(  # noqa: C901
         _partial_text=partial_text,
         _tool_id_wrapper=ctx.tool_id_wrapper,
     )
+    streamer_ref = streamer
+    streamer.run = current_run
 
     try:
         yield streamer

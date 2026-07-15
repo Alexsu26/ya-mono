@@ -3,18 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic_ai import RunContext
 from ya_agent_sdk.context import AgentContext
 from ya_agent_sdk.context.agent import AgentInfo
-from ya_agent_sdk.context.bus import MessageBus
+from ya_agent_sdk.context.bus import BusMessage, MessageBus
 from ya_agent_sdk.toolsets.core.base import BaseTool
-from yaacli.background import BACKGROUND_MONITOR_KEY, BackgroundMonitor
+from yaacli.app.tui import TUIApp, TUIState
+from yaacli.background import (
+    BACKGROUND_MONITOR_KEY,
+    DELEGATE_BACKEND_TOOL_NAME,
+    BackgroundMonitor,
+    BackgroundTaskResult,
+)
 from yaacli.environment import TUIEnvironment
-from yaacli.toolsets.background import SpawnDelegateTool, SteerSubagentTool
+from yaacli.toolsets.background import (
+    AsyncDelegateTool,
+    SpawnDelegateTool,
+    SteerSubagentTool,
+    WaitSubagentTool,
+    _task_result_notification,
+)
 
 # =============================================================================
 # BackgroundMonitor Tests (subagent task tracking)
@@ -53,6 +66,76 @@ async def test_monitor_task_auto_removed_on_completion() -> None:
     await asyncio.sleep(0)
 
     assert "test-agent" not in monitor.active_tasks
+
+
+@pytest.mark.asyncio
+async def test_monitor_retires_previous_usage_run_after_its_last_task() -> None:
+    monitor = BackgroundMonitor()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+
+    async def wait_for_release(release: asyncio.Event) -> None:
+        await release.wait()
+
+    first = asyncio.create_task(wait_for_release(release_first))
+    second = asyncio.create_task(wait_for_release(release_second))
+    monitor.register_task("worker-1", first, usage_run_id="run-1")
+    monitor.register_task("worker-2", second, usage_run_id="run-1")
+
+    release_first.set()
+    await first
+    await asyncio.sleep(0)
+    assert monitor.has_tasks_for_usage_run("run-1") is True
+    assert monitor.can_publish_late_usage_snapshot("run-1") is True
+
+    monitor.observe_usage_run("run-2")
+    assert monitor.can_publish_late_usage_snapshot("run-1") is True
+    monitor._pending_usage_snapshots.append(MagicMock(run_id="run-1"))
+
+    release_second.set()
+    await second
+    await asyncio.sleep(0)
+    assert monitor.has_tasks_for_usage_run("run-1") is False
+    assert monitor.can_publish_late_usage_snapshot("run-1") is True
+    assert monitor.drain_retired_usage_run_ids() == set()
+
+    monitor.drain_usage_snapshots()
+    assert monitor.drain_retired_usage_run_ids() == {"run-1"}
+    assert monitor.can_publish_late_usage_snapshot("run-1") is False
+
+
+@pytest.mark.asyncio
+async def test_monitor_resumed_task_gets_fresh_delivery_state_and_message_id() -> None:
+    monitor = BackgroundMonitor()
+    agent_id = "worker-bg-resume"
+
+    async def quick() -> None:
+        return None
+
+    first = asyncio.create_task(quick())
+    monitor.register_task(agent_id, first, is_resume=False)
+    first_message_id = monitor.get_task_result_message_id(agent_id)
+    await first
+    await asyncio.sleep(0)
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id=agent_id,
+            subagent_name="worker",
+            status="completed",
+            content="first",
+        )
+    )
+    monitor.mark_task_result_delivered(agent_id)
+    assert monitor.should_deliver_task_result_message(agent_id) is False
+
+    second = asyncio.create_task(quick())
+    monitor.register_task(agent_id, second, is_resume=True)
+    second_message_id = monitor.get_task_result_message_id(agent_id)
+
+    assert second_message_id != first_message_id
+    assert monitor.should_deliver_task_result_message(agent_id) is True
+    assert monitor.get_task_result(agent_id) is None
+    await second
 
 
 @pytest.mark.asyncio
@@ -194,6 +277,7 @@ def _make_mock_shell(active_pids: dict[str, str] | None = None) -> MagicMock:
     mock_shell.active_background_processes = processes
     # Also set up _background_processes for command lookup
     mock_shell._background_processes = processes
+    mock_shell._output_buffers = {}
     return mock_shell
 
 
@@ -221,7 +305,10 @@ async def test_shell_monitor_detects_completion() -> None:
     monitor.set_completion_callback(lambda pid: callback_calls.append(pid))
 
     # Start with one active process
-    shell = _make_mock_shell({"pid-1": "npm run dev"})
+    shell = _make_mock_shell_with_buffers(
+        active_pids={"pid-1": "npm run dev"},
+        buffers={"pid-1": (["ready"], [], True)},
+    )
     bus = MessageBus()
     bus.subscribe("main")
     monitor.start_shell_monitor(shell, bus, "main", poll_interval=0.05)
@@ -238,13 +325,92 @@ async def test_shell_monitor_detects_completion() -> None:
     # Callback should have been invoked
     assert "pid-1" in callback_calls
 
-    # Bus message should have been sent
+    # Notification should be queued for TUI redelivery.
+    assert monitor.has_pending_messages is True
+    assert monitor.deliver_pending_messages(bus, "main") == 1
     messages = bus.consume("main")
     assert len(messages) >= 1
     shell_msg = [m for m in messages if m.source == "shell-monitor"]
     assert len(shell_msg) == 1
     assert "pid-1" in shell_msg[0].content
     assert "npm run dev" in shell_msg[0].content
+
+    await monitor.close()
+
+
+@pytest.mark.asyncio
+async def test_shell_monitor_drops_completion_after_result_drained() -> None:
+    """Completion wakeup should be dropped after the shell result buffer is consumed."""
+    monitor = BackgroundMonitor()
+    shell = _make_mock_shell_with_buffers(
+        active_pids={"pid-1": "npm run dev"},
+        buffers={"pid-1": (["ready"], [], True)},
+    )
+    bus = MessageBus()
+    monitor.start_shell_monitor(shell, bus, "main", poll_interval=0.05)
+
+    await asyncio.sleep(0.1)
+    shell.active_background_processes = {}
+    await asyncio.sleep(0.15)
+
+    assert monitor.has_pending_messages is True
+
+    # Simulate shell_wait() or inject_background_results() consuming the result.
+    shell._output_buffers.pop("pid-1")
+    assert monitor.deliver_pending_messages(bus, "main") == 0
+    assert bus.has_pending("main") is False
+    assert monitor.has_pending_messages is False
+
+    await monitor.close()
+
+
+@pytest.mark.asyncio
+async def test_shell_monitor_delivers_completion_while_result_buffer_exists() -> None:
+    """Completion wakeup should be delivered while completed result is still buffered."""
+    monitor = BackgroundMonitor()
+    shell = _make_mock_shell_with_buffers(
+        active_pids={"pid-1": "npm run dev"},
+        buffers={"pid-1": (["ready"], [], True)},
+    )
+    bus = MessageBus()
+    monitor.start_shell_monitor(shell, bus, "main", poll_interval=0.05)
+
+    await asyncio.sleep(0.1)
+    shell.active_background_processes = {}
+    await asyncio.sleep(0.15)
+
+    assert monitor.deliver_pending_messages(bus, "main") == 1
+    messages = bus.consume("main")
+    assert len(messages) == 1
+    assert "pid-1" in messages[0].content
+
+    await monitor.close()
+
+
+@pytest.mark.asyncio
+async def test_shell_monitor_queues_completion_for_redelivery() -> None:
+    """Shell completion notifications should be queued until the TUI redelivers them."""
+    monitor = BackgroundMonitor()
+    shell = _make_mock_shell_with_buffers(
+        active_pids={"pid-1": "npm run dev"},
+        buffers={"pid-1": (["ready"], [], True)},
+    )
+    bus = MessageBus()
+    monitor.start_shell_monitor(shell, bus, "main", poll_interval=0.05)
+
+    await asyncio.sleep(0.1)
+    shell.active_background_processes = {}
+    await asyncio.sleep(0.15)
+
+    assert bus.has_pending("main") is False
+    assert monitor.has_pending_messages is True
+    assert monitor.deliver_pending_messages(bus, "main") == 1
+    assert bus.has_pending("main") is True
+    messages = bus.consume("main")
+    assert len(messages) == 1
+    assert messages[0].target == "main"
+    assert messages[0].source == "shell-monitor"
+    assert "pid-1" in messages[0].content
 
     await monitor.close()
 
@@ -352,7 +518,10 @@ async def test_shell_monitor_bus_message_target() -> None:
     """Bus messages from shell monitor should target the configured agent_id."""
     monitor = BackgroundMonitor()
 
-    shell = _make_mock_shell({"pid-1": "echo hello"})
+    shell = _make_mock_shell_with_buffers(
+        active_pids={"pid-1": "echo hello"},
+        buffers={"pid-1": (["hello"], [], True)},
+    )
     bus = MessageBus()
     bus.subscribe("custom-agent")
     bus.subscribe("main")
@@ -365,6 +534,7 @@ async def test_shell_monitor_bus_message_target() -> None:
     await asyncio.sleep(0.15)
 
     # Message should target "custom-agent"
+    assert monitor.deliver_pending_messages(bus, "custom-agent") == 1
     messages = bus.consume("custom-agent")
     assert len(messages) >= 1
     assert messages[0].target == "custom-agent"
@@ -380,6 +550,35 @@ async def test_shell_monitor_bus_message_target() -> None:
 # =============================================================================
 # SpawnDelegateTool Tests
 # =============================================================================
+
+
+class _AvailableDelegateBackend(BaseTool):
+    name = DELEGATE_BACKEND_TOOL_NAME
+    description = "Hidden delegate backend"
+
+    def is_available(self, ctx: RunContext[AgentContext]) -> bool:
+        return False
+
+    @staticmethod
+    def _get_roster_instruction(ctx: RunContext[AgentContext]) -> str | None:
+        return '<subagent name="helper">\nHelper subagent\n</subagent>'
+
+    @staticmethod
+    def _can_delegate(ctx: RunContext[AgentContext]) -> bool:
+        return True
+
+    async def call(self, ctx: RunContext[AgentContext], **kwargs: object) -> str:
+        return "ok"
+
+
+class _UnavailableDelegateBackend(_AvailableDelegateBackend):
+    @staticmethod
+    def _get_roster_instruction(ctx: RunContext[AgentContext]) -> str | None:
+        return None
+
+    @staticmethod
+    def _can_delegate(ctx: RunContext[AgentContext]) -> bool:
+        return False
 
 
 def _make_run_ctx(
@@ -448,6 +647,385 @@ def test_tool_available_with_delegate() -> None:
     assert tool.is_available(ctx)
 
 
+def test_spawn_delegate_checks_backend_can_delegate() -> None:
+    """SpawnDelegateTool should respect backend target availability."""
+    monitor = BackgroundMonitor()
+    mock_toolset = MagicMock()
+    mock_toolset._get_tool_instance.return_value = _UnavailableDelegateBackend()
+    monitor.set_core_toolset(mock_toolset)
+
+    tool = SpawnDelegateTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+
+    assert not tool.is_available(ctx)
+
+
+@pytest.mark.asyncio
+async def test_async_delegate_uses_hidden_backend_roster() -> None:
+    """Async delegate should expose backend roster while keeping async wording."""
+    monitor = BackgroundMonitor()
+    mock_toolset = MagicMock()
+    mock_toolset._get_tool_instance.return_value = _AvailableDelegateBackend()
+    monitor.set_core_toolset(mock_toolset)
+
+    tool = AsyncDelegateTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+
+    assert tool.is_available(ctx)
+    instruction = await tool.get_instruction(ctx)
+    assert instruction is not None
+    assert "delegate is asynchronous" in instruction
+    assert "returns an agent ID immediately" in instruction
+    assert "do not manually poll or loop" in instruction
+    assert "wait_subagent once with a bounded timeout" in instruction
+    assert "finish the current response" in instruction
+    assert "let the CLI notify you" in instruction
+    assert "steer_subagent" in instruction
+    assert '<subagent name="helper">' in instruction
+    assert "Helper subagent" in instruction
+    assert "Delegate calls are blocking" not in instruction
+
+
+def test_background_tools_export_keeps_legacy_spawn_name() -> None:
+    """Legacy background_tools export should not include both delegate variants."""
+    from yaacli.toolsets.background import background_tools
+
+    assert SpawnDelegateTool in background_tools
+    assert WaitSubagentTool in background_tools
+    assert AsyncDelegateTool not in background_tools
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_unavailable_without_work() -> None:
+    """WaitSubagentTool should be unavailable when no background work exists."""
+    monitor = BackgroundMonitor()
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+
+    assert not tool.is_available(ctx)
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_unavailable_for_subagent() -> None:
+    """WaitSubagentTool should be unavailable outside the main agent."""
+    monitor = BackgroundMonitor()
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="helper-bg-a1b2",
+            subagent_name="helper",
+            status="completed",
+            content="done",
+        )
+    )
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="helper-bg-a1b2")
+
+    assert not tool.is_available(ctx)
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_returns_cached_result() -> None:
+    """WaitSubagentTool should return completed cached results immediately."""
+    monitor = BackgroundMonitor()
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="helper-bg-a1b2",
+            subagent_name="helper",
+            status="completed",
+            content="done",
+        )
+    )
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+
+    assert tool.is_available(ctx)
+    result = await tool.call(ctx, agent_id="helper-bg-a1b2", timeout_seconds=0)
+
+    assert result["status"] == "completed"
+    assert result["agent_id"] == "helper-bg-a1b2"
+    assert result["subagent_name"] == "helper"
+    assert result["result"] == "done"
+    assert result["timed_out"] is False
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_unknown_agent() -> None:
+    """WaitSubagentTool should report unknown ids without waiting."""
+    monitor = BackgroundMonitor()
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="helper-bg-a1b2",
+            subagent_name="helper",
+            status="completed",
+            content="done",
+        )
+    )
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+
+    result = await tool.call(ctx, agent_id="missing-bg-z9", timeout_seconds=0)
+
+    assert result["status"] == "not_found"
+    assert result["agent_id"] == "missing-bg-z9"
+    assert result["known_agent_ids"] == ["helper-bg-a1b2"]
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_timeout_does_not_cancel_task() -> None:
+    """Timeout should return running without cancelling the background task."""
+    monitor = BackgroundMonitor()
+
+    async def sleeper() -> None:
+        await asyncio.sleep(1)
+
+    task = asyncio.create_task(sleeper())
+    monitor.register_task("helper-bg-a1b2", task, subagent_name="helper", prompt="work")
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+
+    result = await tool.call(ctx, agent_id="helper-bg-a1b2", timeout_seconds=0.01)
+
+    assert result["status"] == "running"
+    assert result["timed_out"] is True
+    assert not task.done()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_waits_for_active_task_result() -> None:
+    """WaitSubagentTool should wait until a running task records its result."""
+    monitor = BackgroundMonitor()
+
+    async def complete() -> None:
+        await asyncio.sleep(0.01)
+        monitor.record_task_result(
+            BackgroundTaskResult(
+                agent_id="helper-bg-a1b2",
+                subagent_name="helper",
+                status="completed",
+                content="done",
+            )
+        )
+
+    task = asyncio.create_task(complete())
+    monitor.register_task("helper-bg-a1b2", task, subagent_name="helper", prompt="work")
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+
+    result = await tool.call(ctx, agent_id="helper-bg-a1b2", timeout_seconds=1)
+
+    assert result["status"] == "completed"
+    assert result["result"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_waits_for_all_known_agents() -> None:
+    """Omitting agent_id should wait for all known background agents."""
+    monitor = BackgroundMonitor()
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="cached-bg-a1b2",
+            subagent_name="cached",
+            status="completed",
+            content="cached done",
+        )
+    )
+
+    async def complete() -> None:
+        await asyncio.sleep(0.01)
+        monitor.record_task_result(
+            BackgroundTaskResult(
+                agent_id="active-bg-c3d4",
+                subagent_name="active",
+                status="completed",
+                content="active done",
+            )
+        )
+
+    task = asyncio.create_task(complete())
+    monitor.register_task("active-bg-c3d4", task, subagent_name="active", prompt="work")
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+
+    result = await tool.call(ctx, timeout_seconds=1)
+
+    assert result["status"] == "completed"
+    assert result["timed_out"] is False
+    results_by_id = {item["agent_id"]: item for item in result["results"]}
+    assert results_by_id["cached-bg-a1b2"]["result"] == "cached done"
+    assert results_by_id["active-bg-c3d4"]["result"] == "active done"
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_formats_failed_and_cancelled_results() -> None:
+    """WaitSubagentTool should format failed and cancelled terminal results."""
+    monitor = BackgroundMonitor()
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="failed-bg-a1b2",
+            subagent_name="failed",
+            status="failed",
+            error="boom",
+        )
+    )
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="cancelled-bg-c3d4",
+            subagent_name="cancelled",
+            status="cancelled",
+            error="stopped",
+        )
+    )
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+
+    failed = await tool.call(ctx, agent_id="failed-bg-a1b2", timeout_seconds=0)
+    cancelled = await tool.call(ctx, agent_id="cancelled-bg-c3d4", timeout_seconds=0)
+
+    assert failed["status"] == "failed"
+    assert failed["error"] == "boom"
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["error"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_done_without_result_reports_failed() -> None:
+    """A done task without a cached terminal result should not be reported as running."""
+    monitor = BackgroundMonitor()
+
+    async def complete_without_result() -> None:
+        return None
+
+    task = asyncio.create_task(complete_without_result())
+    monitor.register_task("helper-bg-a1b2", task, subagent_name="helper", prompt="work")
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+
+    result = await tool.call(ctx, agent_id="helper-bg-a1b2", timeout_seconds=1)
+
+    assert result["status"] == "failed"
+    assert result["agent_id"] == "helper-bg-a1b2"
+    assert result["subagent_name"] == "helper"
+    assert result["error"] == "Background task finished without recording a result."
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_marks_active_bus_result_consumed() -> None:
+    """wait_subagent should suppress duplicate delivery from the active message bus."""
+    monitor = BackgroundMonitor()
+    bus = MessageBus()
+    bus.subscribe("main")
+    message_id = monitor.get_task_result_message_id("helper-bg-a1b2")
+    bus.send(BusMessage(id=message_id, content="done", source="helper-bg-a1b2", target="main"))
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="helper-bg-a1b2",
+            subagent_name="helper",
+            status="completed",
+            content="done",
+        )
+    )
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+    ctx.deps.message_bus = bus
+
+    result = await tool.call(ctx, agent_id="helper-bg-a1b2", timeout_seconds=0)
+
+    assert result["status"] == "completed"
+    assert result["result"] == "done"
+    assert bus.consume("main") == []
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_drops_queued_fallback_result() -> None:
+    """wait_subagent should remove matching queued fallback notifications."""
+    monitor = BackgroundMonitor()
+    message_id = monitor.get_task_result_message_id("helper-bg-a1b2")
+    monitor.enqueue_message(BusMessage(id=message_id, content="done", source="helper-bg-a1b2", target="main"))
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="helper-bg-a1b2",
+            subagent_name="helper",
+            status="completed",
+            content="done",
+        )
+    )
+    bus = MessageBus()
+    tool = WaitSubagentTool()
+    ctx = _make_run_ctx(monitor=monitor, agent_id="main")
+    ctx.deps.message_bus = bus
+
+    result = await tool.call(ctx, agent_id="helper-bg-a1b2", timeout_seconds=0)
+
+    assert result["status"] == "completed"
+    assert monitor.deliver_pending_messages(bus, "main") == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_subagent_waiting_task_suppresses_completion_bus_message() -> None:
+    """A task completing while wait_subagent is active should not send a duplicate bus message."""
+    monitor = BackgroundMonitor()
+    mock_delegate = AsyncMock(spec=BaseTool)
+    release = asyncio.Event()
+
+    async def delegate_call(*args: object, **kwargs: object) -> str:
+        await release.wait()
+        return "Subagent result"
+
+    mock_delegate.call = AsyncMock(side_effect=delegate_call)
+    mock_toolset = MagicMock()
+    mock_toolset._get_tool_instance.return_value = mock_delegate
+    monitor.set_core_toolset(mock_toolset)
+
+    bus = MessageBus()
+    bus.subscribe("main")
+    mock_deps = MagicMock()
+    mock_deps.resources = MagicMock()
+    mock_deps.resources.get.return_value = monitor
+    mock_deps.subagent_history = {}
+    mock_deps.agent_id = "main"
+    mock_deps.message_bus = bus
+    mock_deps.send_message.side_effect = bus.send
+
+    run_ctx = MagicMock(spec=RunContext)
+    run_ctx.deps = mock_deps
+
+    spawn_result = await SpawnDelegateTool().call(
+        run_ctx,
+        subagent_name="helper",
+        prompt="work",
+        agent_id="helper-bg-a1b2",
+    )
+    assert "helper-bg-a1b2" in spawn_result
+
+    wait_task = asyncio.create_task(WaitSubagentTool().call(run_ctx, agent_id="helper-bg-a1b2", timeout_seconds=1))
+    await asyncio.sleep(0)
+    release.set()
+    wait_result = await wait_task
+
+    assert wait_result["status"] == "completed"
+    assert wait_result["result"] == "Subagent result"
+    assert mock_deps.send_message.call_count == 0
+    assert bus.consume("main") == []
+
+
+@pytest.mark.parametrize(
+    ("input_timeout", "expected"),
+    [
+        (-1.0, 0.0),
+        (999.0, 300.0),
+        (float("inf"), 300.0),
+        (float("nan"), 300.0),
+    ],
+)
+def test_wait_subagent_normalizes_timeout(input_timeout: float, expected: float) -> None:
+    """Timeout normalization should clamp unsafe float values."""
+    assert WaitSubagentTool._normalize_timeout(input_timeout) == expected
+
+
 @pytest.mark.asyncio
 async def test_tool_call_launches_background_task() -> None:
     """Calling SpawnDelegateTool should launch a background task."""
@@ -475,9 +1053,14 @@ async def test_tool_call_launches_background_task() -> None:
     tool = SpawnDelegateTool()
     result = await tool.call(run_ctx, subagent_name="explorer", prompt="Find stuff")
 
-    # Should return immediately with a status message
+    # Should return immediately with a status message that prevents polling loops.
     assert "Spawned delegate" in result
     assert "explorer" in result
+    assert "Do not manually poll or loop" in result
+    assert "wait_subagent once with a bounded timeout" in result
+    assert "finish your current response now" in result
+    assert "automatically notify you" in result
+    assert "steer_subagent" in result
 
     # A background task should be registered
     assert len(monitor.active_tasks) == 1
@@ -491,10 +1074,102 @@ async def test_tool_call_launches_background_task() -> None:
     # We don't have a callback set, but the task should complete
     assert not monitor.has_active_tasks
 
-    # Message should be sent to bus
-    mock_deps.send_message.assert_called_once()
-    sent_msg = mock_deps.send_message.call_args[0][0]
-    assert sent_msg.target == "main"
+    # Message is delivered immediately for the active run guard.
+    assert mock_deps.send_message.call_count == 1
+    assert monitor.has_pending_messages is False
+
+
+@pytest.mark.asyncio
+async def test_tool_call_queues_result_for_redelivery() -> None:
+    """Direct bus delivery acknowledges results so completed retention is bounded."""
+    monitor = BackgroundMonitor(max_completed_tasks=0)
+
+    mock_delegate = AsyncMock(spec=BaseTool)
+    mock_delegate.call = AsyncMock(return_value="Subagent result")
+
+    mock_toolset = MagicMock()
+    mock_toolset._get_tool_instance.return_value = mock_delegate
+    monitor.set_core_toolset(mock_toolset)
+
+    bus = MessageBus()
+    bus.subscribe("main")
+    mock_deps = MagicMock()
+    mock_deps.resources = MagicMock()
+    mock_deps.resources.get.return_value = monitor
+    mock_deps.subagent_history = {}
+    mock_deps.agent_id = "main"
+    mock_deps.message_bus = bus
+    mock_deps.send_message.side_effect = bus.send
+
+    run_ctx = MagicMock(spec=RunContext)
+    run_ctx.deps = mock_deps
+
+    result = await SpawnDelegateTool().call(run_ctx, subagent_name="explorer", prompt="Find stuff")
+
+    assert "Spawned delegate" in result
+    tasks = list(monitor.active_tasks.values())
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert bus.has_pending("main") is True
+    messages = bus.consume("main")
+    assert len(messages) == 1
+    assert messages[0].source.startswith("explorer-bg-")
+    assert messages[0].target == "main"
+    assert messages[0].content == "Subagent result"
+    agent_id = messages[0].source
+    assert agent_id in monitor.task_results
+
+    monitor.acknowledge_enqueued_task_results(bus, "main")
+
+    assert monitor.task_results == {}
+    assert monitor.task_infos == {}
+
+    # No fallback is queued while the main agent is still subscribed; the
+    # active run consumes the directly delivered message instead.
+    assert monitor.has_pending_messages is False
+    assert monitor.deliver_pending_messages(bus, "main") == 0
+    assert bus.has_pending("main") is False
+
+
+@pytest.mark.asyncio
+async def test_tool_call_redelivery_works_when_main_not_subscribed() -> None:
+    """Fallback redelivery should work if the active main context already exited."""
+    monitor = BackgroundMonitor()
+
+    mock_delegate = AsyncMock(spec=BaseTool)
+    mock_delegate.call = AsyncMock(return_value="Late subagent result")
+
+    mock_toolset = MagicMock()
+    mock_toolset._get_tool_instance.return_value = mock_delegate
+    monitor.set_core_toolset(mock_toolset)
+
+    bus = MessageBus()
+    mock_deps = MagicMock()
+    mock_deps.resources = MagicMock()
+    mock_deps.resources.get.return_value = monitor
+    mock_deps.subagent_history = {}
+    mock_deps.agent_id = "main"
+    mock_deps.message_bus = bus
+    mock_deps.send_message.side_effect = bus.send
+
+    run_ctx = MagicMock(spec=RunContext)
+    run_ctx.deps = mock_deps
+
+    result = await SpawnDelegateTool().call(run_ctx, subagent_name="explorer", prompt="Find stuff")
+
+    assert "Spawned delegate" in result
+    tasks = list(monitor.active_tasks.values())
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert mock_deps.send_message.call_count == 0
+    assert bus.has_pending("main") is False
+    assert monitor.deliver_pending_messages(bus, "main") == 1
+    assert bus.has_pending("main") is True
+    messages = bus.consume("main")
+    assert len(messages) == 1
+    assert messages[0].content == "Late subagent result"
 
 
 @pytest.mark.asyncio
@@ -514,6 +1189,60 @@ async def test_tool_call_no_delegate() -> None:
     ctx = _make_run_ctx(monitor=monitor)
     result = await tool.call(ctx, subagent_name="explorer", prompt="Find stuff")
     assert "Error" in result
+
+
+@pytest.mark.asyncio
+async def test_tui_redelivers_background_message_after_running_turn_exits() -> None:
+    """TUI should redeliver queued background results after an active main-agent turn exits."""
+    monitor = BackgroundMonitor()
+    bus = MessageBus()
+
+    env = MagicMock()
+    env.resources = MagicMock()
+    env.resources.get.return_value = monitor
+
+    ctx = MagicMock()
+    ctx.agent_id = "main"
+    ctx.message_bus = bus
+
+    runtime = MagicMock()
+    runtime.env = env
+    runtime.ctx = ctx
+
+    config = MagicMock()
+    config.general.max_requests = 10
+    config.display.max_output_lines = 500
+    config.display.mouse_support = True
+    config_manager = MagicMock()
+
+    app = TUIApp(config=config, config_manager=config_manager)
+    app._runtime = runtime
+    app._state = TUIState.RUNNING
+    app._pending_bus_check_needed = False
+    app._append_system_output = MagicMock()
+
+    async def noop_run_agent(user_input: str) -> None:
+        return None
+
+    app._run_agent = noop_run_agent  # type: ignore[method-assign]
+
+    monitor.enqueue_message(BusMessage(content="Subagent result", source="executor-bg-123", target="main"))
+    app._on_background_task_complete("executor-bg-123")
+
+    app._append_system_output.assert_called_once_with("Background task completed: executor-bg-123")
+    assert app._pending_bus_check_needed is True
+    assert bus.has_pending("main") is False
+
+    app._state = TUIState.IDLE
+    app._check_pending_bus_messages()
+
+    assert bus.has_pending("main") is True
+    messages = bus.consume("main")
+    assert len(messages) == 1
+    assert messages[0].content == "Subagent result"
+    assert app._state == TUIState.RUNNING
+    assert app._agent_task is not None
+    await app._agent_task
 
 
 # =============================================================================
@@ -654,7 +1383,7 @@ async def test_steer_sends_bus_message() -> None:
 
 @pytest.mark.asyncio
 async def test_steer_finished_agent_suggests_resume() -> None:
-    """Steering a finished subagent should suggest spawn_delegate resume."""
+    """Steering a finished subagent should suggest delegate resume."""
     monitor = BackgroundMonitor()
 
     # Create and immediately complete a task
@@ -679,7 +1408,7 @@ async def test_steer_finished_agent_suggests_resume() -> None:
     result = await tool.call(run_ctx, agent_id="searcher-bg-a1b2", message="dig deeper")
 
     assert "already completed" in result
-    assert "spawn_delegate" in result
+    assert "spawn_delegate" not in result
     assert "agent_id" in result
     assert "searcher-bg-a1b2" in result
     assert "delegate" in result
@@ -703,7 +1432,56 @@ async def test_steer_unknown_agent_suggests_resume() -> None:
     result = await tool.call(run_ctx, agent_id="nonexistent-bg-0000", message="hello")
 
     assert "already completed" in result
-    assert "spawn_delegate" in result
+    assert "spawn_delegate" not in result
+    assert "delegate" in result
+
+
+@pytest.mark.asyncio
+async def test_steer_resume_suggests_delegate_in_async_alias_mode() -> None:
+    """Async-only topology should suggest delegate for resume."""
+    monitor = BackgroundMonitor()
+    mock_toolset = MagicMock()
+    mock_toolset._get_tool_instance.return_value = AsyncDelegateTool()
+    monitor.set_core_toolset(mock_toolset)
+
+    mock_deps = MagicMock()
+    mock_deps.resources = MagicMock()
+    mock_deps.resources.get.return_value = monitor
+    mock_deps.agent_id = "main"
+    mock_deps.agent_registry = {}
+
+    run_ctx = MagicMock(spec=RunContext)
+    run_ctx.deps = mock_deps
+
+    result = await SteerSubagentTool().call(run_ctx, agent_id="searcher-bg-a1b2", message="dig deeper")
+
+    assert "already completed" in result
+    assert "spawn_delegate" not in result
+    assert 'delegate(subagent_name="searcher"' in result
+
+
+@pytest.mark.asyncio
+async def test_steer_resume_suggests_spawn_delegate_in_dual_mode() -> None:
+    """Dual topology should suggest spawn_delegate for async resume."""
+    monitor = BackgroundMonitor()
+    mock_delegate = MagicMock(spec=BaseTool)
+    mock_toolset = MagicMock()
+    mock_toolset._get_tool_instance.return_value = mock_delegate
+    monitor.set_core_toolset(mock_toolset)
+
+    mock_deps = MagicMock()
+    mock_deps.resources = MagicMock()
+    mock_deps.resources.get.return_value = monitor
+    mock_deps.agent_id = "main"
+    mock_deps.agent_registry = {}
+
+    run_ctx = MagicMock(spec=RunContext)
+    run_ctx.deps = mock_deps
+
+    result = await SteerSubagentTool().call(run_ctx, agent_id="searcher-bg-a1b2", message="dig deeper")
+
+    assert "already completed" in result
+    assert 'spawn_delegate(subagent_name="searcher"' in result
 
 
 @pytest.mark.asyncio
@@ -762,6 +1540,39 @@ async def test_steer_shows_active_tasks_hint() -> None:
 # =============================================================================
 # SpawnDelegateTool Resume Tests
 # =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_spawn_delegate_rejects_concurrent_resume_for_same_agent_id() -> None:
+    monitor = BackgroundMonitor()
+    mock_delegate = AsyncMock(spec=BaseTool)
+    mock_toolset = MagicMock()
+    mock_toolset._get_tool_instance.return_value = mock_delegate
+    monitor.set_core_toolset(mock_toolset)
+
+    async def running() -> None:
+        await asyncio.sleep(60)
+
+    active_task = asyncio.create_task(running())
+    monitor.register_task("searcher-bg-a1b2", active_task)
+    mock_deps = MagicMock()
+    mock_deps.resources.get.return_value = monitor
+    mock_deps.subagent_history = {"searcher-bg-a1b2": []}
+    run_ctx = MagicMock(spec=RunContext)
+    run_ctx.deps = mock_deps
+
+    result = await SpawnDelegateTool().call(
+        run_ctx,
+        subagent_name="searcher",
+        prompt="overlap",
+        agent_id="searcher-bg-a1b2",
+    )
+
+    assert result == "Error: background agent 'searcher-bg-a1b2' is already running"
+    mock_delegate.call.assert_not_called()
+    active_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await active_task
 
 
 @pytest.mark.asyncio
@@ -858,7 +1669,9 @@ async def test_steer_instruction_only_with_active_tasks() -> None:
 
     instruction = await tool.get_instruction(ctx)
     assert instruction is not None
-    assert "Send additional guidance" in instruction
+    assert "Steer a running background subagent only" in instruction
+    assert "Do not poll after steering" in instruction
+    assert "CLI will notify you" in instruction
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -872,7 +1685,7 @@ async def test_steer_instruction_only_with_active_tasks() -> None:
 
 def _make_mock_shell_with_buffers(
     active_pids: dict[str, str] | None = None,
-    buffers: dict[str, tuple[list[str], list[str]]] | None = None,
+    buffers: dict[str, tuple[list[str], list[str]] | tuple[list[str], list[str], bool]] | None = None,
 ) -> MagicMock:
     """Create a mock Shell with active_background_processes and _output_buffers.
 
@@ -887,12 +1700,17 @@ def _make_mock_shell_with_buffers(
     # Set up output buffers
     output_buffers: dict[str, MagicMock] = {}
     if buffers:
-        for pid, (stdout_lines, stderr_lines) in buffers.items():
+        for pid, buffer_data in buffers.items():
+            if len(buffer_data) == 2:
+                stdout_lines, stderr_lines = buffer_data
+                completed = False
+            else:
+                stdout_lines, stderr_lines, completed = buffer_data
             buf = MagicMock()
             buf.stdout = deque(stdout_lines)
             buf.stderr = deque(stderr_lines)
-            buf.completed = False
-            buf.exit_code = None
+            buf.completed = completed
+            buf.exit_code = 0 if completed else None
             output_buffers[pid] = buf
 
     mock_shell._output_buffers = output_buffers
@@ -925,6 +1743,7 @@ async def test_output_monitoring_notifies_on_new_output() -> None:
     # Wait for poll cycle
     await asyncio.sleep(0.1)
 
+    assert monitor.deliver_pending_messages(bus, "main") >= 1
     messages = bus.consume("main")
     # Should have at least one output notification
     output_msgs = [m for m in messages if "new output" in m.content]
@@ -952,6 +1771,7 @@ async def test_output_monitoring_no_duplicate_notifications() -> None:
     # Wait for multiple poll cycles
     await asyncio.sleep(0.2)
 
+    assert monitor.deliver_pending_messages(bus, "main") >= 1
     messages = bus.consume("main")
     output_msgs = [m for m in messages if "new output" in m.content]
     # Only one notification despite multiple polls (output not drained)
@@ -978,6 +1798,7 @@ async def test_output_monitoring_re_notifies_after_drain() -> None:
 
     # Wait for first notification
     await asyncio.sleep(0.1)
+    monitor.deliver_pending_messages(bus, "main")
     bus.consume("main")  # drain bus
 
     # Simulate drain: clear the output buffer (as shell_wait would)
@@ -989,9 +1810,40 @@ async def test_output_monitoring_re_notifies_after_drain() -> None:
     shell._output_buffers["pid-1"].stdout = deque(["new output"])
     await asyncio.sleep(0.1)
 
+    assert monitor.deliver_pending_messages(bus, "main") >= 1
     messages = bus.consume("main")
     output_msgs = [m for m in messages if "new output" in m.content]
     assert len(output_msgs) >= 1
+
+    await monitor.close()
+
+
+@pytest.mark.asyncio
+async def test_output_monitoring_drops_wakeup_after_output_drained() -> None:
+    """Output wakeup should be dropped if shell_wait drains output before delivery."""
+    from collections import deque
+
+    bus = MessageBus()
+    bus.subscribe("main")
+    shell = _make_mock_shell_with_buffers(
+        active_pids={"pid-1": "build"},
+        buffers={"pid-1": (["initial output"], [])},
+    )
+
+    monitor = BackgroundMonitor()
+    monitor.start_shell_monitor(shell, bus, "main", poll_interval=0.05)
+    monitor.register_monitored_process("pid-1")
+
+    await asyncio.sleep(0.1)
+    assert monitor.has_pending_messages is True
+
+    # Simulate shell_wait(timeout_seconds=0) draining the output before delivery.
+    shell._output_buffers["pid-1"].stdout = deque()
+    shell._output_buffers["pid-1"].stderr = deque()
+
+    assert monitor.deliver_pending_messages(bus, "main") == 0
+    assert bus.consume("main") == []
+    assert monitor.has_pending_messages is False
 
     await monitor.close()
 
@@ -1012,35 +1864,10 @@ async def test_output_monitoring_stderr_triggers_notification() -> None:
 
     await asyncio.sleep(0.1)
 
+    assert monitor.deliver_pending_messages(bus, "main") >= 1
     messages = bus.consume("main")
     output_msgs = [m for m in messages if "new output" in m.content]
     assert len(output_msgs) >= 1
-
-    await monitor.close()
-
-
-@pytest.mark.asyncio
-async def test_output_monitoring_completion_removes_from_monitored() -> None:
-    """Monitored process should be removed when it completes."""
-    bus = MessageBus()
-    shell = _make_mock_shell_with_buffers(
-        active_pids={"pid-1": "make test"},
-        buffers={"pid-1": ([], [])},
-    )
-
-    monitor = BackgroundMonitor()
-    monitor.start_shell_monitor(shell, bus, "main", poll_interval=0.05)
-    monitor.register_monitored_process("pid-1")
-
-    assert "pid-1" in monitor._monitored_processes
-
-    # Simulate process completion
-    shell.active_background_processes = {}
-    await asyncio.sleep(0.15)
-
-    # Should be removed from monitored set
-    assert "pid-1" not in monitor._monitored_processes
-    assert "pid-1" not in monitor._notified_pending
 
     await monitor.close()
 
@@ -1313,3 +2140,215 @@ async def test_monitored_shell_tool_emits_event() -> None:
     assert event.command == "npm run dev"
 
     await monitor.close()
+
+
+@pytest.mark.asyncio
+async def test_background_monitor_bounds_prompt_and_result_and_keeps_undelivered_result() -> None:
+    monitor = BackgroundMonitor(max_completed_tasks=0, max_task_prompt_chars=8, max_task_result_chars=10)
+
+    async def never() -> None:
+        await asyncio.sleep(60)
+
+    task = asyncio.create_task(never())
+    monitor.register_task("worker-bg-1", task, subagent_name="worker", prompt="prompt " * 100)
+    info = monitor.task_infos["worker-bg-1"]
+    assert len(info.prompt) <= 8
+    assert info.prompt_truncated is True
+
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="worker-bg-1",
+            subagent_name="worker",
+            status="completed",
+            content="result " * 100,
+        )
+    )
+    preview = monitor.task_results["worker-bg-1"]
+    assert len(preview.content or "") <= 10
+    assert preview.content_truncated is True
+    notification = _task_result_notification(monitor, "worker-bg-1", "fallback")
+    assert len(notification) < len("result " * 100)
+    assert "wait_subagent" in notification
+    result = monitor.get_task_result("worker-bg-1")
+    assert result is not None
+    assert result.content == "result " * 100
+    assert result.content_truncated is False
+    # Zero delivered-history capacity must not drop an undelivered result.
+    assert "worker-bg-1" in monitor.task_results
+
+    monitor.mark_task_result_delivered("worker-bg-1")
+    assert "worker-bg-1" not in monitor.task_results
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_fallback_task_result_delivery_acknowledges_and_prunes_completed_entry() -> None:
+    monitor = BackgroundMonitor(max_completed_tasks=0)
+    agent_id = "worker-bg-fallback"
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id=agent_id,
+            subagent_name="worker",
+            status="completed",
+            content="done",
+        )
+    )
+    monitor.enqueue_message(
+        BusMessage(
+            id=monitor.get_task_result_message_id(agent_id),
+            content="done",
+            source=agent_id,
+            target="main",
+        )
+    )
+    bus = MessageBus()
+
+    assert monitor.deliver_pending_messages(bus, "main") == 1
+    assert bus.has_pending("main") is True
+    assert agent_id in monitor.task_results
+    assert monitor.is_task_result_delivered(agent_id) is False
+
+    monitor.acknowledge_enqueued_task_results(bus, "main")
+    assert agent_id in monitor.task_results
+
+    bus.consume("main")
+    monitor.acknowledge_enqueued_task_results(bus, "main")
+
+    assert monitor.task_results == {}
+
+
+def test_failed_fallback_delivery_keeps_undelivered_result_reachable() -> None:
+    monitor = BackgroundMonitor(max_completed_tasks=0)
+    agent_id = "worker-bg-retry"
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id=agent_id,
+            subagent_name="worker",
+            status="completed",
+            content="done",
+        )
+    )
+    monitor.enqueue_message(
+        BusMessage(
+            id=monitor.get_task_result_message_id(agent_id),
+            content="done",
+            source=agent_id,
+            target="main",
+        )
+    )
+    bus = MagicMock(spec=MessageBus)
+    bus.send.side_effect = RuntimeError("send failed")
+
+    with pytest.raises(RuntimeError, match="send failed"):
+        monitor.deliver_pending_messages(bus, "main")
+
+    assert agent_id in monitor.task_results
+    assert monitor.is_task_result_delivered(agent_id) is False
+    assert monitor.has_pending_messages is True
+
+
+def test_delivered_result_artifact_remains_until_bounded_entry_eviction() -> None:
+    monitor = BackgroundMonitor(max_completed_tasks=1, max_task_result_chars=10)
+    full_content = "large result " * 100
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="worker-bg-first",
+            subagent_name="worker",
+            status="completed",
+            content=full_content,
+        )
+    )
+
+    monitor.mark_task_result_delivered("worker-bg-first")
+
+    first_result = monitor.get_task_result("worker-bg-first")
+    assert first_result is not None
+    assert first_result.content == full_content
+
+    monitor.record_task_result(
+        BackgroundTaskResult(
+            agent_id="worker-bg-second",
+            subagent_name="worker",
+            status="completed",
+            content="second",
+        )
+    )
+
+    assert monitor.get_task_result("worker-bg-first") is None
+
+
+@pytest.mark.asyncio
+async def test_background_result_artifact_write_does_not_block_event_loop(tmp_path: Path) -> None:
+    monitor = BackgroundMonitor(max_task_result_chars=10)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_write(agent_id: str, kind: str, value: str | None) -> Path:
+        del agent_id, kind
+        started.set()
+        assert release.wait(timeout=2)
+        artifact = tmp_path / "result.txt"
+        artifact.write_text(value or "")
+        return artifact
+
+    with patch.object(monitor, "_write_task_artifact", side_effect=blocking_write):
+        record_task = asyncio.create_task(
+            monitor.record_task_result_async(
+                BackgroundTaskResult(
+                    agent_id="worker-bg-async",
+                    subagent_name="worker",
+                    status="completed",
+                    content="large result " * 100,
+                )
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        await asyncio.sleep(0)
+        assert record_task.done() is False
+        release.set()
+        await record_task
+
+    result = monitor.get_task_result("worker-bg-async")
+    assert result is not None
+    assert result.content == "large result " * 100
+    monitor.mark_task_result_delivered("worker-bg-async")
+
+
+def test_background_monitor_bounds_pending_message_and_usage_snapshot_payloads() -> None:
+    from pydantic_ai.usage import RunUsage
+    from ya_agent_sdk.usage import UsageAgentTotal, UsageSnapshot
+
+    monitor = BackgroundMonitor()
+    monitor.enqueue_message(BusMessage(id="large", content="x" * 20_000, source="worker", target="main"))
+    assert len(monitor._pending_messages) == 1
+    assert len(monitor._pending_messages[0].message.content) <= 16_000
+
+    agent_usages = {
+        f"agent-{index}": UsageAgentTotal(
+            agent_name=f"agent-{index}",
+            model_id=f"model-{index}",
+            usage=RunUsage(input_tokens=1, details={f"detail-{key}": 1 for key in range(100)}),
+        )
+        for index in range(70)
+    }
+    model_usages = {
+        f"model-{index}": RunUsage(input_tokens=1, details={f"detail-{key}": 1 for key in range(100)})
+        for index in range(70)
+    }
+    monitor.enqueue_usage_snapshot(
+        UsageSnapshot(
+            run_id="large-snapshot",
+            total_usage=RunUsage(input_tokens=70),
+            agent_usages=agent_usages,
+            model_usages=model_usages,
+        )
+    )
+
+    [snapshot] = monitor.drain_usage_snapshots()
+    assert len(snapshot.entries) == 0
+    assert len(snapshot.agent_usages) <= 64
+    assert len(snapshot.model_usages) <= 64
+    assert sum(usage.input_tokens for usage in snapshot.model_usages.values()) == 70
+    assert sum(entry.usage.input_tokens for entry in snapshot.agent_usages.values()) == 70
+    assert all(len(usage.details) <= 64 for usage in snapshot.model_usages.values())

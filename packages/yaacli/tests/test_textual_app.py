@@ -2553,8 +2553,8 @@ async def test_theme_slash_command_lists_switches_and_current() -> None:
     assert app._sink.theme_name == "cappuccino"
     assert app.theme == "catppuccin-mocha"
     # The RichLog surface follows the cappuccino base/text colors.
-    assert str(app._log.styles.background).startswith("Color(30, 30, 46")
-    assert str(app._log.styles.color).startswith("Color(205, 214, 244")
+    assert str(app._output_log.styles.background).startswith("Color(30, 30, 46")
+    assert str(app._output_log.styles.color).startswith("Color(205, 214, 244")
     # /theme current reports the active palette.
     assert "Catppuccin Mocha" in rendered
 
@@ -2575,7 +2575,7 @@ async def test_theme_slash_command_recolors_log_surface_back_on_revert() -> None
 
         await app._handle_command("/theme cappuccino")
         await pilot.pause(0.02)
-        cappuccino_bg = app._log.styles.background
+        cappuccino_bg = app._output_log.styles.background
 
         await app._handle_command("/theme tokyo-night")
         await pilot.pause(0.02)
@@ -2583,8 +2583,8 @@ async def test_theme_slash_command_recolors_log_surface_back_on_revert() -> None
         assert app.theme_name == "tokyo-night"
         assert app.theme == "tokyo-night"
         # Reverting must actually recolor the surface, not just flip the name.
-        assert app._log.styles.background != cappuccino_bg
-        assert str(app._log.styles.background).startswith("Color(17, 19, 26")
+        assert app._output_log.styles.background != cappuccino_bg
+        assert str(app._output_log.styles.background).startswith("Color(17, 19, 26")
 
 
 @pytest.mark.asyncio
@@ -3637,7 +3637,7 @@ def test_console_session_surfaces_encrypted_reasoning_without_summary() -> None:
         )
     )
 
-    assert sink.thinking == ["Reasoning was encrypted by the provider; no summary was returned."]
+    assert sink.thinking == ["● 正在思考 (Extended thinking 已加密)..."]
 
 
 @pytest.mark.asyncio
@@ -3702,7 +3702,7 @@ async def test_subagent_tool_calls_collapsed_into_single_block() -> None:
                 evt(
                     "sub1",
                     FunctionToolResultEvent(
-                        result=ToolReturnPart(
+                        part=ToolReturnPart(
                             tool_name="Read",
                             content="ok",
                             tool_call_id=f"t{i}",

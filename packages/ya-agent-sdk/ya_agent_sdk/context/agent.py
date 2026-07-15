@@ -258,6 +258,9 @@ class ModelCapability(StrEnum):
     video_url = "video_url"
     """Model supports receiving videos via URL."""
 
+    youtube_url = "youtube_url"
+    """Model supports receiving public YouTube videos directly by URL."""
+
     reasoning_required = "reasoning_required"
     """Provider requires assistant messages to include reasoning content."""
 
@@ -839,11 +842,21 @@ class ModelConfig(BaseModel):
 
     When set to a positive value, binary images whose *encoded* size would
     exceed this limit are compressed (converted to JPEG with reduced quality
-    and/or resized) before being sent to the model.  Set to 0 to disable
-    compression.
+    and/or resized) before being sent to the model. Set to 0 to disable only
+    the byte-size limit; ``max_image_dimension`` remains independently active.
+    Set both limits to 0 to disable image compression entirely.
 
     Default is 5 MB (5_242_880 bytes), matching the limit of most providers
     (e.g. Anthropic, GCP Vertex AI).
+    """
+
+    max_image_dimension: int = Field(default=8000, ge=0)
+    """Maximum allowed width or height in pixels for binary images.
+
+    Images with either dimension above this value are resized proportionally
+    before being sent to a model. Set to 0 to disable dimension-based resizing.
+    The default matches the 8,000-pixel limit enforced by Anthropic-compatible
+    APIs, including models accessed through Google Vertex AI.
     """
 
     split_large_images: bool = True
@@ -871,6 +884,11 @@ class ModelConfig(BaseModel):
     def has_video_understanding(self) -> bool:
         """Check if the model supports video understanding."""
         return ModelCapability.video_understanding in self.capabilities
+
+    @property
+    def has_youtube_url(self) -> bool:
+        """Check if the model supports receiving public YouTube videos directly by URL."""
+        return ModelCapability.youtube_url in self.capabilities
 
     @property
     def has_audio_understanding(self) -> bool:
@@ -1450,6 +1468,7 @@ class AgentContext(BaseModel):
         return {
             "session_id": session_id,
             "session-id": session_id,
+            "x-session-id": session_id,
             "thread_id": thread_id,
             "thread-id": thread_id,
             "x-client-request-id": thread_id,
@@ -2080,10 +2099,14 @@ class AgentContext(BaseModel):
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Exit the context and record end time."""
         self.end_at = datetime.now(UTC)
-        # For main agent: clear message bus on exit
-        # For subagents: unsubscribe to free cursor
+        # For main agent: clear message bus on exit only when there is no
+        # pending work. Late background notifications may arrive after the last
+        # output guard check; preserving unread messages lets the next turn
+        # consume them instead of losing them during context cleanup.
+        # For subagents: unsubscribe to free cursor.
         if self._agent_id == "main":
-            self.message_bus.clear()
+            if not self.message_bus.has_pending(self._agent_id):
+                self.message_bus.clear()
         else:
             self.message_bus.unsubscribe(self._agent_id)
         async with self._enter_lock:

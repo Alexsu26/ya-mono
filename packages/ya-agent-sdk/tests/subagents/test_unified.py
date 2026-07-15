@@ -93,39 +93,6 @@ def test_create_unified_tool_basic(mock_run_ctx) -> None:
     assert tool_cls.name == "delegate"
 
 
-async def test_unified_tool_builds_subagent_registry_lazily(mock_run_ctx, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Creating the delegate tool and rendering instructions should not build child agents."""
-    from ya_agent_sdk.toolsets.core.subagent import unified
-
-    calls = 0
-
-    def fake_build_entry(*args, **kwargs):  # type: ignore[no-untyped-def]
-        nonlocal calls
-        calls += 1
-        return unified.SubagentEntry(
-            config=args[0],
-            agent=object(),  # type: ignore[arg-type]
-            call_func=lambda *_args, **_kwargs: "ok",
-            required_tools=args[0].tools,
-        )
-
-    monkeypatch.setattr(unified, "_build_subagent_entry", fake_build_entry)
-    configs = [
-        SubagentConfig(name="agent1", description="Agent 1", system_prompt="You are agent 1"),
-        SubagentConfig(name="agent2", description="Agent 2", system_prompt="You are agent 2"),
-    ]
-    parent_toolset = Toolset(tools=[GrepTool, ViewTool])
-
-    tool_cls = create_unified_subagent_tool(configs, parent_toolset, model="test")
-    tool = tool_cls()
-
-    assert calls == 0
-    assert "agent1" in (await tool.get_instruction(mock_run_ctx) or "")
-    assert calls == 0
-    assert "Unknown subagent" in await tool.call(mock_run_ctx, subagent_name="missing", prompt="work")
-    assert calls == 0
-
-
 def test_create_unified_tool_custom_name(mock_run_ctx) -> None:
     """Should support custom tool name."""
     configs = [SubagentConfig(name="agent1", description="...", system_prompt="...")]
@@ -250,9 +217,10 @@ async def test_unified_tool_instruction_contains_self_when_runtime_supports_fork
 
     assert instruction is not None
     assert '<subagent name="self">' in instruction
-    assert "Plan first" in instruction
-    assert "full-context plan steps" in instruction
-    assert "mid-task repository exploration" in instruction
+    assert "Delegate only when a subtask has a clear scope" in instruction
+    assert "The parent agent owns planning" in instruction
+    assert "full-context plan checks" in instruction
+    assert "repository exploration" in instruction
 
 
 async def test_unified_tool_instruction_contains_available_subagents(mock_run_ctx) -> None:

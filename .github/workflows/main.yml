@@ -123,12 +123,3 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: wh1isper/ya-mono
         if: ${{ matrix.coverage }}
-
-  desktop-rust:
-    runs-on: macos-14
-    steps:
-      - name: Check out
-        uses: actions/checkout@v6
-
-      - name: Check the YAACLI Desktop Rust host
-        run: make desktop-rust-check

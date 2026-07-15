@@ -85,10 +85,11 @@ It's crucial that you respond by ONLY asking the user what you should work on ne
 You should NOT take any initiative or make any assumptions about continuing with work.
 Keep this response CONCISE and wrap your analysis in `analysis` and `context` fields to organize your thoughts and ensure you've covered all necessary points.
 
-IMPORTANT: If the message history contains any access to Skills (files in /skills/ directory, such as reading SKILL.md or using skill resources), you MUST include a reminder in the context to re-read the relevant skill documentation when resuming work."""
+IMPORTANT: If the message history shows that a Skill was activated and remains relevant to unfinished work, you MUST include a reminder in the context to re-read that Skill's documentation when resuming. A candidate Skill that was merely inspected or rejected was not activated and must not create a re-read requirement. Do not carry a merely inspected or rejected candidate's workflow, mandatory requirements, referenced-resource instructions, or proposed next steps into any continuation section; if historically relevant, record only that it was inspected and not activated."""
 
 CACHE_FRIENDLY_COMPACT_INSTRUCTION = """Generate a compact continuation summary for the conversation history.
 Return only the summary text. Do not call tools.
+Do not carry a merely inspected or rejected candidate's workflow, mandatory requirements, referenced-resource instructions, or proposed next steps into any continuation section; if historically relevant, record only that it was inspected and not activated.
 Use this exact Markdown structure:
 
 ## Condensed conversation summary
@@ -123,8 +124,8 @@ Use this exact Markdown structure:
 8. Past Interactions:
    - [Key interactions already completed, including actions and outcomes]
 
-9. Skills Documentation:
-   [If any /skills/ documentation was accessed, list the relevant skill files and remind the next agent to re-read them]
+9. Activated Skills:
+   [List only Skills that were activated and remain relevant to unfinished work, and remind the next agent to re-read them. Do not include Skills that were merely inspected or rejected as candidates.]
 
 10. Files to Inspect on Resume:
    [List only file paths that may need to be inspected when resuming. Do not include file contents.]
@@ -311,7 +312,7 @@ class CondenseResult(BaseModel):
     )
     context: str = Field(
         ...,
-        description="""The context to continue the conversation with. If applicable based on the current task, this should include:
+        description="""The context to continue the conversation with. Do not carry a merely inspected or rejected candidate's workflow, mandatory requirements, referenced-resource instructions, or proposed next steps into any continuation section; if historically relevant, record only that it was inspected and not activated. If applicable based on the current task, this should include:
 
 1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail
 2. Key Technical Concepts: List all important technical concepts, technologies, and frameworks discussed.
@@ -699,7 +700,9 @@ def create_compact_filter(
     Args:
         model: Model string or Model instance for the compact agent. Highest priority.
         model_settings: Optional model settings for the compact agent.
-        model_cfg: Model configuration for threshold checking.
+        model_cfg: Optional compact-specific ModelConfig override. When None,
+            threshold checks and compact-agent deps use the runtime context
+            model_cfg.
         main_model: Fallback model inherited from main agent. Lowest priority.
         main_model_settings: Fallback model settings inherited from main agent.
 
@@ -784,7 +787,7 @@ def create_compact_filter(
                     message_history=trimmed_history,
                     deps=AgentContext(
                         env=agent_ctx.env,
-                        model_cfg=model_cfg or ModelConfig(),
+                        model_cfg=model_cfg or agent_ctx.model_cfg,
                     ),
                 )
 

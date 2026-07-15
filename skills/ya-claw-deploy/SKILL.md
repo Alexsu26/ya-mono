@@ -13,16 +13,16 @@ Use the Docker workspace provider for production-like deployments. Choose the ex
 
 ```mermaid
 flowchart LR
-    CLIENT[Web/API Client] --> SVC[YA Claw Service]
-    SVC --> DB[(SQLite or PostgreSQL)]
-    SVC --> DATA[Persistent Data Dir]
-    SVC --> PROVIDER[WorkspaceProvider]
-    PROVIDER --> LOCAL[Local shell]
-    PROVIDER --> DOCKER[Docker shell]
-    DOCKER --> WSC[Reusable Workspace Container]
+    CLIENT["Web/API Client"] --> SVC["YA Claw Service"]
+    SVC --> DB[("SQLite or PostgreSQL")]
+    SVC --> DATA["Persistent Data Dir"]
+    SVC --> PROVIDER["WorkspaceProvider"]
+    PROVIDER --> LOCAL["Local shell"]
+    PROVIDER --> DOCKER["Docker shell"]
+    DOCKER --> WSC["Reusable Workspace Container"]
 ```
 
-The Docker shell shapes give agents an isolated workspace container with Python, Node.js, Chromium, `agent-browser`, `lark-cli`, and bundled workspace skills.
+The Docker shell shapes give agents an isolated workspace container with Python, Node.js, `lark-cli`, and bundled workspace skills.
 
 ## Start Here
 
@@ -33,9 +33,10 @@ Choose the deployment path:
 - Service local + Docker shell: read [`references/systemd.md`](references/systemd.md) and [`references/workspace-provider/service-local-docker-shell.md`](references/workspace-provider/service-local-docker-shell.md)
 - Service local + local shell: read [`references/workspace-provider/service-local-local-shell.md`](references/workspace-provider/service-local-local-shell.md)
 - SQLite or PostgreSQL storage: read [`references/database.md`](references/database.md)
-- Profile seeding: read [`references/profiles.md`](references/profiles.md)
+- Profile seeding, subscription-backed Codex profiles, shell review policy, and shell sandbox policy: read [`references/profiles.md`](references/profiles.md)
 - Bridge deployment: read [`references/bridge/overview.md`](references/bridge/overview.md) and [`references/bridge/lark.md`](references/bridge/lark.md)
 - Schedules and heartbeat: read [`references/schedules-heartbeat.md`](references/schedules-heartbeat.md)
+- Session agency: read [`references/agency.md`](references/agency.md)
 - Session/run pruning: read [`references/operations.md#session-and-run-pruning`](references/operations.md#session-and-run-pruning)
 - Health checks, backup, restore, upgrades, and troubleshooting: read [`references/operations.md`](references/operations.md)
 
@@ -59,8 +60,11 @@ Every deployment needs:
 - SQLite path: `~/.ya-claw/ya_claw.sqlite3`
 - run store: `~/.ya-claw/data/run-store`
 - workspace dir: `~/.ya-claw/data/workspace`
+- session agency: disabled by default; when enabled, inactivity scan runs after 600 seconds with 1800-second cooldown
 - session prune: disabled by default; safe disk-only mode keeps latest 10 runs per session when enabled
 - default profile: `default`
+- profile shell review threshold default: `extra_high`
+- local shell sandbox default: enabled, profile `workspace_write`, backend `auto`, network `full`, env allowlist `*`, raw host shell escalation requires explicit policy allowance
 - Docker workspace image: `ghcr.io/wh1isper/ya-claw-workspace:latest`
 - Docker service host bind: `0.0.0.0`
 - service build metadata: `YA_CLAW_SERVICE_VERSION`, `YA_CLAW_SERVICE_COMMIT`, `YA_CLAW_SERVICE_BUILD`, and `YA_CLAW_SERVICE_IMAGE`, exposed through `/api/v1/claw/info` and the web Overview page
@@ -77,6 +81,7 @@ Every deployment needs:
 08. Verify `/healthz`.
 09. Verify authenticated API or web shell access.
 10. Start a test session and confirm model credentials, workspace tools, and profile behavior.
+11. Enable session agency with `YA_CLAW_AGENCY_ENABLED=true` for deployments that want proactive agency rollout.
 
 ## Reference Routing
 
@@ -86,13 +91,14 @@ Every deployment needs:
 | Docker deployment         | [`references/docker.md`](references/docker.md)                                           | You deploy the YA Claw server as a Docker service                                                               |
 | Workspace provider matrix | [`references/workspace-provider/overview.md`](references/workspace-provider/overview.md) | You choose between service local + Docker shell, service Docker + Docker shell, and service local + local shell |
 | Docker workspace provider | [`references/workspace-provider/docker.md`](references/workspace-provider/docker.md)     | You configure Docker Engine access, path mapping, workspace mounts, and container reuse                         |
-| systemd                   | [`references/systemd.md`](references/systemd.md)                                         | You run YA Claw as a supervised host service                                                                    |
+| Host service              | [`references/systemd.md`](references/systemd.md)                                         | You run YA Claw as a supervised host service                                                                    |
 | Database                  | [`references/database.md`](references/database.md)                                       | You choose SQLite or PostgreSQL, migrate, backup, or restore storage                                            |
-| Profiles                  | [`references/profiles.md`](references/profiles.md)                                       | You seed profiles or manage AgentProfile configuration                                                          |
+| Profiles                  | [`references/profiles.md`](references/profiles.md)                                       | You seed profiles, manage AgentProfile configuration, tune shell review, or configure shell sandbox policy      |
 | Bridge overview           | [`references/bridge/overview.md`](references/bridge/overview.md)                         | You configure bridge dispatch, adapter enablement, and event-to-run routing                                     |
 | Lark bridge               | [`references/bridge/lark.md`](references/bridge/lark.md)                                 | You connect Lark/Feishu events to YA Claw                                                                       |
 | Bridge operations         | [`references/bridge/operations.md`](references/bridge/operations.md)                     | You verify embedded bridge startup, Lark ingress, dedupe, profiles, and workspace replies                       |
 | Schedules and heartbeat   | [`references/schedules-heartbeat.md`](references/schedules-heartbeat.md)                 | You configure cron schedules, heartbeat guidance, timer dispatchers, and timer operations                       |
+| Session agency            | [`references/agency.md`](references/agency.md)                                           | You configure proactive agency, agency signals, paired agency sessions, and agency operations                   |
 | Operations                | [`references/operations.md`](references/operations.md)                                   | You need health checks, logs, pruning, upgrades, backup, restore, or troubleshooting                            |
 
 When editing this skill inside the repository, keep `scripts/build-skill-zips.py` aligned so release artifacts include the canonical skill contents.

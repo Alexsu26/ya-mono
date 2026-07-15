@@ -50,6 +50,9 @@ from ya_agent_sdk.events import (
 )
 
 from yaacli.events import ContextUpdateEvent
+from yaacli.logging import get_logger
+
+logger = get_logger(__name__)
 
 HIDDEN_REASONING_NOTICE = "Reasoning was encrypted by the provider; no summary was returned."
 
@@ -89,7 +92,7 @@ class BlockSink(Protocol):
 def extract_tool_result_text(event: FunctionToolResultEvent) -> tuple[str, bool]:
     """Best-effort: get a string + error flag from a tool result event."""
     try:
-        content = event.result.content
+        content = event.part.content
     except AttributeError:
         return ("", False)
 
@@ -142,10 +145,36 @@ class ConsoleSession:
             self.handle(event)
 
     def handle(self, event: StreamEvent) -> None:
-        agent_id = getattr(event, "agent_id", "main") or "main"
-        msg = getattr(event, "event", None)
-        if msg is None:
-            return
+        """Handle a single stream event with enhanced error handling."""
+        msg: Any | None = None
+        try:
+            agent_id = getattr(event, "agent_id", "main") or "main"
+            msg = getattr(event, "event", None)
+
+            if msg is None:
+                logger.debug(f"Received event with no msg attribute: {type(event).__name__}")
+                return
+
+            # Log event for debugging (only in verbose mode)
+            logger.debug(
+                f"Event: agent={agent_id}, type={type(msg).__name__}, "
+                f"attrs={[k for k in dir(msg) if not k.startswith('_')][:5]}"
+            )
+
+            self._handle_event_internal(agent_id, msg)
+
+        except Exception:
+            # Catch all exceptions to prevent stream interruption
+            logger.exception("Error handling event %s", type(msg).__name__ if msg else "unknown")
+            # Notify user of the error but continue processing
+            try:
+                self.sink.show_breadcrumb("Event handling error; see log for details")
+            except Exception:
+                # If even breadcrumb fails, just log and continue
+                logger.exception("Failed to show error breadcrumb")
+
+    def _handle_event_internal(self, agent_id: str, msg: Any) -> None:
+        """Internal event handling logic (extracted for exception handling)."""
 
         # ---- Lifecycle: subagent start/complete are routed to the sink
         # regardless of which agent_id they came from (the SDK emits them
@@ -224,7 +253,9 @@ class ConsoleSession:
                 self.sink.handle_thinking_delta(msg.part.content)
                 self._saw_thinking = True
             elif _thinking_part_is_hidden(msg.part):
-                self.sink.handle_thinking_delta(HIDDEN_REASONING_NOTICE)
+                # Keep encrypted thinking visibly active so the stream does not appear stuck.
+                logger.debug("Encrypted thinking detected, showing notice")
+                self.sink.handle_thinking_delta("● 正在思考 (Extended thinking 已加密)...")
                 self._saw_thinking = True
             return
 

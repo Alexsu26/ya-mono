@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from pydantic_ai.usage import RunUsage
 from yaacli.usage import SessionUsage
 
@@ -127,6 +129,21 @@ class TestSessionUsage:
         assert "1,000" in summary  # Comma formatting
         assert "Total:" in summary
 
+    def test_grok_4_5_cost_estimate(self) -> None:
+        """Test Grok 4.5 local cost estimate in summary."""
+        session = SessionUsage()
+        session.add(
+            "main",
+            "xai:grok-4.5",
+            RunUsage(input_tokens=1_000_000, cache_read_tokens=200_000, output_tokens=100_000, requests=1),
+        )
+
+        summary = session.format_summary()
+
+        assert "Estimated Cost: $2.30" in summary
+        assert session.estimated_total_cost is not None
+        assert session.estimated_total_cost.total_cost == Decimal("2.30")
+
     def test_preserves_details(self) -> None:
         """Test that details field is accumulated."""
         session = SessionUsage()
@@ -223,3 +240,113 @@ def test_session_usage_replaces_uncommitted_run_snapshot() -> None:
     session.commit_run_snapshot()
     assert not session.has_run_snapshot
     assert session.total_requests == 3
+
+
+def test_session_usage_finalization_releases_replacement_metadata() -> None:
+    from ya_agent_sdk.usage import UsageAgentTotal, UsageSnapshot
+
+    usage = SessionUsage()
+    for index in range(140):
+        snapshot = UsageSnapshot(
+            run_id=f"run-{index}",
+            total_usage=RunUsage(input_tokens=1, output_tokens=2, requests=1),
+            agent_usages={
+                "main": UsageAgentTotal(
+                    agent_name="main",
+                    model_id="model-a",
+                    usage=RunUsage(input_tokens=1, output_tokens=2, requests=1),
+                )
+            },
+            model_usages={"model-a": RunUsage(input_tokens=1, output_tokens=2, requests=1)},
+        )
+        usage.set_run_snapshot(snapshot)
+        usage.commit_run_snapshot("run-" + str(index))
+
+    assert usage._run_snapshots == {}
+    assert len(usage._committed_run_contributions) == 140
+    assert usage.total_input_tokens == 140
+    assert usage.total_output_tokens == 280
+    assert usage.total_requests == 140
+
+    usage.finalize_run_snapshots()
+
+    assert usage._committed_run_contributions == {}
+    assert usage.total_input_tokens == 140
+    assert usage.total_output_tokens == 280
+    assert usage.total_requests == 140
+
+
+def test_session_usage_late_snapshot_replaces_contribution_after_more_than_128_commits() -> None:
+    from ya_agent_sdk.usage import UsageAgentTotal, UsageSnapshot
+
+    def snapshot(run_id: str, tokens: int) -> UsageSnapshot:
+        run_usage = RunUsage(input_tokens=tokens)
+        return UsageSnapshot(
+            run_id=run_id,
+            total_usage=run_usage,
+            agent_usages={"main": UsageAgentTotal(agent_name="main", model_id="model-a", usage=run_usage)},
+            model_usages={"model-a": run_usage},
+        )
+
+    usage = SessionUsage()
+    usage.set_run_snapshot(snapshot("target", 10))
+    usage.commit_run_snapshot("target")
+    for index in range(129):
+        run_id = f"other-{index}"
+        usage.set_run_snapshot(snapshot(run_id, 1))
+        usage.commit_run_snapshot(run_id)
+        usage.finalize_run_snapshots(run_id)
+
+    usage.set_run_snapshot(snapshot("target", 25))
+    usage.commit_run_snapshot("target")
+
+    assert usage.total_input_tokens == 25 + 129
+
+
+def test_session_usage_late_snapshot_replaces_recent_committed_contribution() -> None:
+    from ya_agent_sdk.usage import UsageAgentTotal, UsageSnapshot
+
+    usage = SessionUsage()
+    first = UsageSnapshot(
+        run_id="run-1",
+        total_usage=RunUsage(input_tokens=10),
+        agent_usages={"main": UsageAgentTotal(agent_name="main", model_id="model-a", usage=RunUsage(input_tokens=10))},
+        model_usages={"model-a": RunUsage(input_tokens=10)},
+    )
+    updated = UsageSnapshot(
+        run_id="run-1",
+        total_usage=RunUsage(input_tokens=25),
+        agent_usages={"main": UsageAgentTotal(agent_name="main", model_id="model-a", usage=RunUsage(input_tokens=25))},
+        model_usages={"model-a": RunUsage(input_tokens=25)},
+    )
+    usage.set_run_snapshot(first)
+    usage.commit_run_snapshot()
+    usage.set_run_snapshot(updated)
+    usage.commit_run_snapshot()
+
+    assert usage._run_snapshots == {}
+    assert usage.total_input_tokens == 25
+
+
+def test_session_usage_clear_late_replacement_restores_committed_total() -> None:
+    from ya_agent_sdk.usage import UsageAgentTotal, UsageSnapshot
+
+    def snapshot(tokens: int) -> UsageSnapshot:
+        return UsageSnapshot(
+            run_id="run-1",
+            total_usage=RunUsage(input_tokens=tokens),
+            agent_usages={
+                "main": UsageAgentTotal(agent_name="main", model_id="model-a", usage=RunUsage(input_tokens=tokens))
+            },
+            model_usages={"model-a": RunUsage(input_tokens=tokens)},
+        )
+
+    usage = SessionUsage()
+    usage.set_run_snapshot(snapshot(10))
+    usage.commit_run_snapshot()
+    usage.set_run_snapshot(snapshot(20))
+    assert usage.total_input_tokens == 20
+
+    usage.clear_run_snapshot()
+    assert usage.total_input_tokens == 10
+    assert usage._run_snapshots == {}
