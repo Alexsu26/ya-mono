@@ -14,13 +14,20 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from rich.box import ROUNDED
 from rich.console import Group, RenderableType
+from rich.padding import Padding
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 from yaacli.console.blocks.base import BaseBlock, BlockKind
-from yaacli.console.design import compact_meta, timeline_line, truncate_cells
+from yaacli.console.design import GUTTER_WIDTH, truncate_cells
 from yaacli.console.glyphs import GLYPHS, SPINNER_FRAMES
+
+# How many lines of tool output to preview inside the card body.
+_PREVIEW_LINES = 6
+_PREVIEW_LINE_LEN = 110
 
 _MAX_ARG_LEN = 80
 _MAX_RESULT_LEN = 100
@@ -315,65 +322,75 @@ class ToolCallBlock(BaseBlock):
             width=max(40, min(width - 2, 120)),
         )
 
-    def render(self, width: int, *, frame: int = 0) -> RenderableType:
-        lname = self.name.lower()
-        meta: list[str] = [f"{self.duration:.1f}s"]
+    def _status_parts(self, *, frame: int) -> tuple[str, str, str]:
+        """Return ``(marker, status_label, status_style)`` for the header."""
+        if not self.is_terminal():
+            return SPINNER_FRAMES[frame % len(SPINNER_FRAMES)], "running", "console.state.running"
+        if self.error:
+            return GLYPHS.CROSS, "failed", "console.state.error"
+        return GLYPHS.CHECK, "done", "console.state.success"
+
+    def _header_row(self, width: int, *, frame: int) -> Table:
+        """The card's top row: ``<name>  <arg>            <status>  <dur>``."""
+        marker, status, status_style = self._status_parts(frame=frame)
         summary = summarize_args(self.name, self.args)
-        status = "running"
-        status_style = "console.state.running"
-        marker = ""
-        if self.is_terminal():
-            if self.error:
-                status = "failed"
-                status_style = "console.state.error"
-                marker = GLYPHS.CROSS
-            else:
-                status = "done"
-                status_style = "console.state.success"
-                marker = GLYPHS.CHECK
 
-        if self.is_terminal():
-            if lname in _SHELL_TOOL_NAMES:
-                exit_code = _shell_exit_code(self.result)
-                cwd = _shell_cwd(self.args, self.result)
-                stdout, stderr = _shell_streams(self.result)
-                if exit_code is not None:
-                    meta.append(f"exit {exit_code}")
-                if cwd:
-                    meta.append(f"cwd {truncate_cells(cwd, 18)}")
-                meta.append(f"out {_line_count(stdout)}L")
-                if stderr.strip() or self.error:
-                    meta.append(f"err {_line_count(stderr)}L")
-            result_summary = summarize_result(self.name, self.result, error=self.error)
-            structured_shell_result = lname in _SHELL_TOOL_NAMES and _parse_json_mapping(self.result) is not None
-            summary = (
-                truncate_cells(summary, 26)
-                if structured_shell_result
-                else truncate_cells(compact_meta([summary, result_summary]), 72)
-            )
-            line = timeline_line(
-                label=f"tool {self.name}",
-                status=status,
-                meta=meta,
-                summary=summary,
-                marker=marker,
-                label_style="console.tool.name",
-                status_style=status_style,
-            )
-            if self.expanded:
-                return Group(line, self._render_details(width))
-            return line
+        right = Text()
+        right.append(f"{marker} ", style=status_style)
+        right.append(status, style=status_style)
+        right.append(f"  {self.duration:.1f}s", style="console.tool.duration")
 
-        # In-flight: explicit frame-driven spinner. Rich's Spinner uses its own
-        # clock, which is awkward once active tools are re-rendered into RichLog
-        # strips. The TUI sink drives this frame so transcript and status spinners
-        # stay visually consistent.
-        return timeline_line(
-            label=f"tool {self.name}",
-            status=status,
-            meta=meta,
-            summary=truncate_cells(summary, 64),
-            marker=SPINNER_FRAMES[frame % len(SPINNER_FRAMES)],
-            label_style="console.tool.name",
-            status_style=status_style,
+        left = Text()
+        left.append(self.name, style="console.tool.name")
+        if summary:
+            left.append("  ", style="console.tool.duration")
+            left.append(truncate_cells(summary, max(12, width - 30)), style="console.tool.arg")
+
+        row = Table.grid(expand=True)
+        row.add_column(justify="left", ratio=1)
+        row.add_column(justify="right", no_wrap=True)
+        row.add_row(left, right)
+        return row
+
+    def _preview_body(self) -> Text | None:
+        """A short, line-numbered output preview for the card body."""
+        if not self.is_terminal():
+            return None
+        text = self.output_text().strip("\n")
+        if not text.strip():
+            return None
+        lines = text.splitlines()
+        shown = lines[:_PREVIEW_LINES]
+        body = Text()
+        result_style = "console.state.error" if self.error else "console.tool.result"
+        for index, raw in enumerate(shown):
+            if index:
+                body.append("\n")
+            body.append(f"{index + 1:>3} ", style="console.tool.duration")
+            body.append(truncate_cells(raw, _PREVIEW_LINE_LEN), style=result_style)
+        hidden = len(lines) - len(shown)
+        if hidden > 0:
+            body.append(f"\n    … +{hidden} lines · ctrl-o for details", style="console.tool.tag")
+        return body
+
+    def render(self, width: int, *, frame: int = 0) -> RenderableType:
+        card_width = max(32, min(width - GUTTER_WIDTH, 118))
+        parts: list[RenderableType] = [self._header_row(card_width - 2, frame=frame)]
+
+        if self.expanded:
+            parts.append(self._render_details(card_width))
+        else:
+            preview = self._preview_body()
+            if preview is not None:
+                parts.append(preview)
+
+        border_style = "console.state.error" if (self.is_terminal() and self.error) else "console.code.border"
+        card = Panel(
+            Group(*parts) if len(parts) > 1 else parts[0],
+            box=ROUNDED,
+            border_style=border_style,
+            padding=(0, 1),
+            width=card_width,
         )
+        # Indent the whole card under the unified block gutter.
+        return Padding(card, (0, 0, 0, GUTTER_WIDTH))

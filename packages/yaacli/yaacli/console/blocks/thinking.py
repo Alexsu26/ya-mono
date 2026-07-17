@@ -7,12 +7,12 @@ from dataclasses import dataclass, field
 from rich.console import Group, RenderableType
 
 from yaacli.console.blocks.base import BaseBlock, BlockKind
-from yaacli.console.design import rail_text, turn_header
+from yaacli.console.design import block_body_text, block_header
 
 
 @dataclass
 class ThinkingBlock(BaseBlock):
-    """Reasoning text. Always dim, always gutter-prefixed."""
+    """Reasoning text. Always dim, always gutter-aligned."""
 
     chunks: list[str] = field(default_factory=list)
 
@@ -29,15 +29,14 @@ class ThinkingBlock(BaseBlock):
 
     def render(self, width: int) -> RenderableType:
         return Group(
-            turn_header(
-                "◇",
+            block_header(
+                "●",
                 "thinking",
-                glyph_style="console.text.muted",
+                dot_style="console.text.muted",
                 label_style="console.text.muted",
             ),
-            rail_text(
+            block_body_text(
                 self.text,
-                rail_style="console.thinking.gutter",
                 body_style="console.thinking.text",
             ),
         )

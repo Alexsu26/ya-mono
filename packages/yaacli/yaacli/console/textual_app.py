@@ -80,7 +80,14 @@ from yaacli.console.discovery import (
 )
 from yaacli.console.glyphs import GLYPHS, SPINNER_FRAMES
 from yaacli.console.header import HeaderInfo
-from yaacli.console.theme import DEFAULT_THEME_NAME, build_theme, get_theme, list_themes, theme_exists
+from yaacli.console.theme import (
+    DEFAULT_THEME_NAME,
+    build_textual_theme,
+    build_theme,
+    get_theme,
+    list_themes,
+    theme_exists,
+)
 from yaacli.console.transcript import TranscriptStore, new_session_id
 from yaacli.console.widgets import (
     FooterHint,
@@ -482,6 +489,15 @@ class TextualSink:
         """Render through themed Console and push to the RichLog."""
         self._pop_active_operations_render()
         self._resync_width()
+        # Blank separator between blocks so user / thinking / assistant / tool
+        # regions read as distinct cards instead of one dense wall of text.
+        # Consecutive breadcrumbs stay tight (they are terse one-liners), but a
+        # breadcrumb following a real block still gets air above it.
+        if self._history_entries:
+            prev_kind = self._history_entries[-1].kind
+            consecutive_breadcrumbs = kind == "breadcrumb" and prev_kind == "breadcrumb"
+            if not consecutive_breadcrumbs:
+                self._log.write(Text(""), width=self.width)
         before = len(self._log.lines)
         segments = list(self._render_console.render(renderable))
         self._log.write(Segments(segments), width=self.width)
@@ -1157,23 +1173,29 @@ class YaacliTextualApp(App[None]):
 
     CSS = """
     Screen {
-        background: #11131a;
+        background: $background;
     }
     #log, #tool_details {
         height: 1fr;
         border: none;
         padding: 1 2;
-        background: #11131a;
-        color: #d8dee9;
+        background: $background;
+        color: $foreground;
         overflow-x: hidden;
         overflow-y: auto;
         scrollbar-size-vertical: 1;
+        scrollbar-color: $border-blurred;
+        scrollbar-color-hover: $primary 60%;
+        scrollbar-color-active: $primary;
+        scrollbar-background: $background;
+        scrollbar-background-hover: $background;
+        scrollbar-background-active: $background;
     }
     #input_chrome {
         dock: bottom;
         height: auto;
         padding: 0;
-        background: #1e1e2e;
+        background: $background;
         border: none;
     }
     #input_chrome > StatusBar,
@@ -1184,31 +1206,38 @@ class YaacliTextualApp(App[None]):
         margin: 0 2 0 2;
         margin-bottom: 0;
     }
+    /* Composer follows the Claude Code style: two horizontal rules (top +
+       bottom), no side borders, no rounded corners, and the same background as
+       the canvas so the input reads as an open band rather than a floating box.
+       The rules brighten to the accent on focus. */
     #prompt_composer {
         height: auto;
-        min-height: 3;
+        min-height: 1;
         margin: 0 2 0 2;
-        background: #0f1018;
-        border: none;
-        padding: 0 1;
+        background: $background;
+        border-top: solid $border-blurred;
+        border-bottom: solid $border-blurred;
+        padding: 0;
     }
-    #prompt_composer.rounded {
-        border: round #34384c;
+    #prompt_composer:focus-within {
+        border-top: solid $primary;
+        border-bottom: solid $primary;
     }
     #prompt_mark {
         width: 2;
-        height: 3;
-        padding: 1 0 0 0;
-        background: #0f1018;
-        color: #b4befe;
+        height: 1;
+        padding: 0;
+        background: $background;
+        color: $primary;
         text-style: bold;
     }
-    #prompt_composer > PromptArea,
-    #prompt_composer > FooterHint {
-        dock: none;
-    }
     #prompt_composer > PromptArea {
+        dock: none;
         width: 1fr;
+        background: $background;
+    }
+    #input_chrome > FooterHint {
+        margin: 0 3 0 3;
     }
     """
 
@@ -1276,6 +1305,13 @@ class YaacliTextualApp(App[None]):
         self._search_matches: list[int] = []
         self._search_match_index: int = -1
         self._tool_details_active: bool = False
+
+        # Register a synthesized Textual theme for every console theme and make
+        # the active one current *before* CSS is parsed, so the built-in design
+        # tokens the stylesheet references ($background/$surface/$primary/…)
+        # resolve to this palette. Chrome then follows the console palette on
+        # every theme switch.
+        self._register_console_themes()
 
         # Widgets — composed in compose()
         self._header = HeaderBar()
@@ -1369,7 +1405,7 @@ class YaacliTextualApp(App[None]):
             with Horizontal(id="prompt_composer"):
                 yield Static("›", id="prompt_mark")  # noqa: RUF001
                 yield self._input
-                yield self._footer
+            yield self._footer
 
     def on_mount(self) -> None:
         # Apply the active theme to both the Textual widget chrome and the
@@ -1422,11 +1458,8 @@ class YaacliTextualApp(App[None]):
         self._sync_completion_menu_offsets()
 
     def _sync_composer_shape(self) -> None:
-        try:
-            composer = self.query_one("#prompt_composer")
-            composer.set_class((self.size.height or 0) >= 14, "rounded")
-        except Exception:
-            logger.debug("Could not update composer shape", exc_info=True)
+        # The composer is now always a rounded card (see CSS); nothing to toggle.
+        return
 
     def _sync_composer_hint_width(self) -> None:
         width = self.size.width or 80
@@ -1875,6 +1908,7 @@ class YaacliTextualApp(App[None]):
         try:
             self._status.context_pct = pct
             self._footer.context_pct = pct
+            self._refresh_header()
         except Exception:
             logger.debug("Could not update context status", exc_info=True)
 
@@ -2892,7 +2926,12 @@ class YaacliTextualApp(App[None]):
     # ---------------- header ----------------
 
     def _refresh_header(self) -> None:
-        self._header.info = HeaderInfo.gather(self._cwd, self._model_name)
+        info = HeaderInfo.gather(self._cwd, self._model_name)
+        # Feed the live context usage into the header's right cluster so the
+        # mini context bar reflects the same value as the status row.
+        if self._current_context_tokens > 0 and self._context_window_size > 0:
+            info.context_pct = self._current_context_tokens / self._context_window_size * 100
+        self._header.info = info
 
     def _short_model_label(self) -> str:
         """Return a short version of the model name for the footer.
@@ -3072,16 +3111,35 @@ class YaacliTextualApp(App[None]):
         hardcodes the default base, so we recolor those surfaces here too.
         """
         theme = get_theme(self._theme_name)
-        textual_theme = theme.textual_theme
-        if textual_theme:
-            try:
-                self.theme = textual_theme
-            except Exception:
-                logger.debug("Could not set Textual theme %s", textual_theme, exc_info=True)
+        # Drive all chrome (header, footer, composer, scrollbars, focus borders)
+        # through the synthesized theme's design tokens, so switching themes
+        # recolors the whole UI with no stranded hardcoded colors.
+        synth_name = f"yaacli-{theme.name}"
+        try:
+            self.theme = synth_name
+        except Exception:
+            logger.debug("Could not apply synthesized Textual theme %s", synth_name, exc_info=True)
         self._output_log.styles.background = theme.base
         self._output_log.styles.color = theme.text
         self._tool_details.styles.background = theme.base
         self._tool_details.styles.color = theme.text
+
+    def _register_console_themes(self) -> None:
+        """Register a synthesized Textual theme for every console theme and set
+        the active one current, so built-in CSS variables resolve at parse."""
+        for name in list_themes():
+            synth_name = f"yaacli-{name}"
+            if synth_name not in self.available_themes:
+                try:
+                    self.register_theme(build_textual_theme(name))  # type: ignore[arg-type]
+                except Exception:
+                    logger.debug("Could not register synthesized theme %s", synth_name, exc_info=True)
+        active = f"yaacli-{self._theme_name}"
+        if active in self.available_themes:
+            try:
+                self.theme = active
+            except Exception:
+                logger.debug("Could not set initial theme %s", active, exc_info=True)
 
     @property
     def theme_name(self) -> str:

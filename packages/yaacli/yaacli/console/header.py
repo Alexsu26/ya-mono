@@ -64,30 +64,65 @@ def _git_state(cwd: Path) -> tuple[str | None, bool]:
         return None, False
 
 
-def render_header(info: HeaderInfo) -> RenderableType:
-    line1 = Text()
-    line1.append(truncate_cells(_pretty_cwd(info.cwd), 42), style="console.header.path")
-    if info.branch:
-        line1.append("  git ", style="console.header.branch")
-        line1.append(truncate_cells(info.branch, 18), style="console.header.branch")
-        line1.append(
-            "*" if info.dirty else "",
-            style="console.header.dirty" if info.dirty else "console.header.branch",
-        )
-    if info.model:
-        line1.append("  model ", style="console.header.branch")
-        line1.append(truncate_cells(info.model, 34), style="console.header.model")
+_DIV = "  │  "
 
-    if info.context_pct is not None or info.cost_str:
-        line2 = Text()
+
+def _mini_bar(pct: float, *, cells: int = 8) -> str:
+    """A tiny unicode progress bar for context usage."""
+    pct = max(0.0, min(100.0, pct))
+    filled = round(pct / 100 * cells)
+    return "█" * filled + "░" * (cells - filled)
+
+
+def render_header(info: HeaderInfo, *, width: int = 0) -> RenderableType:
+    """Segmented status line: path │ ⑂ branch │ ◆ model … [ctx bar] pct · cost.
+
+    The left cluster (path / branch / model) is separated by dim ``│`` rules;
+    the right cluster (context bar + cost) is padded flush to the right edge
+    when a width is supplied.
+    """
+    left = Text()
+    left.append(truncate_cells(_pretty_cwd(info.cwd), 40), style="console.header.path")
+    if info.branch:
+        left.append(_DIV, style="console.header.divider")
+        left.append("⑂ ", style="console.header.icon")
+        left.append(truncate_cells(info.branch, 20), style="console.header.branch")
+        if info.dirty:
+            left.append(" •", style="console.header.dirty")
+    if info.model:
+        left.append(_DIV, style="console.header.divider")
+        left.append("◆ ", style="console.header.icon")
+        left.append(truncate_cells(info.model, 34), style="console.header.model")
+
+    right = Text()
+    if info.context_pct is not None:
+        style = "console.header.ctx"
+        if info.context_pct > 85:
+            style = "console.state.error"
+        elif info.context_pct >= 70:
+            style = "console.state.warning"
+        right.append(_mini_bar(info.context_pct), style=style)
+        right.append(f" {info.context_pct:.0f}%", style="console.header.cost")
+    if info.cost_str:
         if info.context_pct is not None:
-            line2.append(f"{info.context_pct:.0f}% used", style="console.header.cost")
-        if info.cost_str:
-            if info.context_pct is not None:
-                line2.append(" · ", style="console.header.cost")
-            line2.append(info.cost_str, style="console.header.cost")
-        return Text("\n").join([line1, line2])
-    return line1
+            right.append("  ·  ", style="console.header.divider")
+        right.append(info.cost_str, style="console.header.cost")
+
+    if width <= 0 or not right.plain:
+        if right.plain:
+            left.append(_DIV, style="console.header.divider")
+            left.append_text(right)
+        return left
+
+    gap = width - left.cell_len - right.cell_len
+    if gap < 2:
+        # Not enough room — drop the right cluster onto the same line tightly.
+        left.append("  ", style="console.header.divider")
+        left.append_text(right)
+        return left
+    left.append(" " * gap)
+    left.append_text(right)
+    return left
 
 
 def _pretty_cwd(path: Path) -> str:

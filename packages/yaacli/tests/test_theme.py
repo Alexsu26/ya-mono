@@ -6,9 +6,12 @@ from rich.theme import Theme
 from yaacli.console import theme as theme_mod
 from yaacli.console.theme import (
     CAPPUCCINO,
+    DAYBREAK,
     DEFAULT_THEME_NAME,
+    NORD_MUTED,
     THEMES,
     TOKYO_NIGHT,
+    active_code_syntax_theme,
     build_theme,
     get_theme,
     list_themes,
@@ -26,6 +29,7 @@ _HISTORICAL_DEFAULT_STYLES: dict[str, str] = {
     "console.text.muted": "#6f778a",
     "console.border.subtle": "#3b4252",
     "console.border.active": "#7aa2f7",
+    "console.accent": "#7aa2f7",
     "console.accent.user": "bold #c099ff",
     "console.accent.assistant": "bold #7dcfff",
     "console.accent.tool": "bold #89ddff",
@@ -53,7 +57,7 @@ _HISTORICAL_DEFAULT_STYLES: dict[str, str] = {
     "console.dot.warning": "#e0af68",
     "console.lbar": "#3b4252",
     "console.user": "bold #c099ff",
-    "console.tool.name": "bold #89ddff",
+    "console.tool.name": "bold #d8dee9",
     "console.tool.arg": "#aeb6c8",
     "console.tool.result": "#d8dee9",
     "console.tool.duration": "#6f778a",
@@ -79,10 +83,13 @@ _HISTORICAL_DEFAULT_STYLES: dict[str, str] = {
     "console.mode.act": "bold green",
     "console.mode.plan": "bold blue",
     "console.header.path": "bold #d8dee9",
-    "console.header.branch": "#6f778a",
+    "console.header.branch": "#aeb6c8",
     "console.header.dirty": "#e0af68",
-    "console.header.model": "bold #aeb6c8",
+    "console.header.model": "#aeb6c8",
     "console.header.cost": "#6f778a",
+    "console.header.divider": "#3b4252",
+    "console.header.icon": "#6f778a",
+    "console.header.ctx": "#7aa2f7",
     "console.footer.hint": "#6f778a",
     "console.footer.key": "bold",
     "console.footer.ready": "#9ece6a",
@@ -90,6 +97,15 @@ _HISTORICAL_DEFAULT_STYLES: dict[str, str] = {
     "console.system.title": "bold #9aa5ce",
     "console.system.frame": "#3b4252",
     "console.breadcrumb": "#6f778a italic",
+    "markdown.code": "#aeb6c8",
+    "markdown.code_block": "#aeb6c8",
+    "markdown.link": "#7aa2f7",
+    "markdown.link_url": "#6f778a",
+    "markdown.item.bullet": "bold #7aa2f7",
+    "markdown.h1": "bold #d8dee9",
+    "markdown.h2": "bold #d8dee9",
+    "markdown.h3": "bold #c7d3f5",
+    "markdown.h4": "bold #c7d3f5",
 }
 
 
@@ -109,18 +125,21 @@ def test_console_styles_module_global_matches_default_theme() -> None:
 def test_build_theme_no_arg_returns_default() -> None:
     theme = build_theme()
     assert isinstance(theme, Theme)
-    # Rich parses token strings into Style objects; check the resolved color.
-    assert "#7dcfff" in str(theme.styles["console.dot.running"].color)
+    # Default is now graphite: assistant/running accent is the indigo brand color.
+    assert "#7c9cf5" in str(theme.styles["console.dot.running"].color)
     # Named theme produces a different resolved color than the default.
     cappuccino = build_theme("cappuccino")
     assert "#94e2d5" in str(cappuccino.styles["console.dot.running"].color)
 
 
 def test_registry_exposes_default_and_cappuccino() -> None:
-    assert DEFAULT_THEME_NAME == "tokyo-night"
-    assert set(list_themes()) == {"tokyo-night", "cappuccino"}
+    assert DEFAULT_THEME_NAME == "graphite"
+    assert set(list_themes()) == {"graphite", "tokyo-night", "cappuccino", "nord-muted", "daybreak"}
+    assert theme_exists("graphite")
     assert theme_exists("tokyo-night")
     assert theme_exists("cappuccino")
+    assert theme_exists("nord-muted")
+    assert theme_exists("daybreak")
     assert not theme_exists("nope")
 
 
@@ -161,3 +180,50 @@ def test_each_theme_pairs_with_a_textual_theme() -> None:
     assert TOKYO_NIGHT.textual_theme == "tokyo-night"
     assert CAPPUCCINO.textual_theme == "catppuccin-mocha"
     assert all(theme.textual_theme for theme in THEMES.values())
+
+
+def test_nord_muted_uses_low_saturation_frost_palette() -> None:
+    """Nord Muted maps its semantic roles onto the desaturated Nord palette."""
+    styles = theme_mod._styles_for(NORD_MUTED)
+
+    # Single frost-blue accent drives focus / active border / assistant.
+    assert NORD_MUTED.accent == "#8fbcdb"
+    assert NORD_MUTED.accent_assistant == "#8fbcdb"
+    assert styles["console.border.active"] == "#8fbcdb"
+    assert styles["console.accent.assistant"] == "bold #8fbcdb"
+    # Warm sand for the user, frost teal for tools.
+    assert styles["console.accent.user"] == "bold #ebcb8b"
+    assert styles["console.accent.tool"] == "bold #88c0d0"
+    # Aurora status colors.
+    assert styles["console.state.success"] == "#a3be8c"
+    assert styles["console.state.error"] == "#bf616a"
+    # Dark syntax theme for a dark canvas.
+    assert NORD_MUTED.code_syntax_theme == "nord"
+
+
+def test_daybreak_is_a_light_theme_with_light_syntax() -> None:
+    """Daybreak is a paper-white theme; its code fences stay light."""
+    styles = theme_mod._styles_for(DAYBREAK)
+
+    # Near-white canvas, ink text.
+    assert DAYBREAK.base == "#ffffff"
+    assert styles["console.text.primary"] == "#1f2328"
+    # GitHub blue accent; AA-dark semantic colors for a light background.
+    assert styles["console.border.active"] == "#0969da"
+    assert styles["console.state.success"] == "#1a7f37"
+    assert styles["console.state.error"] == "#cf222e"
+    # Light code fence surface + light syntax theme so blocks don't invert.
+    assert styles["console.code.bg"] == "#f6f8fa"
+    assert DAYBREAK.code_syntax_theme == "github-light"
+    assert DAYBREAK.textual_theme == "textual-light"
+
+
+def test_build_theme_updates_active_code_syntax_theme() -> None:
+    """The active Syntax code theme tracks the most recently built console theme."""
+    build_theme("daybreak")
+    assert active_code_syntax_theme() == "github-light"
+    build_theme("nord-muted")
+    assert active_code_syntax_theme() == "nord"
+    # Restore the default so test order can't leak the light syntax theme.
+    build_theme()
+    assert active_code_syntax_theme() == get_theme(DEFAULT_THEME_NAME).code_syntax_theme

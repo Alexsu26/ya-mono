@@ -144,7 +144,7 @@ class DisplayConfig(BaseModel):
     code_theme: Literal["dark", "light"] = "dark"
     """Code highlighting theme."""
 
-    theme: str = "tokyo-night"
+    theme: str = "graphite"
     """Console color theme name. Unknown values fall back to the default theme."""
 
     max_tool_result_lines: int = 5

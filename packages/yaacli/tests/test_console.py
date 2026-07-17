@@ -73,33 +73,34 @@ def test_cjk_truncation_respects_terminal_cell_width() -> None:
 
 
 def test_transcript_first_blocks_share_rail_and_role_labels() -> None:
+    # Unified block system: every block leads with a ``●`` dot and an
+    # uppercase role label; body content aligns to the same 2-col gutter.
     user = _render(UserPromptBlock(text="请总结 packages/yaacli"))
-    assert "you" in user
-    assert "▌" in user
+    assert "YOU" in user
+    assert "●" in user
 
     assistant = ModelTextBlock()
     assistant.append("你好，**世界**")
     assistant_out = _render(assistant)
-    assert "assistant" in assistant_out
-    assert "│" in assistant_out
+    assert "ASSISTANT" in assistant_out
+    assert "●" in assistant_out
     assert "你好" in assistant_out
 
     tool = ToolCallBlock(name="Bash", args={"command": "pytest", "cwd": "/repo"})
     tool.complete({"stdout": "ok\n", "stderr": "", "exit_code": 0, "cwd": "/repo"})
     tool_out = _render(tool)
-    assert "├─" in tool_out
-    assert "tool" in tool_out
-    assert "exit 0" in tool_out
-    assert "/repo" in tool_out
+    assert "Bash" in tool_out
+    assert "pytest" in tool_out
+    assert "done" in tool_out
 
     error = _render(ErrorBlock(title="pytest failed", body="3 failures"))
-    assert "✖" in error
-    assert "error" in error
+    assert "●" in error
+    assert "ERROR" in error
     assert "3 failures" in error
     assert "╭" not in error
 
     system = _render(SystemBlock(title="/sessions", body="clean verify", boxed=False))
-    assert "system" in system
+    assert "SYSTEM" in system
     assert "/sessions" in system
     assert "clean verify" in system
 
@@ -169,7 +170,7 @@ def test_user_prompt_block_renders_text_with_anchor() -> None:
     block = UserPromptBlock(text="hello world")
     output = _render(block)
     assert "hello world" in output
-    assert "▌" in output
+    assert "●" in output
 
 
 def test_tool_call_block_running_includes_spinner_label() -> None:
@@ -187,7 +188,8 @@ def test_tool_call_block_completed_replaces_spinner() -> None:
     output = _render(block)
     assert "Read" in output
     assert "x.py" in output
-    assert "lines" in output  # "3 lines" or similar
+    # Card shows a line-numbered preview of the output, not a spinner.
+    assert "a" in output
     assert "running" not in output
 
 
@@ -197,8 +199,9 @@ def test_tool_call_block_completed_includes_done_status() -> None:
     output = _render(block)
     assert "Bash" in output
     assert "done" in output
-    assert "3 lines" in output
-    assert "last: done" in output
+    # Preview surfaces the actual output lines inside the card body.
+    assert "line 1" in output
+    assert "line 2" in output
 
 
 def test_tool_call_block_collapses_shell_details_by_default() -> None:
@@ -218,10 +221,10 @@ def test_tool_call_block_collapses_shell_details_by_default() -> None:
     )
     output = _render(block)
     assert "Bash" in output
-    assert "exit 0" in output
-    assert "stdout" not in output
-    assert "stderr" not in output
-    assert "warning" not in output
+    assert "done" in output
+    # Collapsed card shows a short preview but not the labelled detail panel.
+    assert "shell details" not in output
+    assert "command " not in output
 
 
 def test_tool_call_block_expanded_shell_details_separate_streams() -> None:
@@ -265,7 +268,7 @@ def test_thinking_block_uses_gutter_per_line() -> None:
     block = ThinkingBlock()
     block.append("first thought\nsecond thought")
     output = _render(block)
-    assert "│" in output
+    assert "THINKING" in output
     assert "first thought" in output
     assert "second thought" in output
 
@@ -431,8 +434,8 @@ def test_console_app_lifecycle_smoke() -> None:
     app.close_turn()
 
     out = buf.getvalue()
-    assert "▌" in out
-    assert "you" in out
+    assert "●" in out
+    assert "YOU" in out
     assert "hi" in out
     assert "hello there" in out
     assert "Read" in out

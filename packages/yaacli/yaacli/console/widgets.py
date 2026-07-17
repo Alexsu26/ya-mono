@@ -21,7 +21,7 @@ from textual.widgets import Static, TextArea
 from yaacli.console.design import pad_cells, truncate_cells
 from yaacli.console.glyphs import GLYPHS, SPINNER_FRAMES
 from yaacli.console.header import HeaderInfo, render_header
-from yaacli.console.theme import build_theme
+from yaacli.console.theme import active_theme_name, build_theme
 
 _IGNORED_PATH_NAMES = {
     ".git",
@@ -123,7 +123,7 @@ def _render_themed(renderable: RenderableType, *, width: int = 200) -> Segments:
     Segments — Textual treats Segments as opaque and renders them verbatim.
     """
     console = RichConsole(
-        theme=build_theme(),
+        theme=build_theme(active_theme_name()),
         force_terminal=True,
         color_system="truecolor",
         width=width,
@@ -138,19 +138,29 @@ class HeaderBar(Static):
     HeaderBar {
         dock: top;
         height: 1;
-        padding: 0 1;
-        background: #171a23;
-        color: #d8dee9;
+        padding: 0 2;
+        background: $surface;
+        color: $foreground;
     }
     """
 
     info: reactive[HeaderInfo | None] = reactive(None)
 
+    def _inner_width(self) -> int:
+        # Account for the 2-cell horizontal padding on each side.
+        return max(20, (self.size.width or 200) - 4)
+
     def watch_info(self, info: HeaderInfo | None) -> None:
         if info is None:
             self.update(Text(""))
         else:
-            self.update(_render_themed(render_header(info), width=self.size.width or 200))
+            inner = self._inner_width()
+            self.update(_render_themed(render_header(info, width=inner), width=inner))
+
+    def on_resize(self) -> None:
+        # Re-flow the right-aligned cluster when the terminal width changes.
+        if self.info is not None:
+            self.watch_info(self.info)
 
 
 class FooterHint(Static):
@@ -158,12 +168,11 @@ class FooterHint(Static):
 
     DEFAULT_CSS = """
     FooterHint {
-        dock: bottom;
-        width: 26;
-        height: 3;
-        padding: 1 0 0 1;
-        background: #0f1018;
-        color: #6f778a;
+        width: 1fr;
+        height: 1;
+        padding: 0 1;
+        background: $background;
+        color: $text-muted;
     }
     """
 
@@ -209,24 +218,26 @@ class FooterHint(Static):
 
     def refresh_text(self) -> None:
         width = max(int(self.hint_width or 26), self.size.width or 0)
+        key = "bold console.text.secondary"
+        hint = "console.footer.hint"
         out = Text()
         if width >= 30:
-            out.append("↵", style="bold #aeb6c8")
-            out.append(" send", style="#6f778a")
-            out.append(" · ", style="#6f778a")
-            out.append("⇧↵", style="bold #aeb6c8")
-            out.append(" newline", style="#6f778a")
-            out.append(" · ", style="#6f778a")
-            out.append("/", style="bold #aeb6c8")
-            out.append(" commands", style="#6f778a")
+            out.append("↵", style=key)
+            out.append(" send", style=hint)
+            out.append(" · ", style=hint)
+            out.append("⇧↵", style=key)
+            out.append(" newline", style=hint)
+            out.append(" · ", style=hint)
+            out.append("/", style=key)
+            out.append(" commands", style=hint)
         else:
-            out.append("↵", style="bold #aeb6c8")
-            out.append(" send", style="#6f778a")
-            out.append(" · ", style="#6f778a")
-            out.append("⇧↵", style="bold #aeb6c8")
-            out.append(" · ", style="#6f778a")
-            out.append("/", style="bold #aeb6c8")
-        self.update(out)
+            out.append("↵", style=key)
+            out.append(" send", style=hint)
+            out.append(" · ", style=hint)
+            out.append("⇧↵", style=key)
+            out.append(" · ", style=hint)
+            out.append("/", style=key)
+        self.update(_render_themed(out, width=self.size.width or 120))
 
 
 class ScrollIndicator(Static):
@@ -274,8 +285,8 @@ class SteeringList(Static):
         height: auto;
         max-height: 5;
         padding: 0 1;
-        background: #171a23;
-        color: #d8dee9;
+        background: $surface;
+        color: $foreground;
         display: none;
     }
     SteeringList.has-items {
@@ -321,10 +332,10 @@ class SlashMenu(Static):
         height: auto;
         max-height: 20;
         padding: 0 1;
-        background: #1d2130;
-        color: #d8dee9;
+        background: $panel;
+        color: $foreground;
         display: none;
-        border-top: solid #7aa2f7;
+        border-top: solid $primary;
         overflow-y: auto;
         scrollbar-size-vertical: 1;
     }
@@ -521,25 +532,25 @@ class SlashMenu(Static):
             is_sel = i == selected
             prefix = "▸ " if is_sel else "  "
             row_style = "bold reverse" if is_sel else ""
-            out.append(prefix, style="bold #7aa2f7" if is_sel else "#6f778a")
+            out.append(prefix, style="bold console.accent" if is_sel else "console.meta")
             out.append(
                 pad_cells(self._usage_for(cmd), 24),
-                style=("bold #9aa5ce" if is_sel else "#89ddff"),
+                style=("bold console.accent.system" if is_sel else "console.accent"),
             )
             group = getattr(cmd, "group", "")
             if group:
-                out.append(pad_cells(group, 10), style="#6f778a")
-            out.append(truncate_cells(cmd.description, 80), style=row_style or "#d8dee9")
+                out.append(pad_cells(group, 10), style="console.meta")
+            out.append(truncate_cells(cmd.description, 80), style=row_style or "console.text.primary")
             shortcut = getattr(cmd, "shortcut", None)
             if shortcut:
-                out.append(f"  {shortcut}", style="#6f778a italic")
+                out.append(f"  {shortcut}", style="console.meta italic")
             if i == start and start > 0:
-                out.append(f"  ↑ {start}", style="#6f778a")
+                out.append(f"  ↑ {start}", style="console.meta")
             if i == end - 1 and end < len(self.visible_commands):
-                out.append(f"  ↓ {len(self.visible_commands) - end}", style="#6f778a")
+                out.append(f"  ↓ {len(self.visible_commands) - end}", style="console.meta")
             if i < end - 1:
                 out.append("\n")
-        self.update(out)
+        self.update(_render_themed(out, width=self.size.width or 120))
 
     def _render_window(self, selected: int) -> tuple[int, int]:
         total = len(self.visible_commands)
@@ -561,10 +572,10 @@ class PathMentionMenu(Static):
         height: auto;
         max-height: 12;
         padding: 0 1;
-        background: #1d2130;
-        color: #d8dee9;
+        background: $panel;
+        color: $foreground;
         display: none;
-        border-top: solid #7aa2f7;
+        border-top: solid $primary;
         overflow-y: auto;
         scrollbar-size-vertical: 1;
     }
@@ -682,15 +693,15 @@ class PathMentionMenu(Static):
         for i, item in enumerate(self.visible_items):
             is_sel = i == self.selected_index % len(self.visible_items)
             prefix = "▸ " if is_sel else "  "
-            out.append(prefix, style="bold #7aa2f7" if is_sel else "#6f778a")
+            out.append(prefix, style="bold console.accent" if is_sel else "console.meta")
             out.append(
                 pad_cells(f"@{item.display}", 52),
-                style="bold #89ddff" if is_sel else "#aeb6c8",
+                style="bold console.accent" if is_sel else "console.text.secondary",
             )
-            out.append("dir" if item.is_dir else "file", style="#6f778a")
+            out.append("dir" if item.is_dir else "file", style="console.meta")
             if i < len(self.visible_items) - 1:
                 out.append("\n")
-        self.update(out)
+        self.update(_render_themed(out, width=self.size.width or 120))
 
 
 class StatusBar(Static):
@@ -701,12 +712,12 @@ class StatusBar(Static):
         dock: bottom;
         height: 1;
         padding: 0 0;
-        background: #1e1e2e;
-        color: #d8dee9;
+        background: $background;
+        color: $foreground;
     }
     StatusBar.idle {
-        background: #1e1e2e;
-        color: #6f778a;
+        background: $background;
+        color: $text-muted;
     }
     """
 
@@ -784,10 +795,10 @@ class StatusBar(Static):
     @classmethod
     def context_style_for_pct(cls, pct: float) -> str:
         if pct > 85:
-            return "#f7768e"
+            return "console.state.error"
         if pct >= 70:
-            return "#e0af68"
-        return "#6f778a"
+            return "console.state.warning"
+        return "console.meta"
 
     def _context_text(self) -> Text:
         pct = max(0.0, float(self.context_pct or 0.0))
@@ -795,47 +806,50 @@ class StatusBar(Static):
             return Text()
         out = Text(f"ctx {pct:.0f}%", style=self.context_style_for_pct(pct))
         if pct > 85:
-            out.append(" · compact soon", style="#f7768e")
+            out.append(" · compact soon", style="console.state.error")
         return out
 
     def _left_status(self) -> Text:
         out = Text()
         if self.state == "idle":
-            out.append("●", style="#9ece6a")
-            out.append(" ready", style="bold #aeb6c8")
+            out.append("●", style="console.state.success")
+            out.append(" ready", style="bold console.text.secondary")
         else:
             spin = SPINNER_FRAMES[self.spinner_frame % len(SPINNER_FRAMES)]
-            out.append(spin, style="#f9e2af")
-            out.append(" working", style="bold #d8dee9")
+            out.append(spin, style="console.state.warning")
+            out.append(" working", style="bold console.text.primary")
         tool_count = max(0, int(self.tool_count or 0))
         if tool_count > 0:
-            out.append(" · ", style="#6f778a")
-            out.append(str(tool_count), style="bold #aeb6c8")
-            out.append(" tools" if tool_count != 1 else " tool", style="#6f778a")
+            out.append(" · ", style="console.meta")
+            out.append(str(tool_count), style="bold console.text.secondary")
+            out.append(" tools" if tool_count != 1 else " tool", style="console.meta")
         ctx = self._context_text()
         if ctx.plain:
-            out.append(" · ", style="#6f778a")
+            out.append(" · ", style="console.meta")
             out.append_text(ctx)
         if self.state != "idle":
             label = self._label()
-            out.append(" · ", style="#6f778a")
-            out.append(label, style="#6f778a")
+            out.append(" · ", style="console.meta")
+            out.append(label, style="console.meta")
             if self.detail:
-                out.append(" · ", style="#6f778a")
-                out.append(truncate_cells(self.detail, 42), style="#aeb6c8")
+                out.append(" · ", style="console.meta")
+                out.append(truncate_cells(self.detail, 42), style="console.text.secondary")
             elapsed = max(0.0, time.monotonic() - self.started_at) if self.started_at else 0.0
-            out.append(f" · {elapsed:.1f}s", style="#6f778a")
+            out.append(f" · {elapsed:.1f}s", style="console.meta")
         return out
 
     def _right_status(self, available: int) -> Text:
         out = Text()
-        mode_style = "bold #8bd5a4" if self.mode.upper() == "ACT" else "bold #7aa2f7"
+        mode_style = "console.mode.act" if self.mode.upper() == "ACT" else "console.mode.plan"
         out.append(self.mode.upper(), style=mode_style)
         if self.model_label:
-            out.append(" · ", style="#6f778a")
-            out.append(truncate_cells(self.model_label, max(0, available - out.cell_len)), style="bold #aeb6c8")
+            out.append(" · ", style="console.meta")
+            out.append(
+                truncate_cells(self.model_label, max(0, available - out.cell_len)),
+                style="bold console.text.secondary",
+            )
         if self.state != "idle":
-            out.append(" · esc cancel", style="#6f778a")
+            out.append(" · esc cancel", style="console.meta")
         return out
 
     def _repaint(self) -> None:
@@ -843,13 +857,13 @@ class StatusBar(Static):
         left = self._left_status()
         right = self._right_status(max(12, width - left.cell_len - 4))
         if left.cell_len + right.cell_len + 3 > width:
-            left = Text(truncate_cells(left.plain, max(8, width - right.cell_len - 3)), style="#6f778a")
+            left = Text(truncate_cells(left.plain, max(8, width - right.cell_len - 3)), style="console.meta")
         gap = max(1, width - left.cell_len - right.cell_len)
         text = Text()
         text.append_text(left)
         text.append(" " * gap)
         text.append_text(right)
-        self.update(text)
+        self.update(_render_themed(text, width=width))
 
 
 class LivePane(Static):
@@ -869,8 +883,8 @@ class LivePane(Static):
         height: auto;
         max-height: 30;
         padding: 0 1;
-        background: #11131a;
-        color: #d8dee9;
+        background: $background;
+        color: $foreground;
     }
     LivePane.empty {
         display: none;
@@ -950,19 +964,19 @@ class PromptArea(TextArea):
         width: 1fr;
         min-width: 10;
         height: auto;
-        min-height: 3;
+        min-height: 1;
         max-height: 10;
         border: none;
-        padding: 1 1 0 1;
-        background: #0f1018;
-        color: #d8dee9;
+        padding: 0;
+        background: $background;
+        color: $foreground;
         scrollbar-size-vertical: 0;
     }
     PromptArea:focus {
         border: none;
     }
     PromptArea > .text-area--cursor {
-        background: #7aa2f7;
+        background: $primary;
     }
     """
 

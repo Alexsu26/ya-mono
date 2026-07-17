@@ -9,7 +9,8 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from yaacli.console.blocks.base import BaseBlock, BlockKind
-from yaacli.console.design import rail_renderable, turn_header
+from yaacli.console.design import block_body_renderable, block_header
+from yaacli.console.theme import active_code_syntax_theme
 
 _MAX_MARKDOWN_RENDER_CHARS = 80_000
 
@@ -42,11 +43,11 @@ class ModelTextBlock(BaseBlock):
                 + f"\n\n[output clipped: {hidden} chars hidden; use /export to show more]"
             )
         return Group(
-            turn_header(
+            block_header(
                 "●",
                 "assistant",
-                glyph_style="console.accent.assistant",
+                dot_style="console.accent.assistant",
                 label_style="console.heading.turn",
             ),
-            rail_renderable(Markdown(text, code_theme="monokai")),
+            block_body_renderable(Markdown(text, code_theme=active_code_syntax_theme())),
         )

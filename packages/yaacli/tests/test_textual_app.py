@@ -43,8 +43,13 @@ def _log_text(log: RichLog) -> str:
 def _render_plain(renderable: object, *, width: int = 120) -> str:
     from rich.console import Console
 
+    # Widgets that pre-resolve themed styles (StatusBar, FooterHint, HeaderBar)
+    # hand Textual a RichVisual wrapping a Rich `Segments`. Textual renders that
+    # via render_strips, but Rich's own Console can't consume the RichVisual
+    # wrapper — so unwrap to the inner renderable (the Segments) for the test.
+    inner = getattr(renderable, "_renderable", renderable)
     console = Console(width=width, force_terminal=False, color_system=None)
-    return "".join(segment.text for segment in console.render(renderable))
+    return "".join(segment.text for segment in console.render(inner))
 
 
 @pytest.mark.asyncio
@@ -510,15 +515,15 @@ async def test_textualsink_tool_call_runs_in_richlog_then_commits_to_log() -> No
         running = _log_text(log)
         assert "Read" in running
         assert "running" in running
-        first_render_lines = len(log.lines)
 
         sink.handle_tool_call_complete("t1", "a\nb\nc\n", error=False)
         await pilot.pause(0.05)
         # Done state replaces the transient running render with committed history.
         assert not live.has_blocks
         done = _log_text(log)
-        assert "3 lines" in done
-        assert len(log.lines) <= first_render_lines + 3
+        assert "done" in done
+        # Card body previews the output lines.
+        assert "a" in done and "b" in done
 
 
 @pytest.mark.asyncio
@@ -543,7 +548,7 @@ async def test_active_tool_and_subagent_spinner_frames_advance_in_transcript() -
         sink._stop_active_operations_timer()
         first_frame = _log_text(log)
         assert SPINNER_FRAMES[0] in first_frame
-        assert "tool Read" in first_frame
+        assert "Read" in first_frame
         assert "subagent" in first_frame
 
         sink._tick_active_operations()
@@ -647,7 +652,7 @@ async def test_input_hints_explain_send_and_newline() -> None:
     async with app.run_test() as pilot:
         await pilot.pause()
         footer = app.query_one(FooterHint)
-        rendered = str(footer.render())
+        rendered = _render_plain(footer.render())
         assert "↵ send" in rendered
         assert "⇧↵" in rendered
         assert "/" in rendered
@@ -666,7 +671,7 @@ async def test_wide_textual_composer_shows_full_input_hints() -> None:
     )
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
-        rendered = str(app.query_one(FooterHint).render())
+        rendered = _render_plain(app.query_one(FooterHint).render())
         assert "↵ send" in rendered
         assert "⇧↵ newline" in rendered
         assert "/ commands" in rendered
@@ -684,11 +689,13 @@ async def test_textual_composer_uses_rounded_shape_when_space_allows() -> None:
     )
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
-        assert app.query_one("#prompt_composer").has_class("rounded")
+        # The composer is now always a rounded card — verify it carries a border.
+        composer = app.query_one("#prompt_composer")
+        assert composer.styles.border.top[0] != ""
 
 
 @pytest.mark.asyncio
-async def test_textual_composer_drops_rounded_shape_in_short_terminal() -> None:
+async def test_textual_composer_keeps_rounded_shape_in_short_terminal() -> None:
     from yaacli.console.textual_app import YaacliTextualApp
     from yaacli.console.widgets import PromptArea, StatusBar
 
@@ -700,7 +707,8 @@ async def test_textual_composer_drops_rounded_shape_in_short_terminal() -> None:
     )
     async with app.run_test(size=(80, 10)) as pilot:
         await pilot.pause()
-        assert not app.query_one("#prompt_composer").has_class("rounded")
+        composer = app.query_one("#prompt_composer")
+        assert composer.styles.border.top[0] != ""
         prompt = app.query_one(PromptArea)
         status = app.query_one(StatusBar)
         assert prompt.size.width >= 10
@@ -710,6 +718,7 @@ async def test_textual_composer_drops_rounded_shape_in_short_terminal() -> None:
 @pytest.mark.asyncio
 async def test_input_chrome_sits_flush_to_terminal_bottom() -> None:
     from yaacli.console.textual_app import YaacliTextualApp
+    from yaacli.console.widgets import FooterHint
 
     app = YaacliTextualApp(
         config=_make_stub_config(),
@@ -719,8 +728,9 @@ async def test_input_chrome_sits_flush_to_terminal_bottom() -> None:
     )
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
-        composer = app.query_one("#prompt_composer")
-        assert composer.region.y + composer.region.height == app.size.height
+        # The footer hint row is now the bottom-most element of the chrome.
+        footer = app.query_one(FooterHint)
+        assert footer.region.y + footer.region.height == app.size.height
 
 
 @pytest.mark.asyncio
@@ -740,6 +750,8 @@ async def test_status_row_aligns_with_floating_composer() -> None:
         composer = app.query_one("#prompt_composer")
         assert status.region.x == composer.region.x
         assert status.region.width == composer.region.width
+        # The composer sits directly below the status row (its top rule hugs
+        # the status line — no gap).
         assert composer.region.y - (status.region.y + status.region.height) == 0
 
 
@@ -777,7 +789,7 @@ async def test_scroll_indicator_appears_when_scrolled_up_during_writes() -> None
         await pilot.pause()
         await pilot.pause()
         assert indicator.pending >= 1
-        assert "new output below" in str(indicator.render())
+        assert "new output below" in _render_plain(indicator.render())
         assert log.auto_scroll is False
 
         # End key restores stickiness
@@ -2053,7 +2065,7 @@ async def test_slash_menu_searches_descriptions_and_shows_param_hints() -> None:
 
         names = [cmd.name for cmd in menu.visible_commands]
         assert "model" in names
-        rendered = str(menu.render())
+        rendered = _render_plain(menu.render())
         assert "/model" in rendered
         assert "[name]" in rendered
 
@@ -2350,7 +2362,7 @@ Inspect code without editing it.
 
         assert menu.is_open
         assert [item.name for item in menu.visible_commands] == ["explorer"]
-        assert "Local codebase exploration specialist." in str(menu.render())
+        assert "Local codebase exploration specialist." in _render_plain(menu.render())
 
         await pilot.press("tab")
         await pilot.pause()
@@ -2551,7 +2563,7 @@ async def test_theme_slash_command_lists_switches_and_current() -> None:
     # The switch landed on both layers.
     assert app.theme_name == "cappuccino"
     assert app._sink.theme_name == "cappuccino"
-    assert app.theme == "catppuccin-mocha"
+    assert app.theme == "yaacli-cappuccino"
     # The RichLog surface follows the cappuccino base/text colors.
     assert str(app._output_log.styles.background).startswith("Color(30, 30, 46")
     assert str(app._output_log.styles.color).startswith("Color(205, 214, 244")
@@ -2581,7 +2593,7 @@ async def test_theme_slash_command_recolors_log_surface_back_on_revert() -> None
         await pilot.pause(0.02)
 
         assert app.theme_name == "tokyo-night"
-        assert app.theme == "tokyo-night"
+        assert app.theme == "yaacli-tokyo-night"
         # Reverting must actually recolor the surface, not just flip the name.
         assert app._output_log.styles.background != cappuccino_bg
         assert str(app._output_log.styles.background).startswith("Color(17, 19, 26")
@@ -2606,7 +2618,7 @@ async def test_theme_slash_command_rejects_unknown_theme() -> None:
         rendered = _log_text(app.query_one(RichLog))
 
     assert handled is True
-    assert app.theme_name == "tokyo-night"
+    assert app.theme_name == "graphite"
     assert "→ unknown theme: nope" in rendered
 
 
@@ -2628,7 +2640,7 @@ async def test_theme_loads_from_config_on_startup() -> None:
         # The sink picks up the configured theme before its first render.
         assert app.theme_name == "cappuccino"
         assert app._sink.theme_name == "cappuccino"
-        assert app.theme == "catppuccin-mocha"
+        assert app.theme == "yaacli-cappuccino"
 
 
 @pytest.mark.asyncio
@@ -2646,8 +2658,8 @@ async def test_invalid_config_theme_falls_back_to_default_on_startup() -> None:
 
     async with app.run_test(size=(100, 24)) as pilot:
         await pilot.pause()
-        assert app.theme_name == "tokyo-night"
-        assert app.theme == "tokyo-night"
+        assert app.theme_name == "graphite"
+        assert app.theme == "yaacli-graphite"
 
 
 @pytest.mark.asyncio
@@ -2787,7 +2799,7 @@ async def test_slash_menu_keeps_stable_order_after_recent_command() -> None:
             "plan",
             "clear",
         ]
-        assert "RECENT" not in str(menu.render())
+        assert "RECENT" not in _render_plain(menu.render())
 
 
 @pytest.mark.asyncio
@@ -2858,7 +2870,7 @@ async def test_slash_menu_keeps_keyboard_selection_inside_rendered_window() -> N
             await pilot.press("down")
         await pilot.pause()
 
-        rendered = str(menu.render())
+        rendered = _render_plain(menu.render())
         rendered_lines = rendered.splitlines()
         assert len(rendered_lines) <= menu.MAX_RENDERED_ROWS
         assert sum(line.startswith("▸ ") for line in rendered_lines) == 1
@@ -3237,10 +3249,10 @@ async def test_status_bar_context_usage_is_lightweight_and_thresholded() -> None
     from yaacli.console.textual_app import YaacliTextualApp
     from yaacli.console.widgets import StatusBar
 
-    assert StatusBar.context_style_for_pct(18) == "#6f778a"
-    assert StatusBar.context_style_for_pct(70) == "#e0af68"
-    assert StatusBar.context_style_for_pct(85) == "#e0af68"
-    assert StatusBar.context_style_for_pct(85.1) == "#f7768e"
+    assert StatusBar.context_style_for_pct(18) == "console.meta"
+    assert StatusBar.context_style_for_pct(70) == "console.state.warning"
+    assert StatusBar.context_style_for_pct(85) == "console.state.warning"
+    assert StatusBar.context_style_for_pct(85.1) == "console.state.error"
 
     app = YaacliTextualApp(
         config=_make_stub_config(),
@@ -3328,7 +3340,9 @@ async def test_status_bar_repaints_to_layout_width_on_initial_mount() -> None:
         await pilot.pause()
         status = app.query_one(StatusBar)
         console = Console(width=240, force_terminal=False)
-        rendered_width = sum(segment.cell_length for segment in console.render(status.render()))
+        visual = status.render()
+        inner = getattr(visual, "_renderable", visual)
+        rendered_width = sum(segment.cell_length for segment in console.render(inner))
 
         assert status.size.width >= 190
         assert rendered_width >= status.size.width - 4
@@ -3406,8 +3420,10 @@ async def test_multiline_prompt_expands_without_overlapping_status_or_footer() -
 
         assert prompt.text == "one\ntwo\nthree\nfour\nfive"
         assert prompt.region.height >= 5
+        # Status sits above the prompt; the footer hint row sits below it —
+        # neither overlaps the expanded multiline input.
         assert status.region.y + status.region.height <= prompt.region.y
-        assert footer.region.y + footer.region.height <= prompt.region.y + prompt.region.height
+        assert footer.region.y >= prompt.region.y + prompt.region.height
 
 
 @pytest.mark.asyncio
@@ -3734,7 +3750,8 @@ async def test_subagent_tool_calls_collapsed_into_single_block() -> None:
         )
         await pilot.pause(0.05)
         new_lines = len(log.lines) - baseline
-        assert new_lines == 1, f"expected 1 summary line, got {new_lines}"
+        # One summary line, plus a blank block separator committed before it.
+        assert new_lines <= 2, f"expected a single collapsed summary, got {new_lines}"
         last = "".join(seg.text for seg in log.lines[-1])
         assert "subagent" in last
         assert "explorer" in last

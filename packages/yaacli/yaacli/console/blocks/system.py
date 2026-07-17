@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from yaacli.console.blocks.base import BaseBlock, BlockKind
-from yaacli.console.design import rail_renderable, rail_text, turn_header
+from yaacli.console.design import block_body_renderable, block_body_text, block_header
 
 
 @dataclass
@@ -30,11 +30,11 @@ class SystemBlock(BaseBlock):
         self.state.is_terminal = True
 
     def render(self, width: int) -> RenderableType:
-        header = turn_header(
-            "◆",
+        header = block_header(
+            "●",
             "system",
             meta=self.title,
-            glyph_style="console.accent.system",
+            dot_style="console.accent.system",
             label_style="console.system.title",
         )
 
@@ -46,8 +46,8 @@ class SystemBlock(BaseBlock):
 
         if not self.boxed:
             if isinstance(self.body, str):
-                return Group(header, rail_text(self.body, body_style="console.text.secondary"))
-            return Group(header, rail_renderable(body))
+                return Group(header, block_body_text(self.body, body_style="console.text.secondary"))
+            return Group(header, block_body_renderable(body))
 
         panel_width = max(40, min(width - 2, 120))
         panel = Panel(

@@ -7,8 +7,7 @@ from dataclasses import dataclass
 from rich.console import Group, RenderableType
 
 from yaacli.console.blocks.base import BaseBlock, BlockKind
-from yaacli.console.design import rail_text, turn_header
-from yaacli.console.glyphs import GLYPHS
+from yaacli.console.design import block_body_text, block_header
 
 
 @dataclass
@@ -24,11 +23,11 @@ class UserPromptBlock(BaseBlock):
 
     def render(self, width: int) -> RenderableType:
         return Group(
-            turn_header(
-                GLYPHS.USER,
+            block_header(
+                "●",
                 "you",
-                glyph_style="console.accent.user",
+                dot_style="console.accent.user",
                 label_style="console.accent.user",
             ),
-            rail_text(self.text, rail="  ", body_style="console.text.primary"),
+            block_body_text(self.text, body_style="console.text.primary"),
         )

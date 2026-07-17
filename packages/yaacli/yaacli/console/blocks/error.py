@@ -8,7 +8,7 @@ from rich.console import Group, RenderableType
 from rich.text import Text
 
 from yaacli.console.blocks.base import BaseBlock, BlockKind
-from yaacli.console.design import rail_text, turn_header
+from yaacli.console.design import block_body_text, block_header
 
 
 @dataclass
@@ -26,19 +26,19 @@ class ErrorBlock(BaseBlock):
         self.state.error = True
 
     def render(self, width: int) -> RenderableType:
-        header = turn_header(
-            "✖",
+        header = block_header(
+            "●",
             "error",
             meta=self.title,
-            glyph_style="console.state.error",
+            dot_style="console.state.error",
             label_style="console.error.title",
         )
         body_parts: list[RenderableType] = []
         if self.body:
-            body_parts.append(rail_text(self.body, body_style="console.error.body"))
+            body_parts.append(block_body_text(self.body, body_style="console.error.body"))
         if self.detail:
             detail = Text()
-            detail.append("  │ detail", style="console.meta")
+            detail.append("  detail", style="console.meta")
             body_parts.append(detail)
-            body_parts.append(rail_text(self.detail, body_style="console.text.muted"))
+            body_parts.append(block_body_text(self.detail, body_style="console.text.muted"))
         return Group(header, *body_parts)
